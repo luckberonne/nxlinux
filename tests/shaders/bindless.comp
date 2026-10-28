@@ -1,0 +1,18 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+// NVN texture handles: low 20 bits index the texture pool, the bits above index the sampler pool. Both are unbounded arrays
+// indexed dynamically per invocation, as the translated Maxwell shaders do.
+layout(buffer_reference, std430) readonly buffer Handles { uint h[]; };
+layout(buffer_reference, std430) buffer Out { vec4 v[]; };
+layout(set = 0, binding = 0) uniform texture2D tex[];
+layout(set = 0, binding = 1) uniform sampler smp[];
+layout(push_constant) uniform PC { Out dst; Handles handles; uint n; } pc;
+layout(local_size_x = 8) in;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint h = pc.handles.h[i];
+    uint t = h & 0xFFFFFu, s = h >> 20;
+    pc.dst.v[i] = textureLod(sampler2D(tex[nonuniformEXT(t)], smp[nonuniformEXT(s)]), vec2(0.5, 0.5), 0.0);
+}

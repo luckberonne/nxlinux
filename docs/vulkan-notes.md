@@ -30,3 +30,13 @@ memory with a GPU address) can therefore be imported straight from the guest win
   shader writing through the raw GPU address are visible through the same CPU pointer. This is the NVN model: CPU-visible
   memory with a GPU address, with no staging copy.
 - `src/gfx/vk/vkctx.c` requires the features the backend cannot do without and names the missing one on failure.
+
+## Format table and bindless textures
+- `src/gfx/tex/nvn_fmt_vk.c` is nxnative's `nvn_fmt_mtl.c` retargeted: the same entries, kinds (exact / substitute / none) and
+  remarks. 106 NVN formats map exactly, 29 are substitutes, 21 have no Vulkan counterpart, the same 21 that have none on Metal
+  (3-component formats and the signed RGB10A2 ones). The ASTC order matches Vulkan's directly (Metal skips a number). The 16-bit
+  packed formats needed their names reversed (Metal names from the lowest bit, Vulkan from the highest). `tests/test_fmt_vk.c`
+  checks the table against the device: on RADV every mapped format but the 28 ASTC ones can be sampled or attached.
+- `tests/test_vk_bindless.c`: a 1024-entry sampled-image array and a 16-entry sampler array, partially bound and update-after-bind,
+  indexed with `nonuniformEXT` from an NVN-style handle (low 20 bits texture, the rest sampler) read through a buffer address.
+  A descriptor written after the command buffer was recorded and the set bound is seen by the GPU.
