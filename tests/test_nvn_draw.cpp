@@ -1,6 +1,7 @@
 // Draws from guest code through the NVN API on the Vulkan backend: tests/guest/nvn_draw.c records six stages of draws, each checking one behaviour
 // (default state, culling, blending, depth, channel mask, uniform buffers) against pixels the GPU produced. The shaders are registered by hand as SPIR-V:
-// the translated library that normally supplies them is not loaded yet.
+// the translated library that normally supplies them is not loaded yet. With a fourth argument, a shader library built from Maxwell machine code by the translator
+// (tests/make_maxwell_lib.py) supplies a ninth stage's fragment shader.
 extern "C" {
 #include "../src/host/guest_mem.h"
 #include "../src/host/module.h"
@@ -37,7 +38,7 @@ static void shader_key(const uint8_t *control, const uint8_t *code, uint32_t nco
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: %s nvn_draw.so draw.vert.spv draw.frag.spv\n", argv[0]); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: %s nvn_draw.so draw.vert.spv draw.frag.spv [maxwell.nxsl]\n", argv[0]); return 2; }
     if (guest_mem_init(512ull << 20)) return 1;
     kernel_init();
     hle_collect_sections();
@@ -62,16 +63,19 @@ int main(int argc, char **argv) {
     auto *vs_ctl = (uint8_t *)module_sym(&m, "g_vs_control"), *fs_ctl = (uint8_t *)module_sym(&m, "g_fs_control"), *pool = (uint8_t *)module_sym(&m, "g_poolmem");
     CHECK(vs_ctl && fs_ctl && pool);
     auto *x_ctl = (uint8_t *)module_sym(&m, "g_x_control");
-    memset(vs_ctl, 0x11, 0x880); memset(fs_ctl, 0x22, 0x880); memset(x_ctl, 0x33, 0x880);
-    for (uint8_t *c : {vs_ctl, fs_ctl, x_ctl}) { uint32_t own = 0x880, ncode = 64; memcpy(c + 0x20, &own, 4); memcpy(c + 0x704, &ncode, 4); }
-    memset(pool + 0x0, 0xA1, 64); memset(pool + 0x100, 0xB2, 64); memset(pool + 0x200, 0xC3, 64); memset(pool + 0x300, 0xD4, 64);   // the last two shaders are never registered
+    auto *t_ctl = (uint8_t *)module_sym(&m, "g_t_control");
+    memset(vs_ctl, 0x11, 0x880); memset(fs_ctl, 0x22, 0x880); memset(x_ctl, 0x33, 0x880); memset(t_ctl, 0x44, 0x880);
+    for (uint8_t *c : {vs_ctl, fs_ctl, x_ctl, t_ctl}) { uint32_t own = 0x880, ncode = 64; memcpy(c + 0x20, &own, 4); memcpy(c + 0x704, &ncode, 4); }
+    memset(pool + 0x0, 0xA1, 64); memset(pool + 0x100, 0xB2, 64); memset(pool + 0x200, 0xC3, 64); memset(pool + 0x300, 0xD4, 64); memset(pool + 0x400, 0xE5, 64);   // the last two shaders are never registered
     auto vs_spv = slurp(argv[2]), fs_spv = slurp(argv[3]);
     CHECK(!vs_spv.empty() && !fs_spv.empty());
     uint8_t kv[8], kf[8];
     shader_key(vs_ctl, pool + 0x0, 64, kv); shader_key(fs_ctl, pool + 0x100, 64, kf);
     const nvn_shbind vb[] = {{0, NVN_SB_CBUF, 0}}, fb[] = {{1, NVN_SB_CBUF, 0}};
-    nvn_shader_desc vd = {NVN_STAGE_VERTEX, (const uint32_t *)vs_spv.data(), vs_spv.size(), vb, 1}, fd = {NVN_STAGE_FRAGMENT, (const uint32_t *)fs_spv.data(), fs_spv.size(), fb, 1};
+    nvn_shader_desc vd = {NVN_STAGE_VERTEX, 0, (const uint32_t *)vs_spv.data(), vs_spv.size(), vb, 1}, fd = {NVN_STAGE_FRAGMENT, 0, (const uint32_t *)fs_spv.data(), fs_spv.size(), fb, 1};
     nvn_vk_shader_register(kv, &vd); nvn_vk_shader_register(kf, &fd);
+    bool have_lib = argc > 4;
+    if (have_lib) CHECK(nvn_vk_shader_load_library(argv[4]) == 1);
 
     uint64_t stack = guest_alloc(0x10000, 0x1000);
     kernel_run_main(module_sym(&m, "guest_main"), 0, stack + 0x10000);
@@ -94,8 +98,9 @@ int main(int argc, char **argv) {
     EXPECT(11, 1);       // G  an indexed draw: the indices pick the vertices
     EXPECT(12, 1);       // G  the same indices backwards is the mirror image, which the culling removes: the order is the index buffer's
     EXPECT(13, 1);       // H  a program with no registered shaders: the draw is skipped and the frame goes on
+    if (have_lib) EXPECT(14, 1);   // I  a fragment shader translated from Maxwell machine code: constant orange
     EXPECT(10, 0x5555);
-    CHECK(nvn_draw_count() == 13 && nvn_draw_skipped() == 1);
+    CHECK(nvn_draw_count() == 14 && nvn_draw_skipped() == (have_lib ? 1 : 2));
     CHECK(nvn_pipeline_count() >= 5);
     puts(g_fail ? "FAIL" : "PASS");
     return g_fail;

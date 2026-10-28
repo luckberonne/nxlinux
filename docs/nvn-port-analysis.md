@@ -148,3 +148,17 @@ in red once, the frame goes on). The same test on the null GPU fails every drawi
 Not yet: textures and samplers in shaders (the bindless arrays are tested apart), storage buffers, the driver constant segments c0 and c2, the translated shader
 library and its JSON reflection, geometry and tessellation stages, compute, indirect and multi-draws, line loops / quads / polygons and 8-bit indices (they need
 an index list built), several viewports, multisampling, logic ops, alpha test, transform feedback, conditional rendering, clears with a channel mask.
+
+## Translated shaders reach the draw path
+
+The Maxwell -> SPIR-V translator (Ryujinx's, with nxnative's patches) is vendored in `third_party/ryujinx` and driven by `tools/dmsh_xlate` (.NET; `dotnet build` is the only
+requirement, and CMake builds it when `dotnet` exists). Its output, `<key>.spv` plus `<key>.res.json`, is packed by `tools/shader_pack.py` into one library (`NXSL`) that
+`nvn_vk_shader_load_library()` registers under the same 8-byte keys `hle_nvn.c` computes. Each entry carries a `needs` mask: what the shader reads that the draw path cannot
+supply yet (driver segments c0/c1/c2, storage buffers, textures, images, geometry helper buffers). A draw whose shader needs any of them is skipped with a red line that names
+what is missing, instead of running wrong. Plain uniform buffers (c[3+n]) are already bindings.
+
+`tools/maxwell_asm.py` assembles the few instructions the tests need (MOV32I, EXIT, the SPH header, the scheduling words). The ninth stage of `tests/guest/nvn_draw.c`
+draws with a fragment shader made that way and expects constant orange; `tests/test_maxwell_xlate.py` checks the chain on its own.
+
+The translator declares the capabilities of its whole instruction set in every module (Float64, ImageGatherExtended, fragment shader interlock), so the device now enables
+those features; a GPU without them cannot take translated shaders. RADV has all three. The validation layers caught this: the module was accepted but undeclared-feature use was flagged.

@@ -1,6 +1,6 @@
 // Guest program for tests/test_nvn_draw.cpp: draws through the NVN API, as a game does. The host registers SPIR-V for the two shaders the program names.
 // The shader "code" is a few bytes in the memory pool and the control section a block in .bss; the host fills both in before the program runs and computes the
-// key the way hle_nvn.c does. Six stages, each checking one thing; the results go to g_res[].
+// key the way hle_nvn.c does. Nine stages, each checking one thing; the results go to g_res[].
 #include "nvn_protos.h"
 
 typedef unsigned long u64;
@@ -30,7 +30,7 @@ extern void *nvnBootstrapLoader(const char *name);
 FUNCS(DECL)
 
 u64 g_res[64];
-char g_vs_control[0x880] __attribute__((aligned(16))), g_fs_control[0x880] __attribute__((aligned(16))), g_x_control[0x880] __attribute__((aligned(16)));   /* g_x: a shader nobody registered */
+char g_vs_control[0x880] __attribute__((aligned(16))), g_fs_control[0x880] __attribute__((aligned(16))), g_x_control[0x880] __attribute__((aligned(16))), g_t_control[0x880] __attribute__((aligned(16)));   /* g_x: a shader nobody registered; g_t: the translated Maxwell one */
 char g_poolmem[0x100000] __attribute__((aligned(0x10000)));          // exported: the host writes the shader code into it before the program runs
 static NVNdevice g_dev __attribute__((aligned(64))); static NVNdeviceBuilder g_dev_b __attribute__((aligned(64)));
 static NVNmemoryPool g_pool __attribute__((aligned(64))); static NVNmemoryPoolBuilder g_pool_b __attribute__((aligned(64)));
@@ -38,7 +38,7 @@ static NVNqueue g_queue __attribute__((aligned(64))); static NVNqueueBuilder g_q
 static NVNcommandBuffer g_cb __attribute__((aligned(64)));
 static NVNtexture g_rt __attribute__((aligned(64))), g_depth __attribute__((aligned(64)));
 static NVNtextureBuilder g_tb __attribute__((aligned(64)));
-static NVNprogram g_prog __attribute__((aligned(64))), g_prog_x __attribute__((aligned(64)));
+static NVNprogram g_prog __attribute__((aligned(64))), g_prog_x __attribute__((aligned(64))), g_prog_t __attribute__((aligned(64)));
 static NVNblendState g_blend __attribute__((aligned(16))); static NVNcolorState g_color __attribute__((aligned(16)));
 static NVNchannelMaskState g_mask __attribute__((aligned(16))); static NVNmultisampleState g_ms __attribute__((aligned(16)));
 static NVNpolygonState g_poly __attribute__((aligned(16))); static NVNdepthStencilState g_ds __attribute__((aligned(16)));
@@ -207,6 +207,13 @@ void guest_main(u64 arg) {
     begin(); target(blue, 0); bind_all(UBO_VS0, UBO_FS_WHITE); nvnCommandBufferBindProgram(&g_cb, &g_prog_x, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
     nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, LEFT_RED, 3); copy_out(0); submit();
     g_res[13] = okx && is(LX, LY, 0, 0, 255, 1);
+
+    // ---- I: a fragment shader translated from Maxwell machine code (the host loads it from the shader library; without the library the draw is skipped): constant orange
+    NVNshaderData st[2] = {{POOL(0x0), g_vs_control}, {POOL(0x400), g_t_control}};
+    int okt = nvnProgramInitialize(&g_prog_t, &g_dev) & 0xFF; okt &= nvnProgramSetShaders(&g_prog_t, 2, st) & 0xFF;
+    begin(); target(blue, 0); bind_all(UBO_VS0, UBO_FS_WHITE); nvnCommandBufferBindProgram(&g_cb, &g_prog_t, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+    nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, LEFT_RED, 3); copy_out(0); submit();
+    g_res[14] = okt && is_a(LX, LY, 255, 128, 0, 1, 255) && is(50, 32, 0, 0, 255, 1);
 
     g_res[10] = 0x5555;
     exit_thread();

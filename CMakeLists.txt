@@ -136,4 +136,25 @@ add_custom_target(nvn_draw_so DEPENDS ${GUEST_DRAW})
 add_executable(test_nvn_draw tests/test_nvn_draw.cpp)
 target_link_libraries(test_nvn_draw PRIVATE -Wl,--whole-archive nxnvn -Wl,--no-whole-archive nxhost nxcpu dynarmic pthread m)
 add_dependencies(test_nvn_draw nvn_draw_so test_shaders)
-add_test(NAME nvn_draw COMMAND test_nvn_draw ${GUEST_DRAW} ${CMAKE_BINARY_DIR}/shaders/draw.vert.spv ${CMAKE_BINARY_DIR}/shaders/draw.frag.spv)
+# The Maxwell -> SPIR-V translator is a .NET tool: with dotnet present, the draw test also runs a fragment shader assembled, translated and packed from machine code
+find_program(DOTNET dotnet)
+set(DRAW_LIB)
+if(DOTNET)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(XLATE_DLL ${CMAKE_BINARY_DIR}/dmsh_xlate/dmsh_xlate.dll)
+    file(GLOB_RECURSE XLATE_SRC CONFIGURE_DEPENDS third_party/ryujinx/src/*.cs tools/dmsh_xlate/*.cs)
+    add_custom_command(OUTPUT ${XLATE_DLL}
+        COMMAND ${DOTNET} build ${CMAKE_SOURCE_DIR}/tools/dmsh_xlate/dmsh_xlate.csproj -c Release -o ${CMAKE_BINARY_DIR}/dmsh_xlate -v q --nologo
+        DEPENDS ${XLATE_SRC} tools/dmsh_xlate/dmsh_xlate.csproj)
+    set(DRAW_LIB ${CMAKE_BINARY_DIR}/maxwell.nxsl)
+    add_custom_command(OUTPUT ${DRAW_LIB}
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/make_maxwell_lib.py ${XLATE_DLL} ${DRAW_LIB} ${CMAKE_BINARY_DIR}/maxwell_work
+        DEPENDS ${XLATE_DLL} tests/make_maxwell_lib.py tools/maxwell_asm.py tools/shader_pack.py)
+    add_custom_target(maxwell_lib DEPENDS ${DRAW_LIB})
+    add_dependencies(test_nvn_draw maxwell_lib)
+    add_test(NAME maxwell_xlate COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tests/test_maxwell_xlate.py)
+    set_tests_properties(maxwell_xlate PROPERTIES ENVIRONMENT NX_XLATE_DLL=${XLATE_DLL})
+else()
+    message(STATUS "dotnet not found: the translated-shader stage of nvn_draw is skipped")
+endif()
+add_test(NAME nvn_draw COMMAND test_nvn_draw ${GUEST_DRAW} ${CMAKE_BINARY_DIR}/shaders/draw.vert.spv ${CMAKE_BINARY_DIR}/shaders/draw.frag.spv ${DRAW_LIB})

@@ -39,11 +39,14 @@ int vkctx_create(vkctx_t *c) {
     if (c->has_ext_mem_host) want[nw++] = "VK_EXT_external_memory_host";
     if (c->has_xfb) want[nw++] = "VK_EXT_transform_feedback";
     if (c->has_depth_clip_control) want[nw++] = "VK_EXT_depth_clip_control";
+    int has_interlock = has_ext(ext, ne, "VK_EXT_fragment_shader_interlock");
+    if (has_interlock) want[nw++] = "VK_EXT_fragment_shader_interlock";
     c->has_push_descriptor = has_ext(ext, ne, "VK_KHR_push_descriptor");
     if (c->has_push_descriptor) want[nw++] = "VK_KHR_push_descriptor";
     free(ext);
 
-    VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT il = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, has_interlock ? &il : NULL};
     VkPhysicalDeviceDepthClipControlFeaturesEXT dcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &xfb};
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &dcc};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
@@ -61,7 +64,10 @@ int vkctx_create(vkctx_t *c) {
     c->has_depth_clip_control = c->has_depth_clip_control && dcc.depthClipControl;
 
     // Enable the features we use (all checked above or optional); leave the rest off
-    VkPhysicalDeviceTransformFeedbackFeaturesEXT exfb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, NULL, c->has_xfb, c->has_xfb};
+    // The translator declares the capabilities of its whole instruction set in every module, so a device without them cannot take translated shaders at all
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT eil = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT, NULL, has_interlock && il.fragmentShaderPixelInterlock,
+                                                              has_interlock && il.fragmentShaderSampleInterlock, has_interlock && il.fragmentShaderShadingRateInterlock};
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT exfb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, has_interlock ? &eil : NULL, c->has_xfb, c->has_xfb};
     VkPhysicalDeviceDepthClipControlFeaturesEXT edcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &exfb, c->has_depth_clip_control};
     VkPhysicalDeviceVulkan13Features e13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &edcc, .dynamicRendering = 1, .synchronization2 = 1,
                                             .shaderDemoteToHelperInvocation = f13.shaderDemoteToHelperInvocation};
@@ -70,7 +76,8 @@ int vkctx_create(vkctx_t *c) {
         .descriptorBindingPartiallyBound = 1, .descriptorBindingSampledImageUpdateAfterBind = 1, .descriptorBindingUpdateUnusedWhilePending = f12.descriptorBindingUpdateUnusedWhilePending,
         .descriptorBindingVariableDescriptorCount = f12.descriptorBindingVariableDescriptorCount, .descriptorIndexing = 1, .scalarBlockLayout = f12.scalarBlockLayout};
     VkPhysicalDeviceFeatures ef = {.geometryShader = f->geometryShader, .tessellationShader = f->tessellationShader, .dualSrcBlend = f->dualSrcBlend,
-        .independentBlend = f->independentBlend, .shaderInt64 = f->shaderInt64, .samplerAnisotropy = f->samplerAnisotropy,
+        .independentBlend = f->independentBlend, .shaderInt64 = f->shaderInt64, .shaderFloat64 = f->shaderFloat64, .shaderImageGatherExtended = f->shaderImageGatherExtended,
+        .shaderStorageImageReadWithoutFormat = f->shaderStorageImageReadWithoutFormat, .samplerAnisotropy = f->samplerAnisotropy,
         .fragmentStoresAndAtomics = f->fragmentStoresAndAtomics, .textureCompressionBC = 1, .depthClamp = f->depthClamp, .fillModeNonSolid = f->fillModeNonSolid,
         .multiDrawIndirect = f->multiDrawIndirect, .imageCubeArray = f->imageCubeArray, .shaderStorageImageWriteWithoutFormat = f->shaderStorageImageWriteWithoutFormat,
         .drawIndirectFirstInstance = f->drawIndirectFirstInstance, .logicOp = f->logicOp};

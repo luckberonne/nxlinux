@@ -21,6 +21,7 @@
 typedef struct nvn_shader nvn_shader;
 const nvn_shader *nvn_shader_find(const uint8_t key[8]);
 int nvn_shader_stage(const nvn_shader *s);
+uint32_t nvn_shader_needs(const nvn_shader *s);
 const nvn_shbind *nvn_shader_binds(const nvn_shader *s, int *n);
 VkShaderModule nvn_shader_module(nvn_shader *s);
 
@@ -276,7 +277,7 @@ static void skip(const char *why, int *flag) {
 
 // Everything shared by the plain and the indexed draw: the pipeline, the pass, the dynamic state, the vertex buffers and the uniforms. 0 when the draw cannot be made.
 static int prepare(unsigned prim, pipe_entry **pe_out) {
-    static int f_noprog, f_noshader, f_prim, f_vbuf, f_vattr, f_nort, f_pipe, f_fmt, f_off;
+    static int f_needs, f_noprog, f_noshader, f_prim, f_vbuf, f_vattr, f_nort, f_pipe, f_fmt, f_off;
     state_init();
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd_raw();
     if (!c || !cb) return 0;
@@ -291,6 +292,13 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
         else { skip("geometry, tessellation and compute stages are not supported in a draw yet", &f_noshader); return 0; }
     }
     if (!vs || !fs) { skip("the program's shaders are not in the registry (the translated shader library is not loaded)", &f_noshader); return 0; }
+    if (nvn_shader_needs(vs) | nvn_shader_needs(fs)) {
+        // not an error of the game's: the shader reads something this draw path cannot supply yet (see NVN_NEED_*)
+        char why[160]; uint32_t n = nvn_shader_needs(vs) | nvn_shader_needs(fs);
+        snprintf(why, sizeof why, "the shader needs%s%s%s%s%s%s%s (not supported yet)", n & NVN_NEED_C0 ? " driver segment c0," : "", n & NVN_NEED_C1 ? " constant segment c1," : "",
+                 n & NVN_NEED_C2 ? " driver segment c2," : "", n & NVN_NEED_SBUF ? " storage buffers," : "", n & NVN_NEED_TEX ? " textures," : "", n & NVN_NEED_IMG ? " images," : "", n & NVN_NEED_GEOM ? " geometry helper buffers," : "");
+        skip(why, &f_needs); return 0;
+    }
     VkPrimitiveTopology topo;
     if (!topology(prim, &topo, c->enabled.geometryShader)) { skip("this primitive type needs an index list built for it", &f_prim); return 0; }
     if (!g_rt.n && !g_rt.dser) { skip("no render target is set", &f_nort); return 0; }

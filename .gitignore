@@ -7,3 +7,6 @@ build-*/
 *.nsz
 work/
 .venv/
+obj/
+bin/
+__pycache__/
