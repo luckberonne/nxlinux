@@ -20,3 +20,13 @@ memory with a GPU address) can therefore be imported straight from the guest win
 - The RTX 2050 does not enumerate through Vulkan in this session: `nvidia-smi` sees it and the NVIDIA ICD is installed, but
   the loader lists only RADV, also with `__NV_PRIME_RENDER_OFFLOAD=1 __VK_LAYER_NV_optimus=NVIDIA_only`. Development targets RADV.
 - The Vulkan validation layers are not installed (`vulkan-validation-layers`), so tests run without them.
+
+## Verified on RADV (tests/test_vk_triangle.c, tests/test_vk_hostmem.c)
+- Vertices fetched through a buffer device address (`GL_EXT_buffer_reference`), dynamic rendering into RGBA8, readback:
+  a solid triangle and an interpolated one render as expected.
+- Zero-copy NVN memory pools: a page-aligned range of the guest window imported with `VK_EXT_external_memory_host`
+  (`vkGetMemoryHostPointerPropertiesEXT` + `VkImportMemoryHostPointerInfoEXT`, memory type host-visible/coherent/cached),
+  bound to a buffer with `SHADER_DEVICE_ADDRESS`. The CPU's writes are visible to the GPU, a GPU fill and a compute
+  shader writing through the raw GPU address are visible through the same CPU pointer. This is the NVN model: CPU-visible
+  memory with a GPU address, with no staging copy.
+- `src/gfx/vk/vkctx.c` requires the features the backend cannot do without and names the missing one on failure.
