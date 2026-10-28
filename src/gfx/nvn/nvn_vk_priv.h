@@ -22,3 +22,7 @@ int nvn_vk_oneshot_end(VkCommandBuffer cb);
 // Buffer <-> texture copies of the submission being recorded (nvn_tex_vk.c); row and img are the copy strides in bytes, 0 = tightly packed
 void nvn_vk_copy_b2t(const p_copy_b2t *c, uint64_t row, uint64_t img);
 void nvn_vk_copy_t2b(const p_copy_b2t *c, uint64_t row, uint64_t img);   // the record is the same; its `src` is the destination buffer
+// Clears of a render target in the submission being recorded (nvn_tex_vk.c). rect = x, y, w, h of the scissor, or NULL for the whole level.
+// A colour clear takes rgba as the game recorded it (floats; converted to the attachment's integer type for integer formats).
+void nvn_vk_clear_color(uint64_t serial, const view_t *v, int has_view, int mask, const float rgba[4], const int *rect);
+void nvn_vk_clear_ds(uint64_t serial, const view_t *v, int has_view, float depth, int depth_mask, int stencil, int stencil_mask, const int *rect);

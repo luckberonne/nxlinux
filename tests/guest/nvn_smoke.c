@@ -46,6 +46,7 @@ void guest_main(u64 arg) {
     FN(nvnTextureBuilderSetLevels); FN(nvnTextureBuilderSetStorage); FN(nvnTextureBuilderGetStorageSize); FN(nvnTextureBuilderGetStorageAlignment);
     FN(nvnTextureInitialize); FN(nvnTextureWriteTexels); FN(nvnTextureReadTexels); FN(nvnTextureFinalize);
     FN(nvnCommandBufferCopyTextureToBuffer); FN(nvnCommandBufferCopyBufferToTexture); FN(nvnCommandBufferSetCopyRowStride);
+    FN(nvnCommandBufferSetRenderTargets); FN(nvnCommandBufferClearColor); FN(nvnCommandBufferClearDepthStencil);
     FN(nvnEventBuilderSetDefaults); FN(nvnEventBuilderSetStorage); FN(nvnEventInitialize); FN(nvnEventGetValue); FN(nvnEventFinalize);
     g_res[n++] = nvnBootstrapLoader != 0 && nvnDeviceInitialize != 0 && nvnSyncWait != 0;                 // 0: the loader answered with callable addresses
 
@@ -194,6 +195,38 @@ void guest_main(u64 arg) {
     same = 1; for (int y = 0; y < 4; y++) for (int x = 0; x < 8; x++) same &= g_out[y * 8 + x] == g_px[(10 + y) * 40 + x];
     g_res[45] = same;                                                                                     // 45
     nvnTextureFinalize(&g_tex);
+
+    // ---- a render target: cleared by the GPU (whole, then inside a scissor), copied out, read by the CPU
+    static NVNtexture g_rt __attribute__((aligned(64)));
+    nvnTextureBuilderSetDevice(&g_tb, &g_dev); nvnTextureBuilderSetDefaults(&g_tb);
+    nvnTextureBuilderSetTarget(&g_tb, NVN_TEXTURE_TARGET_2D); nvnTextureBuilderSetSize2D(&g_tb, 32, 16);
+    nvnTextureBuilderSetFormat(&g_tb, NVN_FORMAT_RGBA8); nvnTextureBuilderSetLevels(&g_tb, 1);
+    nvnTextureBuilderSetStorage(&g_tb, &g_pool, 0xC0000);
+    g_res[46] = nvnTextureInitialize(&g_rt, &g_tb) & 0xFF;                                                // 46
+    volatile unsigned char *o3 = (volatile unsigned char *)(g_poolmem + 0xC8000);
+    for (int i = 0; i < 32 * 16 * 4; i++) o3[i] = 0;
+    const NVNtexture *rts[1] = {&g_rt};
+    float green[4] = {0.0f, 1.0f, 0.0f, 1.0f}, red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    NVNcopyRegion whole = {0, 0, 0, 32, 16, 1};
+    nvnCommandBufferBeginRecording(&g_cb);
+    nvnCommandBufferSetRenderTargets(&g_cb, 1, rts, 0, 0, 0);
+    nvnCommandBufferSetScissor(&g_cb, 0, 0, 32, 16);
+    nvnCommandBufferClearColor(&g_cb, 0, green, 0xF);
+    nvnCommandBufferSetScissor(&g_cb, 8, 4, 16, 8);
+    nvnCommandBufferClearColor(&g_cb, 0, red, 0xF);
+    nvnCommandBufferCopyTextureToBuffer(&g_cb, &g_rt, 0, &whole, (NVNbufferAddress)(g_poolmem + 0xC8000), 0);
+    NVNcommandHandle t3 = nvnCommandBufferEndRecording(&g_cb);
+    nvnQueueSubmitCommands(&g_queue, 1, &t3); nvnQueueFinish(&g_queue);
+    same = 1;
+    for (int y = 0; y < 16; y++) for (int x = 0; x < 32; x++) {
+        const volatile unsigned char *q = o3 + (y * 32 + x) * 4; int in = x >= 8 && x < 24 && y >= 4 && y < 12;
+        same &= in ? (q[0] == 255 && q[1] == 0 && q[2] == 0 && q[3] == 255) : (q[0] == 0 && q[1] == 255 && q[2] == 0 && q[3] == 255);
+    }
+    g_res[47] = same;                                                                                     // 47: red inside the scissor, green around it
+    NVNcopyRegion two = {0, 0, 0, 2, 1, 1}; unsigned char px2[8];
+    nvnTextureReadTexels(&g_rt, 0, &two, px2);
+    g_res[48] = px2[0] == 0 && px2[1] == 255 && px2[4] == 0 && px2[5] == 255;                             // 48: the CPU reads the cleared colour back
+    nvnTextureFinalize(&g_rt);
 
     // ---- teardown in reverse
     nvnEventFinalize(&g_event); nvnSyncFinalize(&g_sync2); nvnSyncFinalize(&g_sync); nvnCommandBufferFinalize(&g_cb); nvnQueueFinalize(&g_queue);

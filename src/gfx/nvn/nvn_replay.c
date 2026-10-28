@@ -33,6 +33,9 @@ uint64_t nvn_replay_ops_named(const char *name) {      // the same by op name ("
     for (unsigned i = 0; i < OP_COUNT_; i++) if (op_name[i] && !strcmp(op_name[i], name)) return atomic_load(&g_seen[i]);
     return 0;
 }
+// Render-target and scissor state the clears (and later the draws) read. The textures in a record are snapshots made at record time, so only the serial is kept.
+static struct { int n; uint64_t cser[8]; view_t cview[8]; uint8_t has_cview[8]; uint64_t dser; view_t dview; uint8_t has_dview; } g_rt;
+static struct { int has; int r[4]; } g_sc;                                         // the scissor, once set: x, y, w, h
 static uint64_t g_copy_row, g_copy_img;                // OP_COPY_STRIDE state: bytes per row and per image of buffer<->texture copies (0 = tight)
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }               // lookahead across handles: only the Metal pass merging uses it
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
@@ -80,6 +83,23 @@ void mtl_exec(const uint8_t *p) {
         case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) g_copy_img = (uint64_t)cs->stride; else g_copy_row = (uint64_t)cs->stride; break; }
         case OP_COPY_B2T: nvn_vk_copy_b2t((const p_copy_b2t *)a, g_copy_row, g_copy_img); break;
         case OP_COPY_T2B: nvn_vk_copy_t2b((const p_copy_b2t *)a, g_copy_row, g_copy_img); break;   // the record is a p_copy_b2t whose src is the destination buffer
+        case OP_SET_RT: {
+            const p_set_rt *r = (const p_set_rt *)a;
+            memset(&g_rt, 0, sizeof g_rt); g_rt.n = r->n > 8 ? 8 : r->n;
+            for (int i = 0; i < g_rt.n; i++) { g_rt.cser[i] = r->color[i] ? r->color[i]->serial : 0; g_rt.cview[i] = r->cview[i]; g_rt.has_cview[i] = r->has_cview[i]; }
+            g_rt.dser = r->depth ? r->depth->serial : 0; g_rt.dview = r->dview; g_rt.has_dview = r->has_dview;
+            break; }
+        case OP_SCISSOR: { const p_scissor *sc = (const p_scissor *)a; g_sc.has = 1; g_sc.r[0] = sc->x; g_sc.r[1] = sc->y; g_sc.r[2] = sc->w; g_sc.r[3] = sc->h; break; }
+        case OP_CLEAR_COLOR: {
+            const p_clear_color *cc = (const p_clear_color *)a;
+            if (cc->index < 0 || cc->index >= g_rt.n || !g_rt.cser[cc->index]) { fprintf(stderr, "[dm] [RED] [nvn] colour clear of target %d, which is not set\n", cc->index); break; }
+            nvn_vk_clear_color(g_rt.cser[cc->index], &g_rt.cview[cc->index], g_rt.has_cview[cc->index], cc->mask, cc->rgba, g_sc.has ? g_sc.r : NULL);
+            break; }
+        case OP_CLEAR_DS: {
+            const p_clear_ds *cd = (const p_clear_ds *)a;
+            if (!g_rt.dser) { fprintf(stderr, "[dm] [RED] [nvn] depth-stencil clear with no depth target set\n"); break; }
+            nvn_vk_clear_ds(g_rt.dser, &g_rt.dview, g_rt.has_dview, cd->depth, cd->depth_mask, cd->stencil, cd->stencil_mask, g_sc.has ? g_sc.r : NULL);
+            break; }
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;                        // descriptor pool state: only a draw or a dispatch reads it
         default:
             if (h.op < OP_COUNT_) pending(h.op);

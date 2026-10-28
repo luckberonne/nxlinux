@@ -109,3 +109,18 @@ Images stay in `VK_IMAGE_LAYOUT_GENERAL`: one layout serves transfers, sampling,
 - Found on the way: a barrier that transitions only layer 0 left array layers and cube faces in `UNDEFINED`; RADV tolerated it and the
   validation layer reported it. `test_nvn_vk_tex` (2D with mips, BC1, BC7 with edge blocks, 2D array, 3D, cube, padded strides, both `ReadTexels`
   paths, the CPU rewriting one level of a GPU-written texture) and the texture section of `test_nvn_guest` (through the real NVN API) cover it.
+
+## Render targets and clears (nvn_replay.c, nvn_tex_vk.c)
+`OP_SET_RT` keeps the serials and views of the targets (the textures in a record are snapshots made at record time); `OP_SCISSOR` the scissor.
+`OP_CLEAR_COLOR` and `OP_CLEAR_DS` run as a rendering pass of their own whose load operation is the clear, with the scissor as the render area, so
+the area limits what is cleared. One path covers the scissor, a view that reinterprets the format (an RGBA8_SRGB view of an RGBA8 texture: the
+linear clear value is stored encoded), one mip level, a range of array layers, integer targets (the game records the value as a float; it is
+converted to the attachment's integer type) and depth and stencil. nxnative defers a clear into the next pass's load action because that is cheaper
+on a tile-based GPU; a desktop GPU gains nothing from it, so the clear is done where it is recorded.
+Not yet: a colour clear with a channel mask (`mask != 0xF`) and a stencil clear with a partial mask (Vulkan's load operation cannot mask; nxnative
+draws a triangle, which needs the draw path), 3D textures as targets, multisampled targets. The first two are announced in red once and leave the
+target alone rather than guess.
+Attachment views carry an explicit `VkImageViewUsageCreateInfo`: without it an sRGB view inherited `STORAGE` from the image, which the format
+does not support (reported by the validation layer).
+Checked by `test_nvn_vk_tex` (whole, scissored, one level through a view, sRGB view, R32_UINT, array layers, depth, scissored depth, stencil, a
+masked clear that must change nothing) and by the guest through `SetRenderTargets` / `ClearColor` / `SetScissor` in `test_nvn_guest`.

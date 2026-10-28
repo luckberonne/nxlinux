@@ -164,6 +164,94 @@ int main(void) {
         CHECK(!bad);
     }
 
+    // ---- render targets and clears
+    {
+        uint8_t *cst = g_storage + (size_t)7 * (1u << 20);            // render targets need no storage contents
+        tex_t rt, srgb, ui, arr, dep, sten, pm;
+        #define NEWTEX(t, tgt, fmt, w_, h_, d_, lv_) do { memset(&(t), 0, sizeof(t)); (t).d = (nvn_texdesc){.target = (tgt), .format = (fmt), .width = (w_), .height = (h_), .depth = (d_), .levels = (lv_)}; \
+            nvn_tex_layout(&(t).d, &(t).L); (t).mem = cst; (t).serial = ++g_serial; mtl_tex_init(&(t)); } while (0)
+        NEWTEX(rt, NVN_TEXTURE_TARGET_2D, 0x25, 64, 32, 1, 3);
+        NEWTEX(srgb, NVN_TEXTURE_TARGET_2D, 0x25, 16, 16, 1, 1);
+        NEWTEX(ui, NVN_TEXTURE_TARGET_2D, 0x0B, 16, 16, 1, 1);
+        NEWTEX(arr, NVN_TEXTURE_TARGET_2D_ARRAY, 0x01, 8, 8, 4, 1);
+        NEWTEX(dep, NVN_TEXTURE_TARGET_2D, 0x34, 32, 32, 1, 1);
+        NEWTEX(sten, NVN_TEXTURE_TARGET_2D, 0x31, 16, 16, 1, 1);
+        NEWTEX(pm, NVN_TEXTURE_TARGET_2D, 0x25, 16, 16, 1, 1);
+
+        #define SETRT(t_, hasv, setl, lvl, setlay, l0, nl, setf, f) do { p_set_rt r_; memset(&r_, 0, sizeof r_); r_.n = 1; r_.color[0] = &(t_); r_.has_cview[0] = (hasv); \
+            r_.cview[0].set_levels = (setl); r_.cview[0].base_level = (lvl); r_.cview[0].set_layers = (setlay); r_.cview[0].min_layer = (l0); r_.cview[0].nlayers = (nl); \
+            r_.cview[0].set_format = (setf); r_.cview[0].format = (f); emit(OP_SET_RT, &r_, sizeof r_); } while (0)
+        #define CLEARC(idx, msk, r_, g_, b_, a_) do { p_clear_color c_ = {(idx), (msk), {(r_), (g_), (b_), (a_)}}; emit(OP_CLEAR_COLOR, &c_, sizeof c_); } while (0)
+        #define SCISSOR(x_, y_, w_, h_) do { p_scissor sc_ = {(x_), (y_), (w_), (h_)}; emit(OP_SCISSOR, &sc_, sizeof sc_); } while (0)
+        #define READBACK(t_, lvl, lay, w_, h_, depth_, dst_) do { p_copy_b2t c_ = rec(&(t_), (uint64_t)(uintptr_t)(dst_), (lvl), (lay), 0, 0, 0, (w_), (h_), (depth_)); emit(OP_COPY_T2B, &c_, sizeof c_); } while (0)
+        uint8_t *rb = g_buf + 0x200000;
+        #define NEAR(a_, b_, tol_) ((a_) >= (b_) - (tol_) && (a_) <= (b_) + (tol_))
+
+        // 1. a full clear, then a scissored one, then another level through a view
+        list_begin(); SETRT(rt, 0, 0, 0, 0, 0, 0, 0, 0); CLEARC(0, 0xF, 1.0f, 0.5f, 0.25f, 1.0f); READBACK(rt, 0, 0, 64, 32, 1, rb); list_run();
+        int ok = 1; for (int i = 0; i < 64 * 32; i++) ok &= rb[i * 4] == 255 && NEAR(rb[i * 4 + 1], 128, 1) && NEAR(rb[i * 4 + 2], 64, 1) && rb[i * 4 + 3] == 255;
+        printf("full colour clear: %s\n", ok ? "ok" : "MISMATCH"); CHECK(ok);
+        list_begin(); SCISSOR(10, 5, 20, 8); CLEARC(0, 0xF, 0.0f, 0.0f, 1.0f, 1.0f); READBACK(rt, 0, 0, 64, 32, 1, rb); list_run();
+        ok = 1;
+        for (int y = 0; y < 32; y++) for (int x = 0; x < 64; x++) {
+            const uint8_t *q = rb + (y * 64 + x) * 4; int in = x >= 10 && x < 30 && y >= 5 && y < 13;
+            ok &= in ? (q[0] == 0 && q[1] == 0 && q[2] == 255) : (q[0] == 255 && NEAR(q[1], 128, 1));
+        }
+        printf("scissored colour clear (only the rectangle): %s\n", ok ? "ok" : "MISMATCH"); CHECK(ok);
+        list_begin(); SCISSOR(0, 0, 64, 32); SETRT(rt, 1, 1, 1, 0, 0, 0, 0, 0); CLEARC(0, 0xF, 0.0f, 1.0f, 0.0f, 1.0f);      // level 1 only (32x16)
+        READBACK(rt, 1, 0, 32, 16, 1, rb); READBACK(rt, 0, 0, 64, 32, 1, rb + 0x10000); list_run();
+        ok = 1; for (int i = 0; i < 32 * 16; i++) ok &= rb[i * 4] == 0 && rb[i * 4 + 1] == 255 && rb[i * 4 + 2] == 0;
+        const uint8_t *l0 = rb + 0x10000; ok &= l0[(6 * 64 + 12) * 4 + 2] == 255 && l0[0] == 255;                              // level 0 keeps the earlier clears
+        printf("clear of one mip level through a view: %s\n", ok ? "ok" : "MISMATCH"); CHECK(ok);
+        CHECK(mtl_tex_gpu_owned(rt.serial));
+        NVNcopyRegion pr = {0, 0, 0, 2, 1, 1}; uint8_t px2[8];
+        mtl_read_texels(&rt, 1, 0, &pr, px2, 0, 0);
+        CHECK(px2[0] == 0 && px2[1] == 255 && px2[2] == 0 && px2[4] == 0 && px2[5] == 255);                                    // ReadTexels sees the clear
+
+        // 2. an sRGB view of an RGBA8 texture: the linear clear value is stored encoded
+        list_begin(); SETRT(srgb, 1, 0, 0, 0, 0, 0, 1, 0x38); CLEARC(0, 0xF, 0.5f, 0.5f, 0.5f, 1.0f); READBACK(srgb, 0, 0, 16, 16, 1, rb); list_run();
+        ok = 1; for (int i = 0; i < 256; i++) ok &= NEAR(rb[i * 4], 188, 2) && NEAR(rb[i * 4 + 1], 188, 2) && NEAR(rb[i * 4 + 2], 188, 2) && rb[i * 4 + 3] == 255;
+        printf("clear through an sRGB view (0.5 linear -> %u): %s\n", rb[0], ok ? "ok" : "MISMATCH"); CHECK(ok);
+
+        // 3. an integer target: the float the game recorded becomes the integer
+        list_begin(); SETRT(ui, 0, 0, 0, 0, 0, 0, 0, 0); CLEARC(0, 0xF, 7.0f, 0.0f, 0.0f, 0.0f); READBACK(ui, 0, 0, 16, 16, 1, rb); list_run();
+        ok = 1; for (int i = 0; i < 256; i++) ok &= ((uint32_t *)rb)[i] == 7;
+        printf("integer clear (R32_UINT = 7): %s\n", ok ? "ok" : "MISMATCH"); CHECK(ok);
+
+        // 4. layers of an array: all four to 0, then layer 2 only to 0.5
+        list_begin(); SETRT(arr, 1, 0, 0, 1, 0, 4, 0, 0); CLEARC(0, 0xF, 0.0f, 0.0f, 0.0f, 0.0f);
+        SETRT(arr, 1, 0, 0, 1, 2, 1, 0, 0); CLEARC(0, 0xF, 0.5f, 0.0f, 0.0f, 0.0f);
+        for (int l = 0; l < 4; l++) READBACK(arr, 0, l, 8, 8, 1, rb + l * 256);
+        list_run();
+        ok = 1; for (int l = 0; l < 4; l++) for (int i = 0; i < 64; i++) ok &= (l == 2) ? NEAR(rb[l * 256 + i], 128, 1) : rb[l * 256 + i] == 0;
+        printf("clear of array layers (all, then layer 2): %s\n", ok ? "ok" : "MISMATCH"); CHECK(ok);
+
+        // 5. depth: whole, then a scissor; stencil
+        {
+            p_set_rt r_; memset(&r_, 0, sizeof r_); r_.n = 0; r_.depth = &dep;
+            list_begin(); SCISSOR(0, 0, 32, 32); emit(OP_SET_RT, &r_, sizeof r_);
+            p_clear_ds d1 = {0.25f, 1, 0, 0}; emit(OP_CLEAR_DS, &d1, sizeof d1);
+            SCISSOR(4, 4, 8, 8); p_clear_ds d2 = {0.75f, 1, 0, 0}; emit(OP_CLEAR_DS, &d2, sizeof d2);
+            READBACK(dep, 0, 0, 32, 32, 1, rb); list_run();
+            ok = 1; for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++) { float f = ((float *)rb)[y * 32 + x]; int in = x >= 4 && x < 12 && y >= 4 && y < 12; ok &= f == (in ? 0.75f : 0.25f); }
+            printf("depth clear, whole then scissored: %s\n", ok ? "ok" : "MISMATCH"); CHECK(ok);
+            p_set_rt r2; memset(&r2, 0, sizeof r2); r2.n = 0; r2.depth = &sten;
+            list_begin(); SCISSOR(0, 0, 16, 16); emit(OP_SET_RT, &r2, sizeof r2);
+            p_clear_ds d3 = {1.0f, 0, 0x5A, 0xFF}; emit(OP_CLEAR_DS, &d3, sizeof d3);
+            READBACK(sten, 0, 0, 16, 16, 1, rb); list_run();
+            ok = 1; for (int i = 0; i < 256; i++) ok &= rb[i] == 0x5A;
+            printf("stencil clear (S8 = 0x5A): %s\n", ok ? "ok" : "MISMATCH"); CHECK(ok);
+        }
+
+        // 6. a clear with a channel mask is not executed yet: it must leave the target alone (and say so)
+        list_begin(); SETRT(pm, 0, 0, 0, 0, 0, 0, 0, 0); CLEARC(0, 0xF, 1.0f, 0.0f, 0.0f, 1.0f); CLEARC(0, 0x3, 0.0f, 1.0f, 0.0f, 1.0f); READBACK(pm, 0, 0, 16, 16, 1, rb); list_run();
+        ok = 1; for (int i = 0; i < 256; i++) ok &= rb[i * 4] == 255 && rb[i * 4 + 1] == 0;
+        printf("clear with a channel mask leaves the target alone: %s\n", ok ? "ok" : "MISMATCH"); CHECK(ok);
+
+        tex_t *all[] = {&rt, &srgb, &ui, &arr, &dep, &sten, &pm};
+        for (unsigned i = 0; i < sizeof all / sizeof *all; i++) mtl_tex_release(all[i]);
+    }
+
     // Release: the image goes away only once the GPU is done with it
     for (int i = 0; i < 6; i++) mtl_tex_release(&td[i].t);
     list_begin(); list_run();
