@@ -89,6 +89,17 @@ class T(unittest.TestCase):
         self.run_tool('bob', 'commit', '-m', 'Change a', 'a/one.txt')                            # his own claim, a clean message: fine
         self.assertEqual(self.git('log', '--format=%s', '-1').strip(), 'Change a')
 
+    def test_commit_does_not_claim_what_it_commits(self):
+        (self.root / 'a/one.txt').write_text('1\n'); (self.root / 'a/two.txt').write_text('2\n')
+        self.run_tool('alice', 'commit', '-m', 'Change one', 'a/one.txt')                  # no claim of her own
+        self.assertNotIn('a/one.txt', self.run_tool(None, 'status').stdout)
+        self.run_tool('bob', 'commit', '-m', 'Change two', 'a/two.txt')                    # bob can touch the neighbour, and the same file again
+        (self.root / 'a/one.txt').write_text('1b\n'); self.run_tool('bob', 'commit', '-m', 'Change one again', 'a/one.txt')
+        self.run_tool('alice', 'claim', 'a/two.txt'); f = self.root / '.agents' / 'claims' / 'alice.json'
+        old = time.time() - 5 * 3600; os.utime(f, (old, old))
+        (self.root / 'a/two.txt').write_text('2b\n'); self.run_tool('alice', 'commit', '-m', 'Change two again', 'a/two.txt')
+        self.assertLess(time.time() - f.stat().st_mtime, 60)                               # committing under a claim keeps it fresh
+
     def test_commit_handles_deletions(self):
         (self.root / 'a/two.txt').unlink()
         self.run_tool('alice', 'commit', '-m', 'Remove two', 'a/two.txt')

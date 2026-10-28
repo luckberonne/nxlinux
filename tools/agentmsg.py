@@ -229,7 +229,8 @@ def cmd_commit(st, root, args):
     if hits:
         for p, who, q, note in hits: print(f'{p}: claimed by {who} ({q})', file=sys.stderr)
         sys.exit('agentmsg: refusing to commit paths another agent has claimed')
-    save_claim(st, me, paths, '')                      # committing refreshes (and takes) the claim on what it touches
+    f = st / 'claims' / f'{me}.json'                    # committing refreshes a claim that already exists, and never creates one:
+    if f.exists(): os.utime(f)                          # a shared file does not become mine, and blocked for the others, by being committed
     git = ['git', '-C', str(root)]
     subprocess.run(git + ['add', '-A', '--'] + paths, check=True)
     r = subprocess.run(git + ['commit', '-m', msg, '--'] + paths, capture_output=True, text=True)
