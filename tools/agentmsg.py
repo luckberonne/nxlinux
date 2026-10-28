@@ -4,6 +4,7 @@
 State lives in <repo>/.agents/ (git-ignored): one JSON file per message, one claims file per agent. Standard library only.
 
   agentmsg.py --as NAME send --to NAME|all [--kind info|question|request|handoff] [--reply-to ID] -m TEXT
+  agentmsg.py --as NAME start                 the one command to begin with: the rules in short, who claims what, your unread mail
   agentmsg.py --as NAME inbox [--peek]        unread messages for NAME and for "all"; marks them read unless --peek
   agentmsg.py --as NAME claim PATH... [--note TEXT] [--force]
   agentmsg.py --as NAME release [PATH...]     without paths, releases everything
@@ -11,7 +12,8 @@ State lives in <repo>/.agents/ (git-ignored): one JSON file per message, one cla
   agentmsg.py --as NAME commit -m "one line" PATH...   commits only those paths, refusing paths another agent has claimed
   agentmsg.py hook                            what .githooks/pre-commit runs: warns, never blocks (AGENTS_STRICT=1 blocks)
 
-NAME comes from --as or the AGENT_NAME environment variable. See docs/agents/README.md.
+NAME comes from --as or the AGENT_NAME environment variable. See docs/agents/README.md. Any agent that can run a shell command can use it,
+whatever tool it is; --json makes inbox, status and start print JSON for programs.
 """
 import argparse, json, os, re, secrets, subprocess, sys, time
 from datetime import datetime, timezone
@@ -77,17 +79,28 @@ def cmd_send(st, args):
     print(mid)
 
 
-def cmd_inbox(st, args):
-    me = need_name(args)
+def unread_for(st, me):
     seen = read_ids(st, me)
-    unread = [m for m in load_mail(st, me) if m['id'] not in seen]
-    if not unread: print('no unread messages'); return
-    for m in unread:
+    return [m for m in load_mail(st, me) if m['id'] not in seen]
+
+
+def mark_read(st, me, msgs):
+    f = read_file(st, me); f.parent.mkdir(parents=True, exist_ok=True)
+    with open(f, 'a') as fh: fh.write(''.join(m['id'] + '\n' for m in msgs))
+
+
+def print_messages(msgs):
+    if not msgs: print('no unread messages'); return
+    for m in msgs:
         print(f"--- {m['id']}  from {m['from']}  to {m['to']}  [{m['kind']}]" + (f"  re {m['reply_to']}" if m.get('reply_to') else ''))
         print(m['text'])
-    if not args.peek:
-        f = read_file(st, me); f.parent.mkdir(parents=True, exist_ok=True)
-        with open(f, 'a') as fh: fh.write(''.join(m['id'] + '\n' for m in unread))
+
+
+def cmd_inbox(st, args):
+    me = need_name(args)
+    unread = unread_for(st, me)
+    print(json.dumps(unread, indent=1)) if args.json else print_messages(unread)
+    if unread and not args.peek: mark_read(st, me, unread)
 
 
 # ---------------------------------------------------------------- claims
@@ -157,17 +170,52 @@ def cmd_release(st, root, args):
     print('released: ' + ' '.join(drop))
 
 
-def cmd_status(st, args):
-    claims = load_claims(st)
-    if not claims: print('no claims')
-    for c in sorted(claims, key=lambda c: c['agent']):
-        print(f"{c['agent']}{'  (stale: not refreshed for %.0f h)' % c['age_h'] if c['stale'] else ''}" + (f"  - {c['note']}" if c.get('note') else ''))
-        for p in c['paths']: print('   ' + p)
+def unread_counts(st):
+    out = {}
     mail = st / 'mail'
     if mail.is_dir():
         for box in sorted(p.name for p in mail.iterdir() if p.is_dir() and p.name != 'all'):
-            n = len([m for m in load_mail(st, box) if m['id'] not in read_ids(st, box)])
-            if n: print(f'{box}: {n} unread message(s)')
+            n = len(unread_for(st, box))
+            if n: out[box] = n
+    return out
+
+
+def status_data(st):
+    claims = [{k: c.get(k) for k in ('agent', 'paths', 'note', 'since', 'updated', 'stale', 'age_h')} for c in sorted(load_claims(st), key=lambda c: c['agent'])]
+    return {'claims': claims, 'unread': unread_counts(st)}
+
+
+def print_status(d):
+    if not d['claims']: print('no claims')
+    for c in d['claims']:
+        print(f"{c['agent']}{'  (stale: not refreshed for %.0f h)' % c['age_h'] if c['stale'] else ''}" + (f"  - {c['note']}" if c.get('note') else ''))
+        for p in c['paths']: print('   ' + p)
+    for box, n in d['unread'].items(): print(f'{box}: {n} unread message(s)')
+
+
+def cmd_status(st, args):
+    d = status_data(st)
+    print(json.dumps(d, indent=1)) if args.json else print_status(d)
+
+
+RULES = """Rules for this shared checkout (full text: docs/agents/README.md, AGENTS.md)
+ 1. Read your mail first (this command did). Ask the other agent with: send --to NAME --kind question -m "..."
+ 2. Claim what you will change outside your own area:  claim PATH... --note "why"   (release when done)
+ 3. Commit ONLY with:  commit -m "one plain line" PATH...    Never git add -A / git commit -a / git add .
+ 4. Build in your own directory (build-NAME), not build/.
+ 5. When you stop or hand over:  send --to all --kind handoff -m "done / not done / files / next"
+ 6. No game files, keys or firmware in the repo or in messages. Commit messages never mention an agent or an AI."""
+
+
+def cmd_start(st, root, args):
+    me = need_name(args)
+    unread = unread_for(st, me)
+    if args.json:
+        print(json.dumps({'you': me, 'status': status_data(st), 'inbox': unread}, indent=1))
+    else:
+        print(f'You are {me}.\n\n{RULES}\n\n== status =='); print_status(status_data(st))
+        print('\n== your mail =='); print_messages(unread)
+    if unread: mark_read(st, me, unread)
 
 
 # ---------------------------------------------------------------- git
@@ -198,12 +246,7 @@ def cmd_hook(st, root, args):
         if c['stale']: continue
         for p in staged:
             if any(overlap(p, q) for q in c['paths']): warn.append(f"  {p} is claimed by {c['agent']}")
-    mail = st / 'mail'
-    unread = []
-    if mail.is_dir():
-        for box in sorted(p.name for p in mail.iterdir() if p.is_dir() and p.name != 'all'):
-            n = len([m for m in load_mail(st, box) if m['id'] not in read_ids(st, box)])
-            if n: unread.append(f'{box}: {n}')
+    unread = [f'{box}: {n}' for box, n in unread_counts(st).items()]
     if warn: print('agentmsg: staged files another agent has claimed:\n' + '\n'.join(warn), file=sys.stderr)
     if unread: print('agentmsg: unread messages -> ' + ', '.join(unread) + '  (tools/agentmsg.py --as NAME inbox)', file=sys.stderr)
     if warn and os.environ.get('AGENTS_STRICT') == '1': sys.exit(1)
@@ -211,21 +254,22 @@ def cmd_hook(st, root, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--as', dest='agent'); ap.add_argument('--root')
+    ap.add_argument('--as', dest='agent'); ap.add_argument('--root'); ap.add_argument('--json', action='store_true', help='machine-readable output for inbox, status and start')
     sub = ap.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('send'); s.add_argument('--to', required=True); s.add_argument('--kind', default='info', choices=['info', 'question', 'request', 'handoff'])
     s.add_argument('--reply-to'); s.add_argument('-m', '--message')
     i = sub.add_parser('inbox'); i.add_argument('--peek', action='store_true')
+    st_p = sub.add_parser('status'); sa = sub.add_parser('start')
+    for sp in (i, st_p, sa): sp.add_argument('--json', action='store_true', default=argparse.SUPPRESS, help='JSON output (also accepted before the subcommand)')
     c = sub.add_parser('claim'); c.add_argument('paths', nargs='+'); c.add_argument('--note', default=''); c.add_argument('--force', action='store_true')
     r = sub.add_parser('release'); r.add_argument('paths', nargs='*')
-    sub.add_parser('status')
     g = sub.add_parser('commit'); g.add_argument('-m', '--message', required=True); g.add_argument('paths', nargs='+')
     sub.add_parser('hook')
     args = ap.parse_args()
     root = root_dir(args); st = root / '.agents'
     {'send': lambda: cmd_send(st, args), 'inbox': lambda: cmd_inbox(st, args), 'claim': lambda: cmd_claim(st, root, args),
      'release': lambda: cmd_release(st, root, args), 'status': lambda: cmd_status(st, args), 'commit': lambda: cmd_commit(st, root, args),
-     'hook': lambda: cmd_hook(st, root, args)}[args.cmd]()
+     'hook': lambda: cmd_hook(st, root, args), 'start': lambda: cmd_start(st, root, args)}[args.cmd]()
 
 
 if __name__ == '__main__':

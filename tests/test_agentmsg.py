@@ -95,6 +95,25 @@ class T(unittest.TestCase):
         self.assertFalse((self.root / 'a/two.txt').exists())
         self.assertIn('D\ta/two.txt', self.git('show', '--name-status', '--format=', 'HEAD'))
 
+    # ---- the entry point for an agent of any kind, and JSON for programs
+    def test_start_shows_rules_status_and_mail_once(self):
+        self.run_tool('alice', 'claim', 'a', '--note', 'on a')
+        self.run_tool('alice', 'send', '--to', 'bob', '--kind', 'question', '-m', 'are you there?')
+        out = self.run_tool('bob', 'start').stdout
+        for needle in ('You are bob', 'commit -m', 'never mention an agent', 'alice', 'on a', 'are you there?'): self.assertIn(needle, out)
+        self.assertIn('no unread', self.run_tool('bob', 'start').stdout)                 # read once, not shown again
+
+    def test_json_output_parses(self):
+        self.run_tool('alice', 'claim', 'a')
+        self.run_tool('alice', 'send', '--to', 'bob', '-m', 'hi', '--kind', 'request')
+        st = json.loads(self.run_tool(None, 'status', '--json').stdout)
+        self.assertEqual(st['claims'][0]['agent'], 'alice'); self.assertEqual(st['claims'][0]['paths'], ['a']); self.assertEqual(st['unread'], {'bob': 1})
+        peek = json.loads(self.run_tool('bob', 'inbox', '--json', '--peek').stdout)
+        self.assertEqual([m['text'] for m in peek], ['hi']); self.assertEqual(peek[0]['kind'], 'request')
+        both = json.loads(self.run_tool('bob', 'start', '--json').stdout)                # one document, not several
+        self.assertEqual(set(both), {'you', 'status', 'inbox'}); self.assertEqual(both['you'], 'bob'); self.assertEqual(len(both['inbox']), 1)
+        self.assertEqual(json.loads(self.run_tool('bob', 'inbox', '--json').stdout), [])
+
     # ---- hook
     def test_hook_warns_and_strict_blocks(self):
         self.run_tool('bob', 'claim', 'a')

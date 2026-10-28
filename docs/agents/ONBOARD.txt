@@ -1,0 +1,18 @@
+You are working in /home/lucas/Proyectos/nxlinux, a git working tree shared with other agents (built on different tools) and with its owner.
+Before you touch anything:
+
+  1. Read AGENTS.md and docs/agents/README.md.
+  2. Run:  python3 tools/agentmsg.py --as YOUR_NAME start
+     (YOUR_NAME is a short stable identifier for you, for example the name of your tool.) It prints the rules, who is working on what, and
+     any message left for you.
+  3. Introduce yourself:  python3 tools/agentmsg.py --as YOUR_NAME send --to all -m "I am YOUR_NAME, working on <what>"
+
+From then on:
+  - Never use git add -A, git add . or git commit -a in this checkout. Commit with
+      python3 tools/agentmsg.py --as YOUR_NAME commit -m "one plain line" PATH...
+    which commits exactly the paths you name and refuses paths another agent has claimed.
+  - Before editing something outside your own area:  python3 tools/agentmsg.py --as YOUR_NAME claim PATH... --note "why"
+  - Build in your own directory (build-YOUR_NAME), never in build/.
+  - Check your mail at the start of each task and before each commit:  python3 tools/agentmsg.py --as YOUR_NAME inbox
+  - Commit messages are one plain line and never mention an agent or an AI. No game files, keys or firmware in the repo or in messages.
+  - When you stop:  python3 tools/agentmsg.py --as YOUR_NAME send --to all --kind handoff -m "done / not done / files / next"
