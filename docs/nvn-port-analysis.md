@@ -162,3 +162,8 @@ draws with a fragment shader made that way and expects constant orange; `tests/t
 
 The translator declares the capabilities of its whole instruction set in every module (Float64, ImageGatherExtended, fragment shader interlock), so the device now enables
 those features; a GPU without them cannot take translated shaders. RADV has all three. The validation layers caught this: the module was accepted but undeclared-feature use was flagged.
+
+Stage ten of the draw test runs a whole translated pair: `maxwell_asm.vertex_passthrough()` (ALD of attribute 0 as the position and 1 as the colour, AST to the position and
+to generic output 0) and `fragment_varying()` (IPA of generic input 0 into target 0). Two things came out of the validation layers: the translator's SPIR-V uses
+DrawParameters (the device now enables `shaderDrawParameters`), and its `gl_PerVertex` block carried ClipDistance[8] plus CullDistance[1], over the 8 that
+`maxCombinedClipAndCullDistances` allows on RADV. Maxwell has no cull distances, so the vendored translator (`CodeGen/Spirv/Declarations.cs`) no longer declares that member.

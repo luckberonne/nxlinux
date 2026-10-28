@@ -22,6 +22,26 @@ def exit_():
     return (0xE30 << 52) | (PT << 16) | 0xF
 
 
+def _attr_access(opcode13, reg, rb, offset, size, extra=0):
+    return (opcode13 << 51) | (extra) | ((size & 3) << 47) | ((offset & 0x7FF) << 20) | (PT << 16) | (255 << 8) | (reg & 0xFF)
+
+
+def ald(rd, offset, comps=4):
+    """ALD Rd.., a[offset]: loads `comps` (1-4) consecutive 32-bit components of an input attribute (0x70 = position, 0x80 + 16 n = generic attribute n).
+    0xEFD8 << 48 in the table: 13 bits 1110111111011; Rd bits 0-7, the register holding the address (RZ here) bits 8-15, the byte offset bits 20-30, size bits 47-48."""
+    return _attr_access(0b1110111111011, rd, 0, offset, comps - 1)
+
+
+def ast(rs, offset, comps=4):
+    """AST a[offset], Rs..: stores `comps` consecutive registers to an output attribute (13 bits 1110111111110; the data register is in bits 0-7)"""
+    return _attr_access(0b1110111111110, rs, 0, offset, comps - 1)
+
+
+def ipa(rd, offset):
+    """IPA Rd, a[offset]: a fragment shader's interpolated input (8 bits 11100000; the byte offset in bits 28-37; mode Pass; RZ as the other operand registers)"""
+    return (0xE0 << 56) | ((offset & 0x3FF) << 28) | (255 << 20) | (PT << 16) | (255 << 8) | (rd & 0xFF)
+
+
 def f32(x):
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
@@ -53,6 +73,16 @@ def program(instrs, header, pad_to=0x100):
 def fragment_constant(r, g, b, a):
     """A fragment shader that writes one constant colour to target 0"""
     return program([mov32i(0, f32(r)), mov32i(1, f32(g)), mov32i(2, f32(b)), mov32i(3, f32(a)), exit_()], sph(FRAGMENT, omap_targets=0xF))
+
+
+def vertex_passthrough():
+    """A vertex shader: attribute 0 (x, y, z, w) is the position, attribute 1 goes out as generic output 0 (the colour)"""
+    return program([ald(0, 0x80), ald(4, 0x90), ast(0, 0x70), ast(4, 0x80), exit_()], sph(VERTEX))
+
+
+def fragment_varying():
+    """A fragment shader that writes generic input 0, perspective-interpolated, to target 0"""
+    return program([ipa(0, 0x80), ipa(1, 0x84), ipa(2, 0x88), ipa(3, 0x8C), exit_()], sph(FRAGMENT, omap_targets=0xF, imap=[0xAA]))
 
 
 if __name__ == '__main__':

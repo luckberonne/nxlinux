@@ -50,7 +50,8 @@ int vkctx_create(vkctx_t *c) {
     VkPhysicalDeviceDepthClipControlFeaturesEXT dcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &xfb};
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &dcc};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
-    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
+    VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
     vkGetPhysicalDeviceFeatures2(c->pd, &f2);
     VkPhysicalDeviceFeatures *f = &f2.features;
     // What the NVN backend cannot do without
@@ -71,6 +72,7 @@ int vkctx_create(vkctx_t *c) {
     VkPhysicalDeviceDepthClipControlFeaturesEXT edcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &exfb, c->has_depth_clip_control};
     VkPhysicalDeviceVulkan13Features e13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &edcc, .dynamicRendering = 1, .synchronization2 = 1,
                                             .shaderDemoteToHelperInvocation = f13.shaderDemoteToHelperInvocation};
+    VkPhysicalDeviceVulkan11Features e11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, NULL, .shaderDrawParameters = f11.shaderDrawParameters};
     VkPhysicalDeviceVulkan12Features e12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &e13, .bufferDeviceAddress = 1, .timelineSemaphore = 1,
         .runtimeDescriptorArray = 1, .shaderSampledImageArrayNonUniformIndexing = f12.shaderSampledImageArrayNonUniformIndexing,
         .descriptorBindingPartiallyBound = 1, .descriptorBindingSampledImageUpdateAfterBind = 1, .descriptorBindingUpdateUnusedWhilePending = f12.descriptorBindingUpdateUnusedWhilePending,
@@ -81,7 +83,8 @@ int vkctx_create(vkctx_t *c) {
         .fragmentStoresAndAtomics = f->fragmentStoresAndAtomics, .textureCompressionBC = 1, .depthClamp = f->depthClamp, .fillModeNonSolid = f->fillModeNonSolid,
         .multiDrawIndirect = f->multiDrawIndirect, .imageCubeArray = f->imageCubeArray, .shaderStorageImageWriteWithoutFormat = f->shaderStorageImageWriteWithoutFormat,
         .drawIndirectFirstInstance = f->drawIndirectFirstInstance, .logicOp = f->logicOp};
-    VkPhysicalDeviceFeatures2 ef2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e12, .features = ef};
+    e11.pNext = &e12; e12.pNext = &e13; e13.pNext = &edcc;
+    VkPhysicalDeviceFeatures2 ef2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e11, .features = ef};
 
     uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(c->pd, &nq, NULL);
     VkQueueFamilyProperties qp[16]; if (nq > 16) nq = 16; vkGetPhysicalDeviceQueueFamilyProperties(c->pd, &nq, qp);

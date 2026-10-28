@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Builds the shader library tests/test_nvn_draw.cpp loads for its ninth stage: a Maxwell fragment shader that writes constant orange, assembled by tools/maxwell_asm.py,
+"""Builds the shader library tests/test_nvn_draw.cpp loads for its last two stages: a Maxwell fragment shader that writes constant orange, and a vertex/fragment pair that
+passes a position and a colour through, assembled by tools/maxwell_asm.py,
 translated to SPIR-V by tools/dmsh_xlate and packed by tools/shader_pack.py.
 
 Usage: make_maxwell_lib.py dmsh_xlate.dll out.nxsl workdir
@@ -34,8 +35,10 @@ def translate(dll, jobs, workdir):
 def main(argv):
     if len(argv) != 4: sys.exit(__doc__)
     dll, lib, work = argv[1:]
-    key = stand_in_key()
-    out = translate(dll, [{'key': key, 'stage': 'ps', 'code': maxwell_asm.fragment_constant(1.0, 0.5, 0.0, 1.0), 'fout': {'0': 'float'}}], work)
+    out = translate(dll, [
+        {'key': stand_in_key(), 'stage': 'ps', 'code': maxwell_asm.fragment_constant(1.0, 0.5, 0.0, 1.0), 'fout': {'0': 'float'}},
+        {'key': stand_in_key(0x55, 0xF6), 'stage': 'vs', 'code': maxwell_asm.vertex_passthrough(), 'attr': {'0': 'float', '1': 'float'}},
+        {'key': stand_in_key(0x66, 0x07), 'stage': 'ps', 'code': maxwell_asm.fragment_varying(), 'fout': {'0': 'float'}}], work)
     shader_pack.main(['shader_pack.py', lib, str(out)])
 
 

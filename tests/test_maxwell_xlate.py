@@ -56,6 +56,17 @@ class Translator(unittest.TestCase):
             self.assertEqual((e['key'], e['stage'], e['needs'], e['binds']), (key, 1, 0, []))
             self.assertEqual(e['spirv'], spv.read_bytes())
 
+    def test_vertex_fragment_pair(self):
+        with tempfile.TemporaryDirectory() as d:
+            kv, kp = make_maxwell_lib.stand_in_key(0x55, 0xF6), make_maxwell_lib.stand_in_key(0x66, 0x07)
+            out = make_maxwell_lib.translate(DLL, [
+                {'key': kv, 'stage': 'vs', 'code': maxwell_asm.vertex_passthrough(), 'attr': {'0': 'float', '1': 'float'}},
+                {'key': kp, 'stage': 'ps', 'code': maxwell_asm.fragment_varying(), 'fout': {'0': 'float'}}], d)
+            for k in (kv, kp):
+                if shutil.which('spirv-val'): subprocess.run(['spirv-val', '--target-env', 'vulkan1.3', str(out / f'{k}.spv')], check=True)
+            vs = (out / f'{kv}.spv').read_bytes()
+            self.assertNotIn(b'gl_CullDistance', vs)            # the patched per-vertex block has no cull member (Vulkan caps clip + cull sizes together)
+
     def test_stand_in_key_is_stable(self):
         self.assertEqual(len(make_maxwell_lib.stand_in_key()), 16)
         self.assertNotEqual(make_maxwell_lib.stand_in_key(), make_maxwell_lib.stand_in_key(fill_code=0xE6))
