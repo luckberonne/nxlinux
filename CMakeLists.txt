@@ -32,7 +32,7 @@ add_executable(test_module tests/test_module.cpp)
 target_link_libraries(test_module PRIVATE nxhost pthread)
 add_dependencies(test_module mod_a_so)
 add_test(NAME module COMMAND test_module ${MOD_A})
-target_sources(nxhost PRIVATE src/host/kernel.c)
+target_sources(nxhost PRIVATE src/host/kernel.c src/host/mem.c)
 set(GUEST_THREADS ${CMAKE_BINARY_DIR}/threads.so)
 add_custom_command(OUTPUT ${GUEST_THREADS}
     COMMAND clang --target=aarch64-linux-gnu -O1 -fPIC -nostdlib -shared -fuse-ld=lld -o ${GUEST_THREADS} ${CMAKE_SOURCE_DIR}/tests/guest/threads.c
@@ -42,3 +42,12 @@ add_executable(test_kernel tests/test_kernel.cpp)
 target_link_libraries(test_kernel PRIVATE nxhost pthread)
 add_dependencies(test_kernel threads_so)
 add_test(NAME kernel COMMAND test_kernel ${GUEST_THREADS})
+set(GUEST_MEMORY ${CMAKE_BINARY_DIR}/memory.so)
+add_custom_command(OUTPUT ${GUEST_MEMORY}
+    COMMAND clang --target=aarch64-linux-gnu -O1 -fPIC -nostdlib -shared -fuse-ld=lld -o ${GUEST_MEMORY} ${CMAKE_SOURCE_DIR}/tests/guest/memory.c
+    DEPENDS tests/guest/memory.c)
+add_custom_target(memory_so DEPENDS ${GUEST_MEMORY})
+add_executable(test_mem tests/test_mem.cpp)
+target_link_libraries(test_mem PRIVATE nxhost pthread)
+add_dependencies(test_mem memory_so)
+add_test(NAME mem COMMAND test_mem ${GUEST_MEMORY})

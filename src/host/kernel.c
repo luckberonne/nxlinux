@@ -146,6 +146,7 @@ static void on_svc(cpu_t *c, uint32_t swi, void *user);
 static void on_fault(cpu_t *c, uint64_t pc, int kind, void *user);
 static uint64_t cntpct_cb(void) { return kernel_cntpct(); }
 extern int hle_dispatch(cpu_t *c, uint32_t swi);      // hle_stub.c
+extern int mem_svc(cpu_t *c, uint32_t swi);           // mem.c
 
 static uint64_t tlr_alloc(void) {                      // holding G
     if (g_ntlr_free) return g_tlr_free[--g_ntlr_free];
@@ -248,6 +249,7 @@ static void on_fault(cpu_t *c, uint64_t pc, int kind, void *user) {
 static void on_svc(cpu_t *c, uint32_t swi, void *user) {
     (void)user;
     if (kernel_svc(c, swi)) return;
+    if (mem_svc(c, swi)) return;
     if (hle_dispatch(c, swi)) return;
     fprintf(stderr, "[RED] unimplemented svc %#x (lr=%#llx)\n", swi, (unsigned long long)cpu_get_x(c, 30));
     cpu_set_x(c, 0, 0xF201u);   // Svc::ResultNotImplemented

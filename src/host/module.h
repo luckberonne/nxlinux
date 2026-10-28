@@ -13,6 +13,7 @@ typedef struct {
     const char *strtab;
     unsigned nsym;
     uint64_t init, init_array, init_arraysz;
+    uint64_t ro_off, data_off;   // segment offsets from base (0 = unknown): code [0,ro) RX, read-only [ro,data) R, data and bss [data,size) RW
 } module_t;
 
 // img: text+ro+data laid out at their memory offsets (what tools/nso.py produces); bss zero bytes follow it.
@@ -23,3 +24,8 @@ int64_t module_dyn_from_mod0(const uint8_t *img, size_t len);   // -1 if there i
 // Returns the number of imports that bound to a stub with no registered host function.
 int module_relocate(module_t *m, module_t **loaded, int nloaded);
 uint64_t module_sym(const module_t *m, const char *name);   // guest address of a defined symbol, 0 if none
+
+// Registry for QueryMemory: modules are found by address.
+void module_register(module_t *m);
+module_t *module_of(uint64_t addr);
+uint64_t module_image_bytes(void);   // total size of the registered modules, page-rounded (counted against the application pool by SetHeapSize)

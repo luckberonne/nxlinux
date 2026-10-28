@@ -90,3 +90,13 @@ int module_relocate(module_t *m, module_t **loaded, int nloaded) {
     }
     return unimpl;
 }
+
+#define MAX_MODULES 128
+static module_t *g_modules[MAX_MODULES];
+static int g_nmodules;
+void module_register(module_t *m) { if (g_nmodules < MAX_MODULES) g_modules[g_nmodules++] = m; }
+module_t *module_of(uint64_t addr) {
+    for (int i = 0; i < g_nmodules; i++) if (addr >= g_modules[i]->base && addr - g_modules[i]->base < g_modules[i]->size) return g_modules[i];
+    return NULL;
+}
+uint64_t module_image_bytes(void) { uint64_t n = 0; for (int i = 0; i < g_nmodules; i++) n += g_modules[i]->size; return (n + 0x1fffff) & ~0x1fffffull; }

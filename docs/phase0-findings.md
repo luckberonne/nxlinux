@@ -33,3 +33,15 @@ register context per guest thread. A thread borrows a Jit only while it runs gue
 (CallSVC halts with UserDefined2), the kernel handles it outside, where it may block without holding a Jit, and the
 thread resumes on any free Jit. Creating a guest thread is now free. Pool ids are the exclusive-monitor slots and must be
 reserved under the lock (two Jits with the same id lost atomic updates).
+
+## Memory SVCs (src/host/mem.c)
+The window is partitioned [low | alias | stack | heap]; everything above the low region is PROT_NONE until committed.
+Host pages are 4 KiB here, like Horizon's, so nxnative's 16 KiB rounding, "exposed page" tracking and eager zeroing are gone:
+unmapping and heap shrinking `madvise(MADV_DONTNEED)`, which makes remapped memory read as zero. Implemented: SetHeapSize
+(OutOfMemory 0xD001 past the region, LimitReached 0x10801 past the pool less the images), SetMemoryPermission/Attribute,
+MapMemory/UnmapMemory (copy semantics, borrowed sources tracked, shrink/permission changes on a borrowed source refused),
+QueryMemory (heap, mappings, alias runs, free gaps, modules in Horizon's Code RX / Code R / CodeData RW layout, host-made
+stacks as Stack), Map/UnmapPhysicalMemory (alias page bitmap, optional pool limit), GetInfo, Break (bit 31 = notification),
+OutputDebugString and GetSystemTick. GetSystemTick returns the tick count in x0 itself (the ABI), where nxnative returned
+it in x1 behind a Result.
+Not ported (Apple- or diagnostic-specific): address-region tracking via SDK gates, the Unreal heap zone, NRO deactivation.
