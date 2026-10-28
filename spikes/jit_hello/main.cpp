@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 
+using namespace Dynarmic;
 using namespace Dynarmic::A64;
 
 // Guest window, reserved at a fixed address so guest pointers are host pointers.
@@ -62,7 +63,7 @@ int main() {
         0xAA0403E0, // mov x0, x4         out ptr
         0xAA0503E1, // mov x1, x5         string ptr
         0xD4000861, // svc #0x43          hle_poke
-        0xD53BD046, // mrs x6, tpidrro_el0
+        0xD53BD066, // mrs x6, tpidrro_el0
         0xD53BD047, // mrs x7, tpidr_el0
         0xD53BE028, // mrs x8, cntpct_el0
         0xD4000021, // svc #1 (halt)
