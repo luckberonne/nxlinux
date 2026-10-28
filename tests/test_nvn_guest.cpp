@@ -60,6 +60,10 @@ int main(int argc, char **argv) {
     EXPECT(24, 42);                                            // the event: written 7, then 35 added
     EXPECT(25, 1); EXPECT(26, 1); EXPECT(27, 1); EXPECT(28, 1); EXPECT(29, 1); EXPECT(30, 1);
     EXPECT(31, 0x5555);
+    EXPECT(40, 1); EXPECT(41, 1);                              // a texture: built, storage in place
+    EXPECT(42, 1);                                             // written by the CPU (block-linear in the pool), copied out by the GPU: equal
+    EXPECT(43, 1);                                             // patched by a GPU buffer->texture copy with a padded row stride, copied out again
+    EXPECT(44, 1); EXPECT(45, 1);                              // ReadTexels: the GPU-written region (read back) and an untouched corner
     CHECK(hle_unimplemented_calls == 0);
     printf("replayed on %s: END %llu, COPY_B2B %llu, CLEAR_BUF %llu, UPDATE_UB %llu, SIGNAL_EVENT %llu, REPORT_COUNTER %llu, FENCE_SYNC %llu, BARRIER %llu\n", nvn_gpu_name(),
            (unsigned long long)nvn_replay_ops_named("OP_END"), (unsigned long long)nvn_replay_ops_named("OP_COPY_B2B"), (unsigned long long)nvn_replay_ops_named("OP_CLEAR_BUF"),

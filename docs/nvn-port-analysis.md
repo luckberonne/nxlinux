@@ -90,3 +90,22 @@ submission completes), `OP_BARRIER` (a full memory barrier covers every combinat
   7, then 35 added). A control run with `NX_NULL_GPU=1` fails exactly the data checks, so the test does discriminate. `test_nvn_vk_pool` covers
   the order of effects over many submissions and hand-built lists (CALL, JUMP, the staging path with an odd size and offset).
 Not yet: the samples-passed counter (needs occlusion queries), conditional rendering, and every op that draws.
+
+## Textures on Vulkan (src/gfx/nvn/nvn_tex_vk.c)
+Each NVN texture gets a `VkImage` (mip levels, array layers, cube and 3D; format from the `nvn_fmt_to_vk` table, usage from the format's features).
+Images stay in `VK_IMAGE_LAYOUT_GENERAL`: one layout serves transfers, sampling, storage and attachments, so no transitions are tracked.
+- **Where the truth is, per subresource** (a mip level of one array layer). The storage in the pool (block-linear) is the truth for packaged
+  textures and for what the CPU writes; the image is a cache of it and a subresource marked DIRTY is de-swizzled (`nvn_deswizzle`) and uploaded
+  the next time the GPU uses it. A buffer->texture copy makes the image the truth for what it covers (GPU). A CPU read of a subresource the GPU did
+  not write de-swizzles the storage directly; of one it did, reads the image back after the submitted work has completed.
+  Per subresource, because `hle_nvn.c` knows the level and layers a `WriteTexels` touches (`mtl_tex_cpu_written_sub`): a whole-texture flag
+  would re-upload the storage over what the GPU wrote to other levels, which nxnative avoids by mirroring every copy back into the storage.
+- **Copies**: `OP_COPY_B2T` / `OP_COPY_T2B` with the row and image strides of `OP_COPY_STRIDE` (a padded stride works), regions inside a level,
+  edge blocks of compressed formats. Not yet: copies between textures, texture clears, the mirror into the storage that nxnative keeps for the
+  CPU's benefit, depth-stencil upload, multisampled textures, formats Vulkan lacks here (ASTC; the 3-component formats need expanding).
+- **Released textures** are destroyed once the timeline passes every submission that may mention them.
+- **Thread safety**: the queue and the command pool are externally synchronised, so submit, one-shot readbacks and command buffer recycling
+  share a lock.
+- Found on the way: a barrier that transitions only layer 0 left array layers and cube faces in `UNDEFINED`; RADV tolerated it and the
+  validation layer reported it. `test_nvn_vk_tex` (2D with mips, BC1, BC7 with edge blocks, 2D array, 3D, cube, padded strides, both `ReadTexels`
+  paths, the CPU rewriting one level of a GPU-written texture) and the texture section of `test_nvn_guest` (through the real NVN API) cover it.

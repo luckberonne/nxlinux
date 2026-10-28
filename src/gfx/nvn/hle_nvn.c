@@ -2512,7 +2512,7 @@ static void write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r
         dm_guest_write_prepare(t->mem, t->L.size);
         int ok = 1;
         for (int z = 0; z < nz && ok; z++) ok = !write_region_bl(t, level, layer0 + (unsigned)(r->zoffset + z), r, src + (size_t)z * img0, row0, bw, bh, bpb);
-        if (ok) { mtl_tex_cpu_written(t); return; }
+        if (ok) { mtl_tex_cpu_written_sub(t, level, layer0 + (unsigned)r->zoffset, (unsigned)nz); return; }
     }
     uint32_t lw = t->d.width >> level ? t->d.width >> level : 1, lh = t->d.height >> level ? t->d.height >> level : 1, lz = is3d ? (t->d.depth >> level ? t->d.depth >> level : 1) : 1;
     size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
@@ -2531,7 +2531,7 @@ static void write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r
         if (!is3d || z == nz - 1) nvn_swizzle(&t->d, level, layer, lin, lp, t->mem);
     }
     free(lin);
-    mtl_tex_cpu_written(t);
+    mtl_tex_cpu_written_sub(t, level, is3d ? 0 : layer0 + (unsigned)r->zoffset, is3d ? 1u : (unsigned)nz);
 }
 NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) { write_texels(CTX(t), (const view_t *)v, r, src, 0, 0); }
 // with the source's row and image strides in bytes (0 = tightly packed, as WriteTexels)

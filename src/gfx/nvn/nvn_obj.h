@@ -182,6 +182,8 @@ typedef struct { int32_t on; } p_rast_discard;
 
 // Entry point of the Metal replay layer (nvn_mtl.m): replays a set of command handles into the current submission
 void mtl_exec(const uint8_t *handle);
+// The CPU wrote layers [layer0, layer0+nlayers) of one mip level (a 3D texture's level is layer 0, one layer): only those subresources are filled from the storage again
+void mtl_tex_cpu_written_sub(const tex_t *t, unsigned level, unsigned layer0, unsigned nlayers);
 void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value);   // in-order buffer fill within the submission (OP_CLEAR_BUF)
 void mtl_exec_rest(const uint64_t *handles, int n);   // Tells which handles in this submission still follow the current handle (used by the pass lookahead across handles)
 // Present: draw the swapchain texture to the front-end CAMetalLayer (only counts when there is no window)

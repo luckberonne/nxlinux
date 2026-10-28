@@ -4,7 +4,8 @@
 #include "nvn_mtl.h"
 #include <stdatomic.h>
 
-// Memory pools, submissions and fences are in nvn_vk.c.
+// Memory pools, submissions and fences are in nvn_vk.c; textures in nvn_tex_vk.c. On the null GPU there are no images: a texture the
+// game writes through the CPU is read back by de-swizzling its storage only, and a GPU-owned one reads as zero.
 
 // ---- presentation: no window, no display link; the game paces itself against its own clock
 static _Atomic uint64_t g_ticket;
@@ -49,7 +50,6 @@ void mtl_prog_release(prog_t *p) { (void)p; }
 void mtl_pso_line(char *out, size_t n) { if (n) out[0] = 0; }
 void mtl_queue_activate(uint64_t serial) { (void)serial; }
 void mtl_queue_forget(uint64_t serial) { (void)serial; }
-void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) { (void)t; (void)level; (void)layer0; (void)r; (void)dst; (void)row; (void)img; }
 void mtl_reg_image(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
 void mtl_reg_samp(int id, const samp_par *p) { (void)id; (void)p; }
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
@@ -59,9 +59,6 @@ void mtl_set_origin_lower_left(int on) { (void)on; }
 void mtl_set_queue_origin_lower_left(int on) { (void)on; }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 void mtl_stats(uint64_t *passes, uint64_t *draws) { if (passes) *passes = 0; if (draws) *draws = 0; }
-void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
-void mtl_tex_init(const tex_t *t) { (void)t; }
-void mtl_tex_release(tex_t *t) { (void)t; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 uint64_t mtl_udc_saved_bytes(void) { return 0; }
 uint64_t mtl_upload_bytes(void) { return 0; }

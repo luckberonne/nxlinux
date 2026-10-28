@@ -45,8 +45,10 @@ static struct {
     // the submission being recorded: actions to run after it completes, and staging buffers it reads
     post_op *ops; int nops, capops; vkbuf_t *stg; int nstg, capstg;
     // submissions waiting for the GPU, oldest first; the completion thread and any waiter drain it
+    pthread_mutex_t vk_mu;                              // the queue and the command pool are externally synchronized: submit, one-shot readbacks and command buffer recycling take it
+    struct { VkImage img; VkImageView view; VkDeviceMemory mem; uint64_t value; } dead[256]; int ndead;   // images to destroy once the timeline passes `value`
     pthread_mutex_t q_mu; pthread_cond_t q_cv; sub_rec *q; size_t qhead, qn, qcap; pthread_t thread; int thread_up;
-} G = {.once = PTHREAD_ONCE_INIT, .pool_mu = PTHREAD_MUTEX_INITIALIZER, .q_mu = PTHREAD_MUTEX_INITIALIZER, .q_cv = PTHREAD_COND_INITIALIZER};
+} G = {.once = PTHREAD_ONCE_INIT, .pool_mu = PTHREAD_MUTEX_INITIALIZER, .vk_mu = PTHREAD_MUTEX_INITIALIZER, .q_mu = PTHREAD_MUTEX_INITIALIZER, .q_cv = PTHREAD_COND_INITIALIZER};
 
 static void gpu_init(void) {
     if (getenv("NX_NULL_GPU")) { fprintf(stderr, "[dm] [nvn] NX_NULL_GPU set: no Vulkan device is opened\n"); return; }
@@ -214,19 +216,52 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
 }
 
 // ---- submissions
-static void reap(void) {                                  // return command buffers the GPU has finished with
+static void reap(void) {                                  // return command buffers and images the GPU has finished with
     uint64_t done = nvn_gpu_completed();
+    pthread_mutex_lock(&G.vk_mu);
     int k = 0;
     for (int i = 0; i < G.nflight; i++) {
         if (G.flight[i].value <= done) vkFreeCommandBuffers(G.c.dev, G.c.pool, 1, &G.flight[i].cb);
         else G.flight[k++] = G.flight[i];
     }
     G.nflight = k;
+    k = 0;
+    for (int i = 0; i < G.ndead; i++) {
+        if (G.dead[i].value <= done) { vkDestroyImageView(G.c.dev, G.dead[i].view, NULL); vkDestroyImage(G.c.dev, G.dead[i].img, NULL); vkFreeMemory(G.c.dev, G.dead[i].mem, NULL); }
+        else G.dead[k++] = G.dead[i];
+    }
+    G.ndead = k;
+    pthread_mutex_unlock(&G.vk_mu);
+}
+// An image the game released: destroyed once every submission that may still use it has completed
+void nvn_vk_defer_image(VkImage img, VkImageView view, VkDeviceMemory mem) {
+    if (!gpu()) return;
+    pthread_mutex_lock(&G.vk_mu);
+    uint64_t v = atomic_load(&G.submitted) + (G.cur ? 1 : 0);          // the submission being recorded counts: it may already mention the image
+    if (G.ndead == 256) { vkDeviceWaitIdle(G.c.dev); for (int i = 0; i < G.ndead; i++) { vkDestroyImageView(G.c.dev, G.dead[i].view, NULL); vkDestroyImage(G.c.dev, G.dead[i].img, NULL); vkFreeMemory(G.c.dev, G.dead[i].mem, NULL); } G.ndead = 0; }
+    G.dead[G.ndead].img = img; G.dead[G.ndead].view = view; G.dead[G.ndead].mem = mem; G.dead[G.ndead++].value = v;
+    pthread_mutex_unlock(&G.vk_mu);
+}
+// A command buffer of its own, submitted and waited for at once: for readbacks that cannot wait for a fence the game has not asked for
+VkCommandBuffer nvn_vk_oneshot_begin(void) {
+    if (!gpu()) return NULL;
+    pthread_mutex_lock(&G.vk_mu);
+    VkCommandBuffer cb = vkctx_begin(&G.c);
+    pthread_mutex_unlock(&G.vk_mu);
+    return cb;
+}
+int nvn_vk_oneshot_end(VkCommandBuffer cb) {
+    pthread_mutex_lock(&G.vk_mu);
+    int r = vkctx_end(&G.c, cb);                          // ends, submits, waits on a fence, frees
+    pthread_mutex_unlock(&G.vk_mu);
+    return r;
 }
 void mtl_sub_begin(void) {
     if (!gpu()) return;
     reap();
+    pthread_mutex_lock(&G.vk_mu);
     G.cur = vkctx_begin(&G.c);
+    pthread_mutex_unlock(&G.vk_mu);
     if (!G.cur) fprintf(stderr, "[dm] [RED] [nvn] could not start a command buffer\n");
 }
 uint64_t mtl_sub_commit(void) {
@@ -241,7 +276,9 @@ uint64_t mtl_sub_commit(void) {
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = G.tl, .value = value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = G.cur ? 1 : 0, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
     if (G.cur) vkEndCommandBuffer(G.cur);
+    pthread_mutex_lock(&G.vk_mu);
     VkResult r = vkQueueSubmit2(G.c.queue, 1, &si, VK_NULL_HANDLE);
+    pthread_mutex_unlock(&G.vk_mu);
     if (r) fprintf(stderr, "[dm] [RED] [nvn] vkQueueSubmit2 failed (%d)\n", (int)r);
     if (G.cur) { if (G.nflight < MAX_INFLIGHT) { G.flight[G.nflight].cb = G.cur; G.flight[G.nflight++].value = value; } else { vkQueueWaitIdle(G.c.queue); vkFreeCommandBuffers(G.c.dev, G.c.pool, 1, &G.cur); } }
     G.cur = NULL;

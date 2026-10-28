@@ -45,3 +45,6 @@ VkShaderModule vkctx_shader_from_file(vkctx_t *c, const char *path);
 void vk_barrier_image(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
                       VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
                       VkImageAspectFlags aspect, uint32_t levels);
+// The same over every mip level and array layer of the image
+void vk_barrier_image_all(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
+                          VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access, VkImageAspectFlags aspect);

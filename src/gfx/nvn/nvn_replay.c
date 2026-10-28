@@ -33,6 +33,7 @@ uint64_t nvn_replay_ops_named(const char *name) {      // the same by op name ("
     for (unsigned i = 0; i < OP_COUNT_; i++) if (op_name[i] && !strcmp(op_name[i], name)) return atomic_load(&g_seen[i]);
     return 0;
 }
+static uint64_t g_copy_row, g_copy_img;                // OP_COPY_STRIDE state: bytes per row and per image of buffer<->texture copies (0 = tight)
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }               // lookahead across handles: only the Metal pass merging uses it
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 
@@ -76,6 +77,9 @@ void mtl_exec(const uint8_t *p) {
         case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s_, d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); update_ub(d, n, a + 16); break; }
         case OP_BARRIER: { VkCommandBuffer cb = nvn_vk_cmd(); if (cb) nvn_vk_barrier_all(cb); break; }   // a full barrier covers every combination of the game's bits
+        case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) g_copy_img = (uint64_t)cs->stride; else g_copy_row = (uint64_t)cs->stride; break; }
+        case OP_COPY_B2T: nvn_vk_copy_b2t((const p_copy_b2t *)a, g_copy_row, g_copy_img); break;
+        case OP_COPY_T2B: nvn_vk_copy_t2b((const p_copy_b2t *)a, g_copy_row, g_copy_img); break;   // the record is a p_copy_b2t whose src is the destination buffer
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;                        // descriptor pool state: only a draw or a dispatch reads it
         default:
             if (h.op < OP_COUNT_) pending(h.op);

@@ -8,6 +8,9 @@ extern void *nvnBootstrapLoader(const char *name);       // imported: the host t
 #define FN(name) NVNT_##name name = (NVNT_##name)nvnBootstrapLoader(#name)
 
 u64 g_res[64];
+static NVNtexture g_tex __attribute__((aligned(64)));
+static NVNtextureBuilder g_tb __attribute__((aligned(64)));
+static unsigned g_px[40 * 20], g_out[40 * 20];
 static NVNdevice g_dev __attribute__((aligned(64)));
 static NVNdeviceBuilder g_dev_b __attribute__((aligned(64)));
 static NVNmemoryPool g_pool __attribute__((aligned(64)));
@@ -39,6 +42,10 @@ void guest_main(u64 arg) {
     FN(nvnSyncInitialize); FN(nvnSyncWait); FN(nvnSyncFinalize);
     FN(nvnCommandBufferClearBuffer); FN(nvnCommandBufferUpdateUniformBuffer); FN(nvnCommandBufferReportCounter); FN(nvnCommandBufferSignalEvent);
     FN(nvnCommandBufferFenceSync); FN(nvnCommandBufferBarrier); FN(nvnCommandBufferCallCommands);
+    FN(nvnTextureBuilderSetDevice); FN(nvnTextureBuilderSetDefaults); FN(nvnTextureBuilderSetTarget); FN(nvnTextureBuilderSetSize2D); FN(nvnTextureBuilderSetFormat);
+    FN(nvnTextureBuilderSetLevels); FN(nvnTextureBuilderSetStorage); FN(nvnTextureBuilderGetStorageSize); FN(nvnTextureBuilderGetStorageAlignment);
+    FN(nvnTextureInitialize); FN(nvnTextureWriteTexels); FN(nvnTextureReadTexels); FN(nvnTextureFinalize);
+    FN(nvnCommandBufferCopyTextureToBuffer); FN(nvnCommandBufferCopyBufferToTexture); FN(nvnCommandBufferSetCopyRowStride);
     FN(nvnEventBuilderSetDefaults); FN(nvnEventBuilderSetStorage); FN(nvnEventInitialize); FN(nvnEventGetValue); FN(nvnEventFinalize);
     g_res[n++] = nvnBootstrapLoader != 0 && nvnDeviceInitialize != 0 && nvnSyncWait != 0;                 // 0: the loader answered with callable addresses
 
@@ -142,6 +149,51 @@ void guest_main(u64 arg) {
     g_res[n++] = fill_ok; g_res[n++] = copy_ok; g_res[n++] = chain_ok; g_res[n++] = ub_ok; g_res[n++] = edge_ok;   // 25-29
     g_res[n++] = cnt[2] != 0xFFFFFFFFu || cnt[3] != 0xFFFFFFFFu;                                          // 30: the timestamp report landed
     nvnQueueFinish(&g_queue);
+
+    // ---- a texture: written by the CPU, copied out by the GPU, patched by the GPU, then read by the CPU
+    nvnTextureBuilderSetDevice(&g_tb, &g_dev); nvnTextureBuilderSetDefaults(&g_tb);
+    nvnTextureBuilderSetTarget(&g_tb, NVN_TEXTURE_TARGET_2D); nvnTextureBuilderSetSize2D(&g_tb, 40, 20);
+    nvnTextureBuilderSetFormat(&g_tb, NVN_FORMAT_RGBA8); nvnTextureBuilderSetLevels(&g_tb, 3);
+    u64 tsz = nvnTextureBuilderGetStorageSize(&g_tb), tal = nvnTextureBuilderGetStorageAlignment(&g_tb);
+    nvnTextureBuilderSetStorage(&g_tb, &g_pool, 0x80000);
+    g_res[40] = nvnTextureInitialize(&g_tex, &g_tb) & 0xFF;                                               // 40: the texture exists
+    g_res[41] = tsz > 0 && tal > 0 && (0x80000 % tal) == 0;                                               // 41: its storage fits where it was put
+    for (int i = 0; i < 40 * 20; i++) g_px[i] = (unsigned)i * 2654435761u;
+    NVNcopyRegion all = {0, 0, 0, 40, 20, 1};
+    nvnTextureWriteTexels(&g_tex, 0, &all, g_px);                                                         // the CPU writes level 0
+    volatile unsigned *o1 = (volatile unsigned *)(g_poolmem + 0xA0000), *o2 = (volatile unsigned *)(g_poolmem + 0xB0000);
+    volatile unsigned char *pa = (volatile unsigned char *)(g_poolmem + 0xA8000);
+    for (int i = 0; i < 40 * 20; i++) { o1[i] = 0; o2[i] = 0; }
+    nvnCommandBufferBeginRecording(&g_cb);
+    nvnCommandBufferCopyTextureToBuffer(&g_cb, &g_tex, 0, &all, (NVNbufferAddress)(g_poolmem + 0xA0000), 0);
+    NVNcommandHandle t1 = nvnCommandBufferEndRecording(&g_cb);
+    nvnQueueSubmitCommands(&g_queue, 1, &t1); nvnQueueFinish(&g_queue);
+    int same = 1; for (int i = 0; i < 40 * 20; i++) same &= o1[i] == g_px[i];
+    g_res[42] = same;                                                                                     // 42: the GPU read back what the CPU wrote
+    NVNcopyRegion patch = {5, 3, 0, 10, 6, 1};
+    for (int y = 0; y < 6; y++) for (int x = 0; x < 48; x++) pa[y * 48 + x] = x < 40 ? (unsigned char)(0x30 + y * 7 + x) : 0xEE;   // rows 48 bytes apart, 40 of them texels
+    nvnCommandBufferBeginRecording(&g_cb);
+    nvnCommandBufferSetCopyRowStride(&g_cb, 48);
+    nvnCommandBufferCopyBufferToTexture(&g_cb, (NVNbufferAddress)(g_poolmem + 0xA8000), &g_tex, 0, &patch, 0);
+    nvnCommandBufferSetCopyRowStride(&g_cb, 0);
+    nvnCommandBufferCopyTextureToBuffer(&g_cb, &g_tex, 0, &all, (NVNbufferAddress)(g_poolmem + 0xB0000), 0);
+    NVNcommandHandle t2 = nvnCommandBufferEndRecording(&g_cb);
+    nvnQueueSubmitCommands(&g_queue, 1, &t2); nvnQueueFinish(&g_queue);
+    same = 1;
+    for (int y = 0; y < 20; y++) for (int x = 0; x < 40; x++) {
+        unsigned want = g_px[y * 40 + x];
+        if (x >= 5 && x < 15 && y >= 3 && y < 9) { const volatile unsigned char *q = pa + (y - 3) * 48 + (x - 5) * 4; want = q[0] | q[1] << 8 | q[2] << 16 | (unsigned)q[3] << 24; }
+        same &= o2[y * 40 + x] == want;
+    }
+    g_res[43] = same;                                                                                     // 43: the patch landed, the rest is untouched
+    nvnTextureReadTexels(&g_tex, 0, &patch, g_out);                                                       // the CPU reads the GPU-written region
+    same = 1; for (int y = 0; y < 6; y++) for (int x = 0; x < 40; x++) same &= ((volatile unsigned char *)g_out)[y * 40 + x] == pa[y * 48 + x];
+    g_res[44] = same;                                                                                     // 44
+    NVNcopyRegion corner = {0, 10, 0, 8, 4, 1};                                                            // rows 10-13: below the patch (rows 3-8)
+    nvnTextureReadTexels(&g_tex, 0, &corner, g_out);                                                      // ... and a corner the GPU did not touch
+    same = 1; for (int y = 0; y < 4; y++) for (int x = 0; x < 8; x++) same &= g_out[y * 8 + x] == g_px[(10 + y) * 40 + x];
+    g_res[45] = same;                                                                                     // 45
+    nvnTextureFinalize(&g_tex);
 
     // ---- teardown in reverse
     nvnEventFinalize(&g_event); nvnSyncFinalize(&g_sync2); nvnSyncFinalize(&g_sync); nvnCommandBufferFinalize(&g_cb); nvnQueueFinalize(&g_queue);
