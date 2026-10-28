@@ -1,0 +1,50 @@
+1 Vulkan device(s)
+
+GPU0: AMD Radeon 660M (RADV REMBRANDT) (integrated), Vulkan 1.4.354
+  core features: bufferDeviceAddress yes  descriptorIndexing(runtimeArray yes, updateAfterBind sampled yes, partiallyBound yes)
+                 timelineSemaphore yes  dynamicRendering yes  synchronization2 yes  shaderInt64 yes  shaderFloat64 yes  shaderDemoteToHelper yes
+                 geometryShader yes  tessellationShader yes  dualSrcBlend yes  independentBlend yes  imageCubeArray yes  samplerAnisotropy yes
+                 fragmentStoresAndAtomics yes  storageImageWriteWithoutFormat yes  multiDrawIndirect yes  drawIndirectFirstInstance yes  depthClamp yes  fillModeNonSolid yes
+                 textureCompressionBC yes  textureCompressionASTC_LDR NO   textureCompressionETC2 NO 
+  extensions: transform_feedback yes (feature yes)  depth_clip_control yes (feature yes)  depth_clip_enable yes  external_memory_host yes
+              swapchain yes  memory_budget yes  custom_border_color yes  provoking_vertex yes  extended_dynamic_state3 yes  conservative_raster yes  mesh_shader yes
+  external memory host: min import alignment 4096 bytes
+  limits: maxPerStageDescriptorSampledImages 8388606  maxDescriptorSetSampledImages 8388606  maxBoundDescriptorSets 32  maxStorageBufferRange 4294967295  maxImageDimension2D 16384
+  formats (sampled / color or depth attachment / blendable):
+    BC1          yes NO  NO 
+    BC2          yes NO  NO 
+    BC3          yes NO  NO 
+    BC4          yes NO  NO 
+    BC5          yes NO  NO 
+    BC6H         yes NO  NO 
+    BC7          yes NO  NO 
+    ASTC 4x4     NO  NO  NO 
+    ASTC 6x6     NO  NO  NO 
+    ASTC 8x8     NO  NO  NO 
+    ETC2         NO  NO  NO 
+    D32          yes yes NO 
+    D24S8        NO  NO  NO 
+    D32S8        yes yes NO 
+    D16          yes yes NO 
+    X8D24        NO  NO  NO 
+    RGBA16F      yes yes yes
+    R11G11B10F   yes yes yes
+    A2B10G10R10  yes yes yes
+    RGB565       yes yes yes
+    A1R5G5B5     yes yes yes
+    RGBA4        yes yes yes
+    BGRA8 sRGB   yes yes yes
+    RGBA8 sRGB   yes yes yes
+  heap 0: 2.64 GB
+  heap 1: 5.27 GB device-local
+  type 0 (heap 1): device-local
+  type 1 (heap 1): device-local
+  type 2 (heap 0): host-visible host-coherent
+  type 3 (heap 1): device-local host-visible host-coherent
+  type 4 (heap 1): device-local host-visible host-coherent
+  type 5 (heap 0): host-visible host-coherent host-cached
+  type 6 (heap 0): host-visible host-coherent host-cached
+  type 7 (heap 1): device-local
+  type 8 (heap 0): host-visible host-coherent
+  type 9 (heap 1): device-local host-visible host-coherent
+  type 10 (heap 0): host-visible host-coherent host-cached
