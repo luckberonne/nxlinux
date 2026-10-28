@@ -42,6 +42,7 @@ that never touch real material:
 Writes work/synth/{prod.keys, base.nsp, update.nsp} by default (gitignored); every
 byte is pseudorandom from a fixed seed, so a CI test can pin the artifacts.
 """
+import argparse
 import hashlib
 import random
 import struct
@@ -139,13 +140,22 @@ def _page_up(n):
 
 NSO_HDR = 0x100
 
-def build_nso(text, ro, data, bss, build_id):
+def build_nso(text, ro, data, bss, build_id, mos=None):
     """NSO0 with the flags clear: no compression, no segment hashes. load() requires
-    text at 0 in memory, ro and data after it on whole pages, nothing overlapping;
-    the file's segments follow right after the header."""
+    text at 0 in memory, ro and data after it on whole pages, nothing overlapping
+    (a gap is allowed); the file's segments follow right after the header. mos, when
+    given, places the segments at those memory offsets instead of packing them tight
+    (what packing an ELF keeps, so the guest's prelinked addresses still land)."""
     assert len(build_id) == 0x20
-    mos = (0, _page_up(len(text)), _page_up(len(text)) + _page_up(len(ro)))
+    tight = (0, _page_up(len(text)), _page_up(len(text)) + _page_up(len(ro)))
+    if mos is None:
+        mos = tight
+    else:
+        mos = list(mos)
+        while len(mos) < 3:                     # the ELF can fold empty segments away
+            mos.append(tight[len(mos)])
     assert mos[0] == 0 and mos[1] >= len(text) and mos[2] >= mos[1] + len(ro)   # load() checks these
+    assert all(m % PAGE == 0 for m in mos)                                      # load() checks these too
     header = bytearray(NSO_HDR)
     header[0:4] = b'NSO0'
     struct.pack_into('<I', header, 0xC, 0)                             # flags: plain segments
@@ -465,6 +475,78 @@ def build_nca3(sections, title_id, content_type, header_key, kaek, keygen=0,
 def rng_rand(seed, n):
     return random.Random(seed).randbytes(n)          # no key material: just any pseudo bytes
 
+# --- NSO from a compiled guest (the clang + lld output CMake builds) ---------------------
+
+def _elf_notes(elf):
+    """(name, type, desc) of every note the file carries, PT_NOTE by PT_NOTE (4-aligned)."""
+    phoff = int.from_bytes(elf[0x20:0x28], 'little')
+    phentsize = int.from_bytes(elf[0x36:0x38], 'little')
+    phnum = int.from_bytes(elf[0x38:0x3a], 'little')
+    out = []
+    for i in range(phnum):
+        p = elf[phoff + i * phentsize:phoff + (i + 1) * phentsize]
+        if int.from_bytes(p[0:4], 'little') != 4:                       # PT_NOTE
+            continue
+        off = int.from_bytes(p[8:16], 'little')
+        size = int.from_bytes(p[32:40], 'little')
+        blob, at = elf[off:off + size], 0
+        while at + 12 <= len(blob):
+            namesz = int.from_bytes(blob[at:at + 4], 'little')
+            descsz = int.from_bytes(blob[at + 4:at + 8], 'little')
+            note_type = int.from_bytes(blob[at + 8:at + 12], 'little')
+            at += 12
+            name = bytes(blob[at:at + namesz]); at = (at + namesz + 3) & ~3
+            desc = bytes(blob[at:at + descsz]); at = (at + descsz + 3) & ~3
+            out.append((name, note_type, desc))
+    return out
+
+def build_nso_from_elf(elf):
+    """A compiled guest ELF64 (what CMake's clang + lld builds for tests/guest) -> NSO0
+    with plain segments, so the same program flows nx_extract -> nso.py -> module ->
+    kernel. The rule is the loader's own, told back in the error: up to three PT_LOADs
+    sorted by vaddr are text, ro, data, each vaddr on a 0x1000 page, text at 0, none
+    overlapping (a page gap is allowed), and only the last one may carry bss. The
+    segments keep their ELF vaddrs as memory offsets, so prelinked addresses still
+    resolve. The build ID is the ELF's GNU note when it has one."""
+    if elf[0:4] != b'\x7fELF' or elf[4] != 2 or elf[5] != 1:
+        raise ValueError('the guest is not a little-endian ELF64')
+    phoff = int.from_bytes(elf[0x20:0x28], 'little')
+    phentsize = int.from_bytes(elf[0x36:0x38], 'little')
+    phnum = int.from_bytes(elf[0x38:0x3a], 'little')
+    loads = []
+    for i in range(phnum):
+        p = elf[phoff + i * phentsize:phoff + (i + 1) * phentsize]
+        if int.from_bytes(p[0:4], 'little') != 1:                       # PT_LOAD
+            continue
+        vaddr = int.from_bytes(p[16:24], 'little')
+        offset = int.from_bytes(p[8:16], 'little')
+        filesz = int.from_bytes(p[32:40], 'little')
+        memsz = int.from_bytes(p[40:48], 'little')
+        loads.append((vaddr, offset, filesz, memsz))
+    if not 0 < len(loads) <= 3:
+        raise ValueError(f'{len(loads)} PT_LOADs: an NSO has at most text, ro and data '
+                         '(link the guest flat: text, ro, data)')
+    loads.sort()
+    if loads[0][0] != 0 or loads[0][2] == 0:
+        raise ValueError(f'the first PT_LOAD is at {loads[0][0]:#x}: text has to start at 0')
+    for prev, cur in zip(loads, loads[1:]):
+        if cur[0] % PAGE or cur[0] < _page_up(prev[0] + prev[2]):
+            raise ValueError(f'a PT_LOAD at {cur[0]:#x} is not on a page after the one '
+                             f'before (which ends at {prev[0] + prev[2]:#x}): '
+                             'link the guest page-aligned flat (text, ro, data)')
+    for vaddr, _, filesz, memsz in loads[:-1]:
+        if memsz != filesz:                                             # only data carries bss
+            raise ValueError(f'the PT_LOAD at {vaddr:#x} has p_memsz past its p_filesz; '
+                             'an NSO has one bss size (the data segment\'s)')
+    bss = loads[-1][3] - loads[-1][2]
+    segs = [bytes(elf[off:off + filesz]) for _, off, filesz, _ in loads]
+    while len(segs) < 3:
+        segs.append(b'')
+    for name, note_type, desc in _elf_notes(elf):
+        if name == b'GNU\x00' and note_type == 3 and len(desc) <= 0x20: # NT_GNU_BUILD_ID
+            return build_nso(*segs, bss, desc.ljust(0x20, b'\0'), mos=[l[0] for l in loads])
+    return build_nso(*segs, bss, hashlib.sha256(elf).digest(), mos=[l[0] for l in loads])
+
 # --- The fake game ---------------------------------------------------------------------
 
 TITLE_ID = 0x51595354484B21          # 'SYSTHK!' in ascii; no game uses it
@@ -478,14 +560,26 @@ def _module(rng, kind):
     data = b'\0' * 0x1000
     return build_nso(text, ro, data, 0x4000, rng.randbytes(0x20))
 
+def make_nacp():
+    """A Control NACP (0x4000, the modern size) with the fake game's identity:
+    entry 0's language, name and publisher, plus the display version at 0x3000."""
+    nacp = bytearray(0x4000)
+    struct.pack_into('<I', nacp, 0, 1)                    # language 1 = English US
+    nacp[4:4 + 0x200] = b'Synthetic Test\0'.ljust(0x200, b'\0')
+    nacp[0x204:0x204 + 0x100] = b'synth-nsp\0'.ljust(0x100, b'\0')
+    nacp[0x3000:0x3010] = b'1.0.0\0'.ljust(0x10, b'\0')
+    return bytes(nacp)
+
 def make_romfs(variant):
     """The fake game's RomFS: two text files and a pseudorandom blob spanning the
-    0x4000 data-block boundary, so reads touch more than one integrity block.
-    The update ships a changed config and a file the base does not have."""
+    0x4000 data-block boundary, so reads touch more than one integrity block,
+    plus a control.nacp with the title's metadata. The update ships a changed
+    config and a file the base does not have."""
     files = {
         'data/config.txt': b'synthetic romfs config\nvariant: %s\n' % variant.encode(),
         'assets/greeting.txt': b'hello from the synthetic RomFS (%s)\n' % variant.encode(),
         'assets/tile.dat': rng_rand(0x7171, 0x4800),
+        'control.nacp': make_nacp(),
     }
     if variant == 'update':
         files['data/extra.txt'] = b'only in the update\n'
@@ -509,10 +603,16 @@ def synth_sequence(seed):
     kaek = rng.randbytes(16)
     return header_key, kaek, _module(rng, 'base'), _module(rng, 'patch')
 
-def write_all(out, seed=DEFAULT_SEED, with_romfs=True):
+def write_all(out, seed=DEFAULT_SEED, with_romfs=True, main_nso=None):
+    """Make prod.keys, base.nsp and update.nsp. main_nso, when given, replaces the
+    base title's own module (an NSO packed from a real compiled guest, so the
+    pipeline nx_extract -> nso.py -> module -> kernel runs on actual aarch64 code);
+    the update keeps the synthetic patch module so the merge path still works."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     header_key, kaek, base_module, update_module = synth_sequence(seed)
+    if main_nso is not None:
+        base_module = main_nso
     (out / 'prod.keys').write_text(
         '# synthetic keyset for the pipeline tests (docs/plan.md); not from any console\n'
         f'header_key = {header_key.hex()}\n'
@@ -528,12 +628,19 @@ def content_id(nca):
     return hashlib.sha256(nca).hexdigest()[:32]
 
 def main():
-    args = sys.argv[1:]
-    with_romfs = '--no-romfs' not in args
-    args = [a for a in args if a != '--no-romfs']
-    out = args[0] if args else 'work/synth'
-    seed = int(args[1], 0) if len(args) > 1 else DEFAULT_SEED
-    write_all(out, seed, with_romfs)
+    ap = argparse.ArgumentParser(description='write a synthetic title: prod.keys, base.nsp, update.nsp')
+    ap.add_argument('out', nargs='?', default='work/synth')
+    ap.add_argument('--seed', type=lambda x: int(x, 0), default=DEFAULT_SEED)
+    ap.add_argument('--no-romfs', action='store_true')
+    ap.add_argument('--main-elf', metavar='PATH',
+                    help='use this compiled guest (ELF from clang + lld, or already an NSO) '
+                         'as the base title\'s ExeFS main')
+    args = ap.parse_args()
+    main_nso = None
+    if args.main_elf:
+        elf = Path(args.main_elf).read_bytes()
+        main_nso = elf if elf[0:4] == b'NSO0' else build_nso_from_elf(elf)
+    write_all(args.out, args.seed, not args.no_romfs, main_nso)
 
 if __name__ == '__main__':
     sys.exit(main())

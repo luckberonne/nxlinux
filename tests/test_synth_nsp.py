@@ -202,7 +202,7 @@ class NxExtract(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn(f'title {s.TITLE_ID:016x}', p.stdout)
         self.assertIn('main build id', p.stdout)
-        self.assertIn('RomFS: 3 files', p.stdout)
+        self.assertIn('RomFS: 4 files', p.stdout)
         self.assertEqual((self.out / 'ExeFS' / 'main').read_bytes(), base)
         self.assertEqual((self.out / 'RomFS' / 'data' / 'config.txt').read_bytes(),
                          b'synthetic romfs config\nvariant: base\n')
@@ -210,6 +210,7 @@ class NxExtract(unittest.TestCase):
                          b'hello from the synthetic RomFS (base)\n')
         self.assertEqual((self.out / 'RomFS' / 'assets' / 'tile.dat').read_bytes(),
                          s.rng_rand(0x7171, 0x4800))
+        self.assertEqual((self.out / 'RomFS' / 'control.nacp').read_bytes(), s.make_nacp())
 
     def test_update_merge(self):
         _, _, _, update = s.synth_sequence(s.DEFAULT_SEED)
@@ -223,22 +224,23 @@ class NxExtract(unittest.TestCase):
         self.assertEqual((self.out / 'RomFS' / 'data' / 'config.txt').read_bytes(),
                          b'synthetic romfs config\nvariant: update\n')
         self.assertEqual((self.out / 'RomFS' / 'data' / 'extra.txt').read_bytes(), b'only in the update\n')
+        self.assertEqual((self.out / 'RomFS' / 'control.nacp').read_bytes(), s.make_nacp())
 
     def test_manifest(self):
         p = self.run_nx_extract(extra=('--manifest',))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn('RomFS 3 files', p.stdout)
+        self.assertIn('RomFS 4 files', p.stdout)
         rows = (self.out / 'romfs_manifest.tsv').read_text().splitlines()
         paths = [row.split('\t')[0] for row in rows[1:]]
         self.assertEqual(sorted(paths), ['/assets/greeting.txt', '/assets/tile.dat',
-                                         '/data/config.txt'])
+                                         '/control.nacp', '/data/config.txt'])
         tile = [row for row in rows if 'tile.dat' in row][0]
         self.assertEqual(tile.split('\t')[1], str(0x4800))
 
     def test_romfs_image(self):
         p = self.run_nx_extract(extra=('--romfs-image',))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn('image with 6 entries', p.stdout)   # root + 2 dirs + 3 files
+        self.assertIn('image with 7 entries', p.stdout)   # root + 2 dirs + 4 files
         self.assertFalse((self.out / 'RomFS').exists())
         blob = (self.out / 'RomFS.img').read_bytes()
         magic, off, size, count = struct.unpack_from('<8sQQQ', blob, 0)
@@ -252,7 +254,7 @@ class NxExtract(unittest.TestCase):
                 self.assertEqual(blob[a:a + b], b'synthetic romfs config\nvariant: base\n')
             names.append(name)
         self.assertEqual(set(names), {b'', b'assets', b'data', b'greeting.txt',
-                                      b'config.txt', b'tile.dat'})
+                                      b'config.txt', b'tile.dat', b'control.nacp'})
 
     def test_no_romfs(self):
         dir2 = Path(tempfile.mkdtemp(prefix='synth_test_no_romfs_'))
@@ -395,7 +397,9 @@ class Romfs(unittest.TestCase):
         self.assertEqual(walked, {pos for pos, _, _, _ in rows})
         # the enumeration walk: root's children, then each dir's file list
         files = self.table_files(img)
-        self.assertEqual(len(files), 3)
+        self.assertEqual(len(files), 4)
+        nacp_at, nacp_len = files[b'control.nacp']
+        self.assertEqual(img[nacp_at:nacp_at + nacp_len], s.make_nacp())
         config_at, config_len = files[b'config.txt']
         self.assertEqual(img[config_at:config_at + config_len],
                          b'synthetic romfs config\nvariant: base\n')
@@ -430,13 +434,110 @@ class Romfs(unittest.TestCase):
     def test_update_differs_from_base_only_where_expected(self):
         base, update = s.make_romfs('base'), s.make_romfs('update')
         fb, fu = self.table_files(base), self.table_files(update)
-        self.assertEqual(len(fu), 4)                             # + data/extra.txt
+        self.assertEqual(len(fu), 5)                             # + control.nacp, data/extra.txt
         eb = base[fb[b'config.txt'][0]:fb[b'config.txt'][0] + fb[b'config.txt'][1]]
         eu = update[fu[b'config.txt'][0]:fu[b'config.txt'][0] + fu[b'config.txt'][1]]
         self.assertNotEqual(eb, eu)                              # config changed
         ct = update[fu[b'tile.dat'][0]:fu[b'tile.dat'][0] + fu[b'tile.dat'][1]]
         cb = base[fb[b'tile.dat'][0]:fb[b'tile.dat'][0] + fb[b'tile.dat'][1]]
         self.assertEqual(ct, cb)                                 # tile.dat identical
+
+
+class Nacp(unittest.TestCase):
+    """The control.nacp the RomFS carries: the identity strings a control metadata
+    parser looks for, at the offsets the layout defines."""
+
+    def test_identity_strings(self):
+        nacp = s.make_nacp()
+        self.assertEqual(len(nacp), 0x4000)                      # the modern size
+        self.assertEqual(struct.unpack_from('<I', nacp, 0)[0], 1)   # language 1 = EN-US
+        self.assertEqual(nacp[4:19], b'Synthetic Test\0')
+        self.assertEqual(nacp[0x204:0x20E], b'synth-nsp\0')
+        self.assertEqual(nacp[0x3000:0x3006], b'1.0.0\0')
+        self.assertEqual(nacp[0x3010:0x4000], b'\0' * (0x4000 - 0x3010))
+
+
+class NsoFromElf(unittest.TestCase):
+    """A compiled guest ELF (clang + lld output) packed as NSO: it must load with
+    tools/nso.py exactly like the synthetic modules do, and nx_extract must hand
+    it out of the NSP byte for byte with the ELF's build id."""
+
+    @staticmethod
+    def _guest(desc=bytes(range(16)), ro_va=0x1000, data_va=0x2000):
+        """A small flat guest ELF (as clang + lld would link it for ExeFS) with a
+        GNU build-id note; ro_va/data_va set the section pages, file offsets follow."""
+        text = b'\x60\x04\x80\x52' + b'\x01\x00\x00\xd4' + b'\xc0\x03\x5f\xd6'   # mov; svc; ret
+        elf = bytearray(data_va + data_va)                       # file offsets mirror the vaddr spread
+        elf[0:0x40] = struct.pack(                               # aarch64 LSB ET_EXEC
+            '<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01\0' + b'\0' * 9,
+            2, 0xB7, 1, 0, 0x40, 0, 0, 64, 56, 4, 0, 0, 0)
+        for i, p in enumerate((
+                (1, 5, 0x200, 0, 0, len(text), len(text), 0x1000),        # PT_LOAD text (RX)
+                (1, 4, ro_va + 0x200, ro_va, ro_va, 0x20, 0x20, 0x1000),  # PT_LOAD ro (R)
+                (1, 6, data_va + 0x200, data_va, data_va, 0x10, 0x810, 0x1000),   # data + bss (RW)
+                (4, 4, 0x140, 0, 0, 0x24, 0x24, 4))):                     # PT_NOTE GNU
+            struct.pack_into('<II6Q', elf, 0x40 + i * 56, *p)
+        elf[0x140:0x164] = struct.pack('<III', 4, 16, 3) + b'GNU\0' + desc
+        elf[0x200:0x200 + len(text)] = text
+        elf[ro_va + 0x200:ro_va + 0x220] = b'(synthetic guest ro)\0'.ljust(0x20, b'\0')
+        elf[data_va + 0x200:data_va + 0x201] = b'T'
+        return bytes(elf), text, desc
+
+    def test_loads_and_layout(self):
+        elf, text, desc = self._guest()
+        nso_bytes = s.build_nso_from_elf(elf)
+        self.assertEqual(nso_bytes[0:4], b'NSO0')
+        import nso
+        m = nso.load(nso_bytes, 'guest main')
+        self.assertEqual(bytes(m.image[:len(text)]), text)
+        self.assertEqual(m.segments[1][0], 0x1000)               # ro starts on page 1
+        self.assertEqual(m.segments[2][0], 0x2000)
+        self.assertEqual(m.bss, 0x800)                           # data's p_memsz tail
+        self.assertEqual(nso_bytes[0x40:0x60], desc.ljust(0x20, b'\0'))   # the GNU note
+
+    def test_gap_kept_as_in_the_elf(self):
+        """A page gap between sections stays: the guest's prelinked addresses
+        (RELATIVE addends) are link-time vaddrs, so the NSO keeps them, and the
+        loader takes the gap just as it does for a retail module."""
+        elf, text, desc = self._guest(ro_va=0x2000, data_va=0x3000)
+        nso_bytes = s.build_nso_from_elf(elf)
+        import nso
+        m = nso.load(nso_bytes, 'guest main')
+        self.assertEqual(m.segments[1][0], 0x2000)               # the gap is kept
+        self.assertEqual(m.segments[2][0], 0x3000)
+        self.assertEqual(m.bss, 0x800)
+        self.assertEqual(bytes(m.image[0x2000:0x2020]),
+                         b'(synthetic guest ro)\0'.ljust(0x20, b'\0'))
+
+    def test_shared_object_layout_refused_with_how_to_fix(self):
+        """A plainly linked .so (4 LOADs, code not at 0) cannot be an NSO: the
+        error says what a guest built for ExeFS must look like instead."""
+        ph = lambda t, f, off, va, fs, ms: struct.pack('<II6Q', t, f, off, va, va, fs, ms, 0x10000)
+        elf = struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01\0' + b'\0' * 9,
+                          3, 0xB7, 1, 0, 0x80, 0, 0, 64, 56, 4, 0, 0, 0)
+        elf += (ph(1, 4, 0, 0, 0xEAC, 0xEAC) + ph(1, 5, 0xEAC, 0x10EAC, 0x38D4, 0x38D4)
+                + ph(1, 6, 0x4780, 0x24780, 0x180, 0x880) + ph(1, 6, 0x4900, 0x34900, 0x20, 0x1A6BC0))
+        with self.assertRaises(ValueError) as got:
+            s.build_nso_from_elf(elf)
+        self.assertIn('at most text, ro and data', str(got.exception))
+        self.assertIn('link the guest flat', str(got.exception))
+
+    def test_extracted_main_is_the_guest(self):
+        elf, text, desc = self._guest(b'\xa1\xb2\xc3\xd4' * 4)
+        nso_bytes = s.build_nso_from_elf(elf)
+        out = Path(tempfile.mkdtemp(prefix='synth_guest_'))
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        s.write_all(out, s.DEFAULT_SEED, main_nso=nso_bytes)
+        nx = REPO / 'work' / 'nx_extract' / 'nx_extract'
+        if not nx.is_file():
+            raise unittest.SkipTest('work/nx_extract is not built')
+        odir = out / 'extracted'
+        p = subprocess.run([str(nx), str(out / 'prod.keys'), str(out / 'base.nsp'), '-',
+                            str(odir)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual((odir / 'ExeFS' / 'main').read_bytes(), nso_bytes)   # byte for byte
+        self.assertIn((odir / 'ExeFS' / 'main').read_bytes()[0x40:0x50].hex(), p.stdout)
+        self.assertEqual((odir / 'RomFS' / 'control.nacp').read_bytes(), s.make_nacp())
 
 
 if __name__ == '__main__':
