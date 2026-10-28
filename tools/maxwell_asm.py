@@ -42,6 +42,17 @@ def ipa(rd, offset):
     return (0xE0 << 56) | ((offset & 0x3FF) << 28) | (255 << 20) | (PT << 16) | (255 << 8) | (rd & 0xFF)
 
 
+def ldc(rd, slot, byte_offset):
+    """LDC Rd, c[slot][offset]: one 32-bit word of a constant buffer (13 bits 1110111110010; slot bits 36-40, byte offset bits 20-35, size B32 = 4 in bits 48-50,
+    address mode IA = 0, the address register is RZ). Slots 0-2 belong to the driver; an NVN uniform buffer n is slot 3 + n."""
+    return (0b1110111110010 << 51) | (4 << 48) | ((slot & 0x1F) << 36) | ((byte_offset & 0xFFFF) << 20) | (PT << 16) | (255 << 8) | (rd & 0xFF)
+
+
+def fadd(rd, ra, rb):
+    """FADD Rd, Ra, Rb (13 bits 0101110001011; Rb bits 20-27; no modifiers)"""
+    return (0b0101110001011 << 51) | ((rb & 0xFF) << 20) | (PT << 16) | ((ra & 0xFF) << 8) | (rd & 0xFF)
+
+
 def f32(x):
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
@@ -78,6 +89,12 @@ def fragment_constant(r, g, b, a):
 def vertex_passthrough():
     """A vertex shader: attribute 0 (x, y, z, w) is the position, attribute 1 goes out as generic output 0 (the colour)"""
     return program([ald(0, 0x80), ald(4, 0x90), ast(0, 0x70), ast(4, 0x80), exit_()], sph(VERTEX))
+
+
+def vertex_shifted(slot=3):
+    """Like vertex_passthrough, but the position is (x + c[slot][0], y + c[slot][4], c[slot][8], 1): the vertex uniform buffer of tests/shaders/draw.vert"""
+    return program([ald(0, 0x80), ald(4, 0x90), ldc(8, slot, 0), ldc(9, slot, 4), ldc(10, slot, 8),
+                    fadd(0, 0, 8), fadd(1, 1, 9), fadd(2, 10, 255), ast(0, 0x70), ast(4, 0x80), exit_()], sph(VERTEX))
 
 
 def fragment_varying():

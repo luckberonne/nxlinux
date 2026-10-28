@@ -167,3 +167,7 @@ Stage ten of the draw test runs a whole translated pair: `maxwell_asm.vertex_pas
 to generic output 0) and `fragment_varying()` (IPA of generic input 0 into target 0). Two things came out of the validation layers: the translator's SPIR-V uses
 DrawParameters (the device now enables `shaderDrawParameters`), and its `gl_PerVertex` block carried ClipDistance[8] plus CullDistance[1], over the 8 that
 `maxCombinedClipAndCullDistances` allows on RADV. Maxwell has no cull distances, so the vendored translator (`CodeGen/Spirv/Declarations.cs`) no longer declares that member.
+
+Stage eleven: `maxwell_asm.vertex_shifted()` reads the vertex uniform buffer with LDC from constant buffer 3 (NVN uniform slot 0) and adds it to the position, as stage F does with
+GLSL. The translator gives the buffer binding 1; binding 0 is its `support_buffer` (render scale, viewport size, y negate), which these shaders declare but never read.
+A shader that does read it (fragment coordinates, y flipped framebuffers) needs that buffer bound: not done yet, and `needs` does not flag it.
