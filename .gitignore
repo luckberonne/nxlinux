@@ -1,0 +1,6 @@
+build/
+*.keys
+*.nsp
+*.xci
+*.nsz
+work/

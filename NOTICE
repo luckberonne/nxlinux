@@ -1,0 +1,4 @@
+nxlinux is a Linux x86_64 port of nxnative (https://github.com/seedds/nxnative, MIT, Copyright (c) 2026 seedds).
+Code copied from nxnative keeps its MIT license (see LICENSE). Third-party components keep their own licenses:
+Ryujinx (shader translator), LibHac, libvpx, stb_vorbis, dynarmic (0BSD).
+This project contains no game content, keys or firmware. You bring your own.
