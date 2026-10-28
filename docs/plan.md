@@ -98,10 +98,11 @@ Esta máquina es un Ryzen 5 7535HS (x86_64) con una RTX 2050 y una Radeon 680M, 
 3. **Fase 1:** `nx_extract` sobre las NSP de MK8D (más ambos updates) y comparar el log con el flujo de arranque de `docs/agents/03-bringup.md`.
 4. **Fases 3–4:** validation layers de Vulkan sin errores, y capturas con RenderDoc comparadas con las capturas del README de MK8D.
 5. **Aceptación:** menús, carrera de demostración y Gran Premio completo con sonido, medido en fps.
+6. **Ensayo sintético (hecho):** `tools/synth_nsp.py` genera un `prod.keys` desechable y NSP de un juego falso (base + update, ExeFS con NSOs); el `nx_extract` vendido de `nxnative-src` los acepta de punta a punta (`tests/test_synth_nsp.py`, integración incluida si hay `work/nx_extract`). Con archivos reales el punto 3 reutiliza el mismo camino.
 
 ## Requisitos y notas
 - **Sobre `prod.keys`:** revisé el repo (`README.md`, `docs/`, `scripts/build_ipa_from_nsp.py`) y la página que mandaste. Ninguno los incluye ni explica cómo obtenerlas; solo piden que las traigas (`-k prod.keys`). No se pueden evitar: los NCA del juego están cifrados y `nx_extract` (LibHac) las necesita para leer el RomFS y el ExeFS. Tampoco voy a buscar ni descargar claves de terceros. La vía legítima es sacarlas de tu propia consola con Lockpick_RCM (junto con el volcado de tus juegos con NXDumpTool). Si no tienes consola, la parte del juego real no se puede probar; el repo nuevo igual avanza con los programas de prueba.
 - Necesitas tus propios dumps de MK8D (NSP base + update 4.0.0 y 4.0.1) y `prod.keys`. Quedan fuera del repo (carpeta de trabajo aparte, nunca en git). Hasta tenerlos, las fases 0 y 3 se prueban con programas aarch64 de prueba y tests sintéticos; las fases 1–2 y 4–5 necesitan los archivos reales.
 - Commits sin mencionar a Claude ni a ningún agente, mensajes de una línea (regla del usuario, skill `commits-sin-claude`).
-- Dependencias nuevas: dynarmic, SDL3, ffmpeg, SPIRV-Reflect, CMake, .NET (ya requerido por `nx_extract`).
+- Dependencias nuevas: dynarmic, SDL3, ffmpeg, SPIRV-Reflect, CMake, .NET (ya requerido por `nx_extract`); y `cryptography` para la venv de Python (kit sintético de `tools/synth_nsp.py`).
 - El código de `dm/` seguirá en inglés, como pide `AGENTS.md`, y las líneas rojas de log empiezan con `[RED]`.
