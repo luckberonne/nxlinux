@@ -33,7 +33,9 @@ void cpu_set_sp(cpu_t *c, uint64_t v);
 void cpu_set_tls(cpu_t *c, uint64_t tpidr_el0, uint64_t tpidrro_el0);
 void cpu_get_v(cpu_t *c, int i, uint64_t out[2]);
 void cpu_set_v(cpu_t *c, int i, const uint64_t in[2]);
-void cpu_invalidate(cpu_t *c, uint64_t addr, uint64_t len);   // the guest wrote code there
+void cpu_invalidate(cpu_t *c, uint64_t addr, uint64_t len);
+// Called after every new Jit is created (dynarmic installs its fault handler then); faults.c uses it to put its own back on top
+void cpu_set_jit_created_hook(void (*fn)(void));   // the guest wrote code there
 
 #ifdef __cplusplus
 }

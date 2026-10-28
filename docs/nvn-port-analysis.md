@@ -43,3 +43,14 @@ Estimate for a first working Vulkan replayer (menus, then a race): roughly 4-6 t
 3. Op replay: render targets, clears, state, draw, then bindings (the argument fill from the shader reflection).
 4. Shaders: SPIR-V from `dmsh_xlate`, reflection from SPIR-V instead of MSL text.
 5. Presentation with SDL3.
+
+## Status: hle_nvn.c runs on Linux behind a null GPU
+`hle_nvn.c`, `nvn_dirty.c`, `nvn_capture.c`, `nvn_tex.c` and the deswizzle code build and link on Linux (target `nxnvn`; `nvn_link_check`
+links every object and fails on any unresolved symbol). Its constructor runs: 537 NVN names, 427 implemented (413 with semantics,
+14 empty), the other 110 report in red. What replaced the Apple parts:
+- `src/gfx/nvn/nvn_platform.h`: clocks, resident memory from /proc, a safe pointer read, Mach calls that report failure.
+- `src/host/sha256.c` for the program keys (tested against FIPS vectors and `sha256sum`), a pointer map instead of CFDictionary.
+- `src/gfx/nvn/nvn_null.c`: the 70 Metal-layer functions. Pools and addresses are real, submissions complete at once, nothing is drawn.
+- NVN function thunks are svc stubs in the guest window (`nvn_thunk_for`), reaching the implementation through `hle_call`.
+- `src/host/faults.c`: the SIGSEGV dispatch dirty tracking needs, re-installed on top of dynarmic's handler after each Jit is made.
+Left out for now: `vm_remap` (virtual pools need a shared guest window), LZFSE capture compression, power and QoS statistics.

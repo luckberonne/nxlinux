@@ -92,6 +92,8 @@ static std::mutex g_mu;
 static std::condition_variable g_cv;
 static std::vector<std::unique_ptr<jitenv>> g_envs;   // every Jit created
 static std::vector<jitenv *> g_free;
+static void (*g_jit_hook)(void);
+void cpu_set_jit_created_hook(void (*fn)(void)) { g_jit_hook = fn; }
 static unsigned g_max_jits, g_created;     // g_created: ids handed out, including Jits still being built
 
 static unsigned max_jits() {
@@ -130,6 +132,7 @@ static jitenv *acquire(cpu *c) {
             unsigned id = g_created++;          // reserved under the lock: ids are the exclusive-monitor slots and must be unique
             lk.unlock();                        // ~18 ms: do not hold the pool while building
             auto e = make_env(id);
+            if (g_jit_hook) g_jit_hook();
             lk.lock();
             jitenv *p = e.get();
             g_envs.push_back(std::move(e));

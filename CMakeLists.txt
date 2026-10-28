@@ -86,3 +86,26 @@ add_executable(test_vk_bindless tests/test_vk_bindless.c)
 target_link_libraries(test_vk_bindless PRIVATE nxvk m)
 add_dependencies(test_vk_bindless test_shaders)
 add_test(NAME vk_bindless COMMAND test_vk_bindless ${CMAKE_BINARY_DIR}/shaders/bindless.comp.spv)
+add_executable(test_sha256 tests/test_sha256.c src/host/sha256.c)
+add_test(NAME sha256 COMMAND test_sha256)
+
+# ---- NVN layer (nxnative's hle_nvn.c, ported). The game profile header is generated from games/<id>/game.tsv.
+set(NX_GAME 0100152000022000 CACHE STRING "title ID of the game profile the host is built for")
+set(NX_GEN_DIR ${CMAKE_BINARY_DIR}/gen/${NX_GAME})
+add_custom_command(OUTPUT ${NX_GEN_DIR}/game_profile.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${NX_GEN_DIR}
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/games/game.py header ${NX_GAME} ${NX_GEN_DIR}/game_profile.h
+    DEPENDS games/game.py games/${NX_GAME}/game.tsv)
+add_custom_target(game_profile DEPENDS ${NX_GEN_DIR}/game_profile.h)
+add_custom_command(OUTPUT ${NX_GEN_DIR}/nvn_names.c
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/gen_nvn_names.py ${CMAKE_SOURCE_DIR}/src/gfx/nvn/names.txt ${NX_GEN_DIR}/nvn_names.c
+    DEPENDS tools/gen_nvn_names.py src/gfx/nvn/names.txt)
+add_library(nxnvn STATIC src/gfx/nvn/hle_nvn.c src/gfx/nvn/nvn_dirty.c src/gfx/nvn/nvn_capture.c src/gfx/nvn/nvn_tex.c src/gfx/nvn/nvn_null.c
+    src/gfx/tex/nvn_deswizzle.c src/host/sha256.c src/host/faults.c src/host/hostsvc.c ${NX_GEN_DIR}/nvn_names.c)
+target_link_libraries(nxnvn PUBLIC nxhost m)
+target_include_directories(nxnvn PUBLIC ${NX_GEN_DIR} src/host src/gfx/nvn src/gfx/nvn/include src/gfx third_party/vulkan-headers/include)
+add_dependencies(nxnvn game_profile)
+target_compile_options(nxnvn PRIVATE -Wno-unused-function)
+target_compile_definitions(nxnvn PRIVATE _GNU_SOURCE)
+add_executable(nvn_link_check tests/nvn_link_check.c)
+target_link_libraries(nvn_link_check PRIVATE -Wl,--whole-archive nxnvn -Wl,--no-whole-archive nxhost nxcpu dynarmic pthread m)

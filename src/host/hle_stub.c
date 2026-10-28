@@ -1,6 +1,7 @@
 #include "hle_stub.h"
 #include "hle_call.h"
 #include "guest_mem.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,32 +14,39 @@ static hle_entry_t g_stub[MAX_STUBS];   // stub i: name and function (fn NULL = 
 static int g_nstub;
 static uint64_t g_page;                 // guest address of stub 0; stub i is 8 bytes at g_page + 8*i
 unsigned long hle_unimplemented_calls;
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;     // registration and stub creation; a stub is immutable once made, so dispatch takes no lock
 
 void hle_register(const char *name, void *fn) {
+    pthread_mutex_lock(&g_mu);
     if (g_nreg == MAX_STUBS) { fprintf(stderr, "[RED] hle_register: table full\n"); abort(); }
     g_reg[g_nreg].name = strdup(name); g_reg[g_nreg].fn = fn; g_nreg++;
+    pthread_mutex_unlock(&g_mu);
 }
 
 static void *lookup(const char *name) {
     for (int i = 0; i < g_nreg; i++) if (!strcmp(g_reg[i].name, name)) return g_reg[i].fn;
     return NULL;
 }
-int hle_implements(const char *name) { return lookup(name) != NULL; }
+int hle_implements(const char *name) {
+    pthread_mutex_lock(&g_mu); int r = lookup(name) != NULL; pthread_mutex_unlock(&g_mu);
+    return r;
+}
 
 uint64_t hle_stub_for(const char *name) {
-    if (!g_page) {
-        g_page = guest_alloc(MAX_STUBS * 8, 0x1000);
-        if (!g_page) return 0;
-    }
-    for (int i = 0; i < g_nstub; i++) if (!strcmp(g_stub[i].name, name)) return g_page + 8 * i;
-    if (g_nstub == MAX_STUBS) { fprintf(stderr, "[RED] hle_stub_for: stub page full\n"); return 0; }
+    pthread_mutex_lock(&g_mu);
+    if (!g_page) g_page = guest_alloc(MAX_STUBS * 8, 0x1000);
+    if (!g_page) { pthread_mutex_unlock(&g_mu); return 0; }
+    for (int i = 0; i < g_nstub; i++) if (!strcmp(g_stub[i].name, name)) { pthread_mutex_unlock(&g_mu); return g_page + 8 * i; }
+    if (g_nstub == MAX_STUBS) { fprintf(stderr, "[RED] hle_stub_for: stub page full\n"); pthread_mutex_unlock(&g_mu); return 0; }
     int i = g_nstub++;
     g_stub[i].name = strdup(name);
     g_stub[i].fn = lookup(name);
     uint32_t *code = (uint32_t *)(g_page + 8 * i);
     code[0] = 0xD4000001u | ((HLE_SVC_BASE + i) << 5);   // svc #(HLE_SVC_BASE+i)
     code[1] = 0xD65F03C0u;                                // ret
-    return g_page + 8 * i;
+    uint64_t a = g_page + 8 * i;
+    pthread_mutex_unlock(&g_mu);
+    return a;
 }
 
 int hle_dispatch(cpu_t *c, uint32_t swi) {

@@ -1,0 +1,124 @@
+// A null GPU behind the Metal-layer interface that hle_nvn.c calls (nvn_mtl.h): every call is accepted, nothing is drawn,
+// and every submission is complete the moment it is committed. It keeps the memory-pool table, which is real (GPU address = CPU address),
+// so address lookups work. The statistics and pacing functions report zero. The Vulkan backend replaces this file function by function.
+#include "nvn_obj.h"
+#include "nvn_mtl.h"
+#include <pthread.h>
+#include <stdatomic.h>
+
+// ---- memory pools: [base, base+size) of guest memory; GPU address == CPU address
+#define MAX_POOLS 1024
+static struct { uint64_t base, size; } g_pool[MAX_POOLS];
+static int g_npool;
+static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+
+void mtl_pool_add(const void *mem, uint64_t size) {
+    pthread_mutex_lock(&g_pool_mu);
+    int i = 0;
+    for (; i < g_npool; i++) if (g_pool[i].base == (uint64_t)(uintptr_t)mem) break;
+    if (i < g_npool || g_npool < MAX_POOLS) { g_pool[i].base = (uint64_t)(uintptr_t)mem; g_pool[i].size = size; if (i == g_npool) g_npool++; }
+    pthread_mutex_unlock(&g_pool_mu);
+}
+void mtl_pool_del(const void *mem) {
+    pthread_mutex_lock(&g_pool_mu);
+    for (int i = 0; i < g_npool; i++) if (g_pool[i].base == (uint64_t)(uintptr_t)mem) { g_pool[i] = g_pool[--g_npool]; break; }
+    pthread_mutex_unlock(&g_pool_mu);
+}
+void mtl_alias_drop_pool(const void *pool) { (void)pool; }
+int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+    int hit = 0;
+    pthread_mutex_lock(&g_pool_mu);
+    for (int i = 0; i < g_npool; i++)
+        if (addr >= g_pool[i].base && len <= g_pool[i].size && addr - g_pool[i].base <= g_pool[i].size - len) {
+            if (buf) *buf = (void *)(uintptr_t)g_pool[i].base;
+            if (off) *off = addr - g_pool[i].base;
+            hit = 1; break;
+        }
+    pthread_mutex_unlock(&g_pool_mu);
+    return hit;
+}
+
+// ---- submissions: the fence value of a submission, complete as soon as it is committed
+static _Atomic uint64_t g_fence;
+void mtl_sub_begin(void) {}
+uint64_t mtl_sub_commit(void) { return atomic_fetch_add(&g_fence, 1) + 1; }
+uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
+int mtl_wait(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return 1; }
+int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return 1; }
+void mtl_finish(void) {}
+void mtl_drain(void) {}
+
+// ---- presentation: no window, no display link; the game paces itself against its own clock
+static _Atomic uint64_t g_ticket;
+uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) { (void)t; (void)period_s; (void)crop; return atomic_fetch_add(&g_ticket, 1) + 1; }
+void mtl_present_wait(uint64_t ticket) { (void)ticket; }
+int mtl_has_window(void) { return 0; }
+int mtl_display_hz(void) { return 60; }
+int mtl_fps_target(void) { return 60; }              // hle_nvn.c divides by it
+int mtl_link_active(void) { return 0; }
+int mtl_link_rate(void) { return 60; }
+int mtl_link_stalled(void) { return 0; }
+int mtl_link_tick(uint64_t n, double *target, double *lead_ms, int *ticks, double *gap_ms) { (void)n; (void)target; (void)lead_ms; (void)ticks; (void)gap_ms; return 0; }
+int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)vsyncs; (void)timeout_ns; return 1; }
+int mtl_link_wait_ticks(int ticks, uint64_t timeout_ns) { (void)ticks; (void)timeout_ns; return 1; }
+int mtl_snap_on(void) { return 0; }
+uint64_t mtl_snap_acquire_wait(void) { return 0; }
+
+// ---- DM_NVN_CAPTURE hooks (nvn_capture.inc is part of the Metal file in nxnative)
+void nvn_cap_submit(int n, const uint64_t *handles) { (void)n; (void)handles; }
+void nvn_cap_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; }
+
+// ---- Everything else: statistics and tuning read by hle_nvn.c's reports, and the object notifications a real backend acts on
+void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) { (void)f; (void)gpu_ms; (void)frame_ms; }
+void mtl_alloc_stats(uint64_t *wired, uint64_t *gpu, int *n) { if (wired) *wired = 0; if (gpu) *gpu = 0; if (n) *n = 0; }
+void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { if (enc) *enc = 0; if (reuse) *reuse = 0; }
+void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full_rw_passes) { if (load) *load = 0; if (store) *store = 0; if (full_rw_passes) *full_rw_passes = 0; }
+unsigned mtl_cpu_tex_count(void) { return 0; }
+void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { if (lib_ns) *lib_ns = 0; if (pso_ns) *pso_ns = 0; }
+void mtl_create_stats(uint64_t *lib, uint64_t *pso) { if (lib) *lib = 0; if (pso) *pso = 0; }
+uint64_t mtl_drawable_ns_take(void) { return 0; }
+uint64_t mtl_ds_omit(void) { return 0; }
+void mtl_exec(const uint8_t *handle) { (void)handle; }
+void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
+double mtl_gpu_ms(uint64_t f) { (void)f; return 0.0; }
+int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { if (t0) *t0 = 0; if (t1) *t1 = 0; return 0; }
+void mtl_hybrid_stats(uint64_t *draws, uint64_t *made, uint64_t *none) { if (draws) *draws = 0; if (made) *made = 0; if (none) *none = 0; }
+void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { (void)frame; (void)mb; }
+uint64_t mtl_pkg_edge_skips(void) { return 0; }
+uint64_t mtl_pkg_miss(void) { return 0; }
+void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { if (uploads) *uploads = 0; if (reuploads) *reuploads = 0; }
+uint32_t mtl_present_qos(void) { return 0; }
+double mtl_presented_time(uint64_t n) { (void)n; return 0.0; }
+void mtl_prog_release(prog_t *p) { (void)p; }
+void mtl_pso_line(char *out, size_t n) { if (n) out[0] = 0; }
+void mtl_queue_activate(uint64_t serial) { (void)serial; }
+void mtl_queue_forget(uint64_t serial) { (void)serial; }
+void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) { (void)t; (void)level; (void)layer0; (void)r; (void)dst; (void)row; (void)img; }
+void mtl_reg_image(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
+void mtl_reg_samp(int id, const samp_par *p) { (void)id; (void)p; }
+void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
+void mtl_set_depth_zero(int on) { (void)on; }
+void mtl_set_frame(uint64_t f) { (void)f; }
+void mtl_set_origin_lower_left(int on) { (void)on; }
+void mtl_set_queue_origin_lower_left(int on) { (void)on; }
+void mtl_set_tex_pool_n(int n) { (void)n; }
+void mtl_stats(uint64_t *passes, uint64_t *draws) { if (passes) *passes = 0; if (draws) *draws = 0; }
+void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
+void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
+void mtl_tex_init(const tex_t *t) { (void)t; }
+void mtl_tex_release(tex_t *t) { (void)t; }
+void mtl_ub_present(double iv_ms) { (void)iv_ms; }
+uint64_t mtl_udc_saved_bytes(void) { return 0; }
+uint64_t mtl_upload_bytes(void) { return 0; }
+uint64_t mtl_upload_gpu_ns_take(void) { return 0; }
+uint64_t mtl_upload_ns_take(void) { return 0; }
+void mtl_use_stats(uint64_t *call, uint64_t *skip) { if (call) *call = 0; if (skip) *skip = 0; }
+void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip, uint64_t *copies, uint64_t *copy_bytes) { if (resolve) *resolve = 0; if (reuse) *reuse = 0; if (set) *set = 0; if (skip) *skip = 0; if (copies) *copies = 0; if (copy_bytes) *copy_bytes = 0; }
+void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
+
+// ---- the NVN function table's glue
+// nxnative's native-code thunks (nvn_thunks.S) are replaced by svc stubs in the guest window: a thunk is created the first time its
+// name is looked up, once nvn_init_slots has filled the slot table.
+void nvn_unimpl_entry(void) {}
+void nvn_prof_entry(void) {}
+void nvn_big_entry(void) {}
