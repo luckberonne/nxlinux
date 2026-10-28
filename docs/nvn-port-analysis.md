@@ -54,3 +54,10 @@ links every object and fails on any unresolved symbol). Its constructor runs: 53
 - NVN function thunks are svc stubs in the guest window (`nvn_thunk_for`), reaching the implementation through `hle_call`.
 - `src/host/faults.c`: the SIGSEGV dispatch dirty tracking needs, re-installed on top of dynarmic's handler after each Jit is made.
 Left out for now: `vm_remap` (virtual pools need a shared guest window), LZFSE capture compression, power and QoS statistics.
+
+## Verified end to end from guest code (tests/guest/nvn_smoke.c, tests/test_nvn_guest.cpp)
+An aarch64 program built against the real `nvn.h` runs on the emulated CPU and does what a game does first: `nvnBootstrapLoader`, device
+(API 55.15 from the profile, pool page size 65536 and queue command memory minimum 65536, the Tegra X1 values in `g_devinfo`), a memory
+pool over its own `.bss` (`nvnMemoryPoolMap` returns that address), two buffers in the pool whose GPU addresses equal their CPU addresses,
+a queue, a command buffer (viewport, scissor, buffer copy), `EndRecording`, `QueueSubmitCommands`, a fence and `SyncWait`, then teardown.
+Path: guest code -> svc stub -> `hle_call` -> the NVN function in `hle_nvn.c` -> the null GPU. No `[RED]` line, no unimplemented import.

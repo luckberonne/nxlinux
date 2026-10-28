@@ -109,3 +109,13 @@ target_compile_options(nxnvn PRIVATE -Wno-unused-function)
 target_compile_definitions(nxnvn PRIVATE _GNU_SOURCE)
 add_executable(nvn_link_check tests/nvn_link_check.c)
 target_link_libraries(nvn_link_check PRIVATE -Wl,--whole-archive nxnvn -Wl,--no-whole-archive nxhost nxcpu dynarmic pthread m)
+set(GUEST_NVN ${CMAKE_BINARY_DIR}/nvn_smoke.so)
+add_custom_command(OUTPUT ${GUEST_NVN}
+    COMMAND clang --target=aarch64-linux-gnu -ffreestanding -O1 -fPIC -nostdlib -shared -fuse-ld=lld -I${CMAKE_SOURCE_DIR}/src/gfx/nvn -I${CMAKE_SOURCE_DIR}/src/gfx/nvn/include
+            -o ${GUEST_NVN} ${CMAKE_SOURCE_DIR}/tests/guest/nvn_smoke.c
+    DEPENDS tests/guest/nvn_smoke.c src/gfx/nvn/nvn_protos.h src/gfx/nvn/include/nvn.h)
+add_custom_target(nvn_smoke_so DEPENDS ${GUEST_NVN})
+add_executable(test_nvn_guest tests/test_nvn_guest.cpp)
+target_link_libraries(test_nvn_guest PRIVATE -Wl,--whole-archive nxnvn -Wl,--no-whole-archive nxhost nxcpu dynarmic pthread m)
+add_dependencies(test_nvn_guest nvn_smoke_so)
+add_test(NAME nvn_guest COMMAND test_nvn_guest ${GUEST_NVN})
