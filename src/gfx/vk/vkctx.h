@@ -14,9 +14,11 @@ typedef struct {
     VkPhysicalDeviceProperties props;
     VkPhysicalDeviceMemoryProperties mem;
     int validation;                 // the Khronos validation layer is active
-    int has_xfb, has_depth_clip_control, has_ext_mem_host;
+    int has_xfb, has_depth_clip_control, has_ext_mem_host, has_push_descriptor;
     VkDeviceSize host_import_align; // minImportedHostPointerAlignment
     PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerProperties;
+    PFN_vkCmdPushDescriptorSetKHR CmdPushDescriptorSet;       // VK_KHR_push_descriptor: the draw path pushes its uniform buffers
+    VkPhysicalDeviceFeatures enabled;                         // the core features that were turned on
     PFN_vkCmdBeginTransformFeedbackEXT CmdBeginTransformFeedback;
     PFN_vkCmdEndTransformFeedbackEXT CmdEndTransformFeedback;
     PFN_vkCmdBindTransformFeedbackBuffersEXT CmdBindTransformFeedbackBuffers;

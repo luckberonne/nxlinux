@@ -1,0 +1,19 @@
+// The shaders the Vulkan backend can run, by the 8-byte key nvn programs carry (the first 8 bytes of SHA-256 of a shader's control section and code,
+// hle_nvn.c keys_hash). The offline chain (dmsh_xlate: Maxwell -> SPIR-V) will fill this from its output; until it does, tests register their own.
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+
+enum { NVN_STAGE_VERTEX = 0, NVN_STAGE_FRAGMENT = 1, NVN_STAGE_GEOMETRY = 2, NVN_STAGE_TESS_CONTROL = 3, NVN_STAGE_TESS_EVAL = 4, NVN_STAGE_COMPUTE = 5 };   // NVNshaderStage
+enum { NVN_SB_CBUF = 1 };    // binding kinds (dmsh_abi.h DMSH_KIND_*); more as the draw path grows: storage buffers, textures, the driver segments
+
+typedef struct { uint32_t binding; uint32_t kind; uint32_t reg; } nvn_shbind;   // Vulkan binding in descriptor set 0, what it is, and its slot (a cbuf's uniform slot)
+
+typedef struct {
+    int stage;                    // NVN_STAGE_*
+    const uint32_t *spirv; size_t bytes;
+    const nvn_shbind *binds; int nbinds;
+} nvn_shader_desc;
+
+void nvn_vk_shader_register(const uint8_t key[8], const nvn_shader_desc *d);   // copies everything; registering a key again replaces it
+uint64_t nvn_vk_shader_key(const uint8_t key[8]);                               // 8 bytes as a number, for tables

@@ -32,13 +32,15 @@ int vkctx_create(vkctx_t *c) {
 
     uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(c->pd, NULL, &ne, NULL);
     VkExtensionProperties *ext = calloc(ne, sizeof *ext); vkEnumerateDeviceExtensionProperties(c->pd, NULL, &ne, ext);
-    const char *want[8]; uint32_t nw = 0;
+    const char *want[12]; uint32_t nw = 0;
     c->has_ext_mem_host = has_ext(ext, ne, "VK_EXT_external_memory_host");
     c->has_xfb = has_ext(ext, ne, "VK_EXT_transform_feedback");
     c->has_depth_clip_control = has_ext(ext, ne, "VK_EXT_depth_clip_control");
     if (c->has_ext_mem_host) want[nw++] = "VK_EXT_external_memory_host";
     if (c->has_xfb) want[nw++] = "VK_EXT_transform_feedback";
     if (c->has_depth_clip_control) want[nw++] = "VK_EXT_depth_clip_control";
+    c->has_push_descriptor = has_ext(ext, ne, "VK_KHR_push_descriptor");
+    if (c->has_push_descriptor) want[nw++] = "VK_KHR_push_descriptor";
     free(ext);
 
     VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
@@ -71,7 +73,7 @@ int vkctx_create(vkctx_t *c) {
         .independentBlend = f->independentBlend, .shaderInt64 = f->shaderInt64, .samplerAnisotropy = f->samplerAnisotropy,
         .fragmentStoresAndAtomics = f->fragmentStoresAndAtomics, .textureCompressionBC = 1, .depthClamp = f->depthClamp, .fillModeNonSolid = f->fillModeNonSolid,
         .multiDrawIndirect = f->multiDrawIndirect, .imageCubeArray = f->imageCubeArray, .shaderStorageImageWriteWithoutFormat = f->shaderStorageImageWriteWithoutFormat,
-        .drawIndirectFirstInstance = f->drawIndirectFirstInstance};
+        .drawIndirectFirstInstance = f->drawIndirectFirstInstance, .logicOp = f->logicOp};
     VkPhysicalDeviceFeatures2 ef2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e12, .features = ef};
 
     uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(c->pd, &nq, NULL);
@@ -95,6 +97,8 @@ int vkctx_create(vkctx_t *c) {
         c->host_import_align = emh.minImportedHostPointerAlignment;
         c->GetMemoryHostPointerProperties = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(c->dev, "vkGetMemoryHostPointerPropertiesEXT");
     }
+    c->enabled = ef;
+    if (c->has_push_descriptor) c->CmdPushDescriptorSet = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(c->dev, "vkCmdPushDescriptorSetKHR");
     if (c->has_xfb) {
         c->CmdBeginTransformFeedback = (PFN_vkCmdBeginTransformFeedbackEXT)vkGetDeviceProcAddr(c->dev, "vkCmdBeginTransformFeedbackEXT");
         c->CmdEndTransformFeedback = (PFN_vkCmdEndTransformFeedbackEXT)vkGetDeviceProcAddr(c->dev, "vkCmdEndTransformFeedbackEXT");

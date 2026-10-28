@@ -124,3 +124,27 @@ Attachment views carry an explicit `VkImageViewUsageCreateInfo`: without it an s
 does not support (reported by the validation layer).
 Checked by `test_nvn_vk_tex` (whole, scissored, one level through a view, sRGB view, R32_UINT, array layers, depth, scissored depth, stencil, a
 masked clear that must change nothing) and by the guest through `SetRenderTargets` / `ClearColor` / `SetScissor` in `test_nvn_guest`.
+
+## Draws (src/gfx/nvn/nvn_draw_vk.c, nvn_shader_vk.c)
+The replay accumulates the state records (`OP_BIND_PROGRAM/STATE/VATTR/VSTREAM/VBUF/UBO`, viewports, depth range, stencil, polygon offset, blend colour,
+primitive restart, rasteriser discard) and a draw (`OP_DRAW`, `OP_DRAW_IDX`) turns them into Vulkan:
+- **Programs and shaders.** `hle_nvn.c` already computes each shader's 8-byte key; `nvn_prog_keys` exposes a program's keys. A registry
+  (`nvn_vk_shader_register`) maps a key to SPIR-V, its stage and its bindings. The offline chain (`dmsh_xlate`) will fill it; the tests register hand-written
+  SPIR-V for fake shaders whose control and code bytes they choose, and compute the key the way `keys_hash` does.
+- **Pipelines** are built from the whole state, already in Vulkan terms (blend factors and operations, depth and stencil functions, cull and winding, polygon
+  mode, vertex layout, attachment formats), and cached by a `memcmp` of that key. Viewport, scissor, depth bias, blend constants and the stencil masks and
+  reference are dynamic. The blend, depth-stencil, polygon, colour and channel-mask enums of NVN map onto Vulkan's by tables (the depth, stencil and compare
+  enums happen to be the same order shifted by one).
+- **The render pass** opens at the first draw with `LOAD` on every attachment and stays open until something else needs the command buffer:
+  `nvn_vk_cmd()` ends it, so every copy, fill, clear and barrier gets that for free. A change of render targets reopens it.
+- **Conventions of NVN's GL heritage**, checked by the test against pixels: depth through `VK_EXT_depth_clip_control` (negativeOneToOne), so the clip volume is -w..w
+  as in NVN and no shader needs a depth variant (a triangle at NDC z = -0.5 stores exactly 0.25); a lower-left window origin keeps the viewport unflipped and
+  inverts the front face (Vulkan names winding as seen with y down), an upper-left origin flips the viewport and keeps it.
+- **Uniform buffers** are pushed with `VK_KHR_push_descriptor`, one binding per (shader, uniform slot) as the registry says; an unbound slot reads zeros.
+- Found on the way: `SetViewport` records only x, y, w, h, so the record's near and far are zero: the depth range is `SetDepthRange`'s, 0..1 by default.
+Checked by `test_nvn_draw` through the real NVN API from guest code: default state, culling in both senses, blending, depth test and stored depth, channel mask,
+uniform buffers in both stages, indexed draws (the index order is what the culling sees), and a program with no registered shaders (the draw is skipped, announced
+in red once, the frame goes on). The same test on the null GPU fails every drawing check.
+Not yet: textures and samplers in shaders (the bindless arrays are tested apart), storage buffers, the driver constant segments c0 and c2, the translated shader
+library and its JSON reflection, geometry and tessellation stages, compute, indirect and multi-draws, line loops / quads / polygons and 8-bit indices (they need
+an index list built), several viewports, multisampling, logic ops, alpha test, transform feedback, conditional rendering, clears with a channel mask.

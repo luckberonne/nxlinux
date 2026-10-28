@@ -8,6 +8,7 @@
 #include "nvn_mtl.h"
 #include "nvn_vk.h"
 #include "nvn_vk_priv.h"
+#include "nvn_draw.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -33,9 +34,6 @@ uint64_t nvn_replay_ops_named(const char *name) {      // the same by op name ("
     for (unsigned i = 0; i < OP_COUNT_; i++) if (op_name[i] && !strcmp(op_name[i], name)) return atomic_load(&g_seen[i]);
     return 0;
 }
-// Render-target and scissor state the clears (and later the draws) read. The textures in a record are snapshots made at record time, so only the serial is kept.
-static struct { int n; uint64_t cser[8]; view_t cview[8]; uint8_t has_cview[8]; uint64_t dser; view_t dview; uint8_t has_dview; } g_rt;
-static struct { int has; int r[4]; } g_sc;                                         // the scissor, once set: x, y, w, h
 static uint64_t g_copy_row, g_copy_img;                // OP_COPY_STRIDE state: bytes per row and per image of buffer<->texture copies (0 = tight)
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }               // lookahead across handles: only the Metal pass merging uses it
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
@@ -90,6 +88,11 @@ void mtl_exec(const uint8_t *p) {
             g_rt.dser = r->depth ? r->depth->serial : 0; g_rt.dview = r->dview; g_rt.has_dview = r->has_dview;
             break; }
         case OP_SCISSOR: { const p_scissor *sc = (const p_scissor *)a; g_sc.has = 1; g_sc.r[0] = sc->x; g_sc.r[1] = sc->y; g_sc.r[2] = sc->w; g_sc.r[3] = sc->h; break; }
+        case OP_DRAW: { p_draw t; nvn_draw(draw_rec(a, h.size, &t)); break; }
+        case OP_DRAW_IDX: { p_draw_idx t; nvn_draw_idx(draw_idx_rec(a, h.size, &t)); break; }
+        case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_UBO: case OP_BIND_UBO_SMALL:
+        case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_STENCIL: case OP_PRIM_RESTART: case OP_RAST_DISCARD:
+            nvn_draw_state_op(h.op, a); break;
         case OP_CLEAR_COLOR: {
             const p_clear_color *cc = (const p_clear_color *)a;
             if (cc->index < 0 || cc->index >= g_rt.n || !g_rt.cser[cc->index]) { fprintf(stderr, "[dm] [RED] [nvn] colour clear of target %d, which is not set\n", cc->index); break; }

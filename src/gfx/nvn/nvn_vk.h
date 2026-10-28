@@ -14,6 +14,10 @@ uint64_t nvn_gpu_completed(void);     // timeline value the GPU has reached
 uint64_t nvn_replay_ops(unsigned op);
 uint64_t nvn_replay_skipped(unsigned op);
 uint64_t nvn_replay_ops_named(const char *name);
+// Draw statistics (nvn_draw_vk.c): draws recorded, draws that could not be made, distinct pipelines built
+uint64_t nvn_draw_count(void);
+uint64_t nvn_draw_skipped(void);
+uint64_t nvn_pipeline_count(void);
 #ifdef __cplusplus
 }
 #endif

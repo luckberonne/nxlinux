@@ -617,6 +617,15 @@ static void pk_drop(const void *p) {
     if (k) { pk_put(p, NULL); free(k); }
     pthread_mutex_unlock(&g_pk_mu);
 }
+// The keys of a program's shader stages as SetShaders computed them (the replay layer finds the shaders by them): n keys in the order of SetShaders; keys with no
+// valid code area are left out. Returns how many were written to out (at most 6).
+int nvn_prog_keys(const prog_t *p, uint8_t out[6][8]) {
+    prog_keys_t *k = pk_get(p, 0);
+    if (!k) return 0;
+    int n = 0;
+    for (unsigned i = 0; i < p->nstage && i < 6; i++) if (k->ok >> i & 1) memcpy(out[n++], k->key[i], 8);
+    return n;
+}
 // mapped = 1: computed only when the code area is in a registered memory pool (at SetShaders: Mario sets some programs with an unmapped address first and fills it in before the first draw)
 static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     uint32_t ncode = 0; void *mb; uint64_t mo;

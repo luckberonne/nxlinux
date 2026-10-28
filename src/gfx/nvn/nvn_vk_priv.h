@@ -26,3 +26,8 @@ void nvn_vk_copy_t2b(const p_copy_b2t *c, uint64_t row, uint64_t img);   // the 
 // A colour clear takes rgba as the game recorded it (floats; converted to the attachment's integer type for integer formats).
 void nvn_vk_clear_color(uint64_t serial, const view_t *v, int has_view, int mask, const float rgba[4], const int *rect);
 void nvn_vk_clear_ds(uint64_t serial, const view_t *v, int has_view, float depth, int depth_mask, int stencil, int stencil_mask, const int *rect);
+
+// The draw path (nvn_draw_vk.c, nvn_tex_vk.c)
+typedef struct { VkImageView view; VkFormat fmt; uint32_t w, h, layers; VkImageAspectFlags aspect; } nvn_attach;
+int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach *out);
+VkCommandBuffer nvn_vk_cmd_raw(void);       // the submission's command buffer without ending an open render pass: for the draw path only

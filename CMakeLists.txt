@@ -67,7 +67,9 @@ nx_glsl(tri.vert.spv tri.vert)
 nx_glsl(tri.frag.spv tri.frag)
 nx_glsl(fill.comp.spv fill.comp)
 nx_glsl(bindless.comp.spv bindless.comp)
-add_custom_target(test_shaders DEPENDS ${CMAKE_BINARY_DIR}/shaders/tri.vert.spv ${CMAKE_BINARY_DIR}/shaders/tri.frag.spv ${CMAKE_BINARY_DIR}/shaders/fill.comp.spv ${CMAKE_BINARY_DIR}/shaders/bindless.comp.spv)
+nx_glsl(draw.vert.spv draw.vert)
+nx_glsl(draw.frag.spv draw.frag)
+add_custom_target(test_shaders DEPENDS ${CMAKE_BINARY_DIR}/shaders/tri.vert.spv ${CMAKE_BINARY_DIR}/shaders/tri.frag.spv ${CMAKE_BINARY_DIR}/shaders/fill.comp.spv ${CMAKE_BINARY_DIR}/shaders/bindless.comp.spv ${CMAKE_BINARY_DIR}/shaders/draw.vert.spv ${CMAKE_BINARY_DIR}/shaders/draw.frag.spv)
 add_executable(test_vk_triangle tests/test_vk_triangle.c)
 target_link_libraries(test_vk_triangle PRIVATE nxvk m)
 add_dependencies(test_vk_triangle test_shaders)
@@ -100,7 +102,7 @@ add_custom_target(game_profile DEPENDS ${NX_GEN_DIR}/game_profile.h)
 add_custom_command(OUTPUT ${NX_GEN_DIR}/nvn_names.c
     COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/gen_nvn_names.py ${CMAKE_SOURCE_DIR}/src/gfx/nvn/names.txt ${NX_GEN_DIR}/nvn_names.c
     DEPENDS tools/gen_nvn_names.py src/gfx/nvn/names.txt)
-add_library(nxnvn STATIC src/gfx/nvn/hle_nvn.c src/gfx/nvn/nvn_dirty.c src/gfx/nvn/nvn_capture.c src/gfx/nvn/nvn_tex.c src/gfx/nvn/nvn_null.c src/gfx/nvn/nvn_vk.c src/gfx/nvn/nvn_replay.c src/gfx/nvn/nvn_tex_vk.c
+add_library(nxnvn STATIC src/gfx/nvn/hle_nvn.c src/gfx/nvn/nvn_dirty.c src/gfx/nvn/nvn_capture.c src/gfx/nvn/nvn_tex.c src/gfx/nvn/nvn_null.c src/gfx/nvn/nvn_vk.c src/gfx/nvn/nvn_replay.c src/gfx/nvn/nvn_tex_vk.c src/gfx/nvn/nvn_draw_vk.c src/gfx/nvn/nvn_shader_vk.c
     src/gfx/tex/nvn_deswizzle.c src/host/sha256.c src/host/faults.c src/host/hostsvc.c ${NX_GEN_DIR}/nvn_names.c)
 target_link_libraries(nxnvn PUBLIC nxhost nxvk nxfmt m)
 target_include_directories(nxnvn PUBLIC ${NX_GEN_DIR} src/host src/gfx/nvn src/gfx/nvn/include src/gfx third_party/vulkan-headers/include)
@@ -125,3 +127,13 @@ add_test(NAME nvn_vk_pool COMMAND test_nvn_vk_pool)
 add_executable(test_nvn_vk_tex tests/test_nvn_vk_tex.c)
 target_link_libraries(test_nvn_vk_tex PRIVATE nxnvn nxhost nxvk nxfmt pthread m)
 add_test(NAME nvn_vk_tex COMMAND test_nvn_vk_tex)
+set(GUEST_DRAW ${CMAKE_BINARY_DIR}/nvn_draw.so)
+add_custom_command(OUTPUT ${GUEST_DRAW}
+    COMMAND clang --target=aarch64-linux-gnu -ffreestanding -O1 -fPIC -nostdlib -shared -fuse-ld=lld -I${CMAKE_SOURCE_DIR}/src/gfx/nvn -I${CMAKE_SOURCE_DIR}/src/gfx/nvn/include
+            -o ${GUEST_DRAW} ${CMAKE_SOURCE_DIR}/tests/guest/nvn_draw.c
+    DEPENDS tests/guest/nvn_draw.c src/gfx/nvn/nvn_protos.h src/gfx/nvn/include/nvn.h)
+add_custom_target(nvn_draw_so DEPENDS ${GUEST_DRAW})
+add_executable(test_nvn_draw tests/test_nvn_draw.cpp)
+target_link_libraries(test_nvn_draw PRIVATE -Wl,--whole-archive nxnvn -Wl,--no-whole-archive nxhost nxcpu dynarmic pthread m)
+add_dependencies(test_nvn_draw nvn_draw_so test_shaders)
+add_test(NAME nvn_draw COMMAND test_nvn_draw ${GUEST_DRAW} ${CMAKE_BINARY_DIR}/shaders/draw.vert.spv ${CMAKE_BINARY_DIR}/shaders/draw.frag.spv)

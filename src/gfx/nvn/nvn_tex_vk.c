@@ -406,3 +406,22 @@ void nvn_vk_clear_ds(uint64_t serial, const view_t *v, int has_view, float depth
     nvn_vk_barrier_all(cb);
     mark_gpu(e, level, layer0, n);
 }
+
+// A render target for the draw path: its view (the texture's own format, or the view's reinterpretation), the size of the level and the layers.
+// Fills the image from its storage first when that is dirty, and marks what the view covers as GPU-written, since the draws will write it.
+// The submission being recorded must not be inside a render pass (nvn_vk_cmd ends one).
+int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach *out) {
+    static int bad;
+    vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd();
+    if (!c || !cb) return 0;
+    vktex_t *e = find(serial);
+    if (!use(e, c, cb)) return 0;
+    unsigned level, layer0, n; VkFormat fmt; VkRect2D area;
+    if (!clear_target(e, v, has_view, NULL, &level, &layer0, &n, &fmt, &area) || !n) { red_once(&bad, "the render target is a 3D texture or names a level or layer that does not exist", e->d.format); return 0; }
+    VkFormat vf = (e->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? fmt : e->fmt;
+    VkImageView iv = view_for(e, c, vf, level, layer0, n);
+    if (!iv) return 0;
+    mark_gpu(e, level, layer0, n);
+    *out = (nvn_attach){iv, vf, area.extent.width, area.extent.height, n, e->aspect};
+    return 1;
+}

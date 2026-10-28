@@ -11,6 +11,7 @@
 #include "nvn_mtl.h"
 #include "nvn_vk.h"
 #include "nvn_vk_priv.h"
+#include "nvn_draw.h"
 #include "nvn_timestamp.h"
 #include "../vk/vkctx.h"
 #include <pthread.h>
@@ -67,7 +68,9 @@ unsigned nvn_gpu_pools(void) { unsigned n = 0; pthread_mutex_lock(&G.pool_mu); f
 uint64_t nvn_gpu_completed(void) { uint64_t v = 0; if (gpu()) vkGetSemaphoreCounterValue(G.c.dev, G.tl, &v); return v; }
 
 vkctx_t *nvn_vk_ctx(void) { return gpu() ? &G.c : NULL; }
-VkCommandBuffer nvn_vk_cmd(void) { return G.ok ? G.cur : NULL; }
+VkCommandBuffer nvn_vk_cmd_raw(void) { return G.ok ? G.cur : NULL; }
+// Every other operation (copies, fills, barriers, clears) is invalid inside a render pass instance: asking for the command buffer ends the draw path's pass
+VkCommandBuffer nvn_vk_cmd(void) { if (!G.ok || !G.cur) return NULL; nvn_draw_pass_end(); return G.cur; }
 uint64_t nvn_vk_next_fence(void) { return gpu() ? atomic_load(&G.submitted) + 1 : 0; }
 
 // ---- effects of completion
@@ -262,6 +265,7 @@ void mtl_sub_begin(void) {
     pthread_mutex_lock(&G.vk_mu);
     G.cur = vkctx_begin(&G.c);
     pthread_mutex_unlock(&G.vk_mu);
+    nvn_draw_new_submission();
     if (!G.cur) fprintf(stderr, "[dm] [RED] [nvn] could not start a command buffer\n");
 }
 uint64_t mtl_sub_commit(void) {
@@ -271,6 +275,7 @@ uint64_t mtl_sub_commit(void) {
         G.nops = G.nstg = 0;
         return atomic_fetch_add(&n, 1) + 1;
     }
+    nvn_draw_pass_end();                   // a render pass cannot cross the end of the command buffer
     uint64_t value = atomic_load(&G.submitted) + 1;
     VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = G.cur};
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = G.tl, .value = value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
