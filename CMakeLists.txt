@@ -16,3 +16,8 @@ add_executable(t_tex tests/gfx/t_tex.c src/gfx/tex/nvn_deswizzle.c src/gfx/nvn/n
 target_link_libraries(t_tex PRIVATE m)
 target_compile_options(t_tex PRIVATE -Wall -Wextra)
 add_test(NAME tex COMMAND t_tex)
+add_library(nxcpu STATIC src/host/cpu.cpp)
+target_link_libraries(nxcpu PUBLIC dynarmic)
+add_executable(test_cpu_atomic tests/test_cpu_atomic.cpp)
+target_link_libraries(test_cpu_atomic PRIVATE nxcpu pthread)
+add_test(NAME cpu_atomic COMMAND test_cpu_atomic)
