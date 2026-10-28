@@ -15,9 +15,23 @@ that never touch real material:
   · Sections: AES-128-CTR with the decrypted key area slot 2 (NcaKeyType.AesCtr);
     counter bytes 0..7 = the FS header's Counter (CreateCounter), 8..15 =
     (section offset + rel) /16 (Aes128CtrStorage.UpdateCounter).
-  · Section hash tree: the section's FS header carries a master hash over the
-    SHA-256 table (one digest per 0x10000 block of the file system); the table
-    directly precedes the file system data (InitIvfcForPartitionFs).
+  · Code section: a PFS0 with the SHA-256 hash tree: the section's FS header
+    carries a master hash over the SHA-256 table (one digest per 0x10000 block
+    of the file system); the table directly precedes the file system data
+    (InitIvfcForPartitionFs).
+  · Data section: an IVFC-wrapped RomFS (HashType.Ivfc in the FS header). The
+    ivfc struct read by InitIvfcForRomFs names three regions: region 0 holds
+    the SHA-256 table over region 1's 0x1000 blocks, region 1 the table over
+    the RomFS data's 0x4000 blocks, and the master hash (in the fs header) the
+    table over region 0 as a single 0x1000 block. Every digest is plain
+    SHA-256 over the zero-padded block: Tools/FsSystem's
+    IntegrityVerificationStorage pads each touched sector for its digest and,
+    for RomFs/PartitionFs, hashes without salt and without the validation bit
+    (that is save-data only). Inside, the RomFS is what RomFsFileSystem reads:
+    a 0x50 header of nine offsets, int hash buckets (RomEntryKey.GetRomHashCode
+    % bucket count), 24-byte directory and 32-byte file entries laid out as the
+    reader's RomFsEntry, with the sibling chains the enumeration walks and the
+    bucket chains the lookup walks.
   · No ticket: the key area holds plain content keys, not title-key ones.
   · prod.keys: only header_key and key_area_key_application_00. Deliberately no
     master_key_00 and no *_source keys: LibHac ships the real source constants
@@ -51,12 +65,23 @@ FS_HEADERS_OFF = 0x400
 NCA3 = 3                  # the only version LibHac opens from an NSP
 CONTENT_TYPE_PROGRAM = 0
 DIST_TYPE_DOWNLOAD = 1
+FS_FORMAT_ROMFS = 0
 FS_FORMAT_PFS0 = 1
+FS_HASH_IVFC = 3
 FS_HASH_SHA256 = 2
 FS_ENCRYPT_CTR = 3
 GF_REDUCTION = 0x87       # x^128 + x^7 + x^2 + x + 1, the tweak's wrap term
 CTR_SLOT = 2              # NcaKeyType.AesCtr
 DEFAULT_SEED = 0x5EED5EED
+
+IVFC_MAGIC = b'IVFC'
+IVFC_VERSION = 0x10000
+IVFC_LEVELS = 4           # master hash + three regions; region 2 is the RomFS data
+ROMFS_BSP = (12, 12, 14)  # log2 block size hashed for region 0 / region 1 / the data
+ROMFS_DATA_UNIT = 1 << ROMFS_BSP[2]
+ROMFS_TABLE_LIMIT = 0x1000  # region 0 is covered as one master-hash block (no room for more)
+ROMFS_DIR_ENTRY = 24      # Parent, NextSibling, ChildDir, ChildFile, Next, KeyLength
+ROMFS_FILE_ENTRY = 32     # Parent, NextSibling, Offset, Length, Next, KeyLength
 
 # --- AES core (a Cipher call per block: the data is tiny, speed is a non-goal) ---------
 
@@ -167,6 +192,193 @@ def build_pfs0(files):
         out += b'\0' * (_align(len(d), PFS_ALIGN) - len(d))
     return bytes(out)
 
+# --- RomFS (the NCA Data section's file system) -----------------------------------------
+
+def _romfs_name_hash(parent, name):
+    """RomEntryKey.GetRomHashCode: a rotate-27 byte mix over the name."""
+    h = (0x75BCD15 ^ (parent & 0xFFFFFFFF)) & 0xFFFFFFFF
+    for b in name:
+        h = (b ^ ((h << 27) | (h >> 5))) & 0xFFFFFFFF
+    return h
+
+def _prime_at_least(n):
+    n = max(3, n)
+    while any(n % d == 0 for d in range(2, min(n, 47))):
+        n += 1
+    return n
+
+def _sibling_chain(items, parent_of):
+    """(next-sibling map, {parent: first child offset}) for entries: whoever shares
+    a parent is consecutive in items. These are the chains FindNextFile and
+    FindNextDirectory walk (the bucket chains are what the lookups walk)."""
+    sib, first = {}, {}
+    prev_key, prev_parent = None, object()
+    for key, off in items:
+        parent = parent_of(key)
+        if prev_key is not None and prev_parent == parent:
+            sib[prev_key] = off
+        else:
+            first[parent] = off
+        prev_key, prev_parent = key, parent
+    return sib, first
+
+def build_romfs(files):
+    """files: {posix rel path: content} -> a RomFS image as RomFsFileSystem reads it.
+    Layout: 0x50 header of nine offsets, then dir hash table, dir entries, file
+    hash table, file entries, file data. The root is entry 0 of the dir table
+    under key (parent 0, empty name); dir entries are 24 bytes and file entries
+    32 (the reader's RomFsEntry), each followed by the name, no NUL, rounded to
+    four bytes."""
+    assert files
+    tree = {'dirs': {}, 'files': []}
+    for path, content in files.items():
+        node = tree
+        parts = path.split('/')
+        for part in parts[:-1]:
+            node = node['dirs'].setdefault(part, {'dirs': {}, 'files': []})
+        node['files'].append((parts[-1], content))
+    dirs = []                                   # (path tuple, node), parents first
+    def collect(node, path):
+        node['dirs'] = dict(sorted(node['dirs'].items()))
+        node['files'].sort(key=lambda item: item[0])
+        dirs.append((path, node))
+        for name, child in node['dirs'].items():
+            collect(child, path + (name,))
+    collect(tree, ())
+
+    dir_meta, file_meta, file_data = {}, {}, {}
+    file_rows = []
+    at = 0
+    for path, node in dirs:
+        dir_meta[path] = at
+        at += _align(ROMFS_DIR_ENTRY + len(path[-1] if path else ''), 4)
+        for fname, content in node['files']:
+            file_rows.append((path, fname, content))
+    at = 0
+    for dpath, fname, content in file_rows:
+        file_data[dpath + (fname,)], at = at, at + len(content)
+    at = 0
+    for dpath, fname, content in file_rows:
+        file_meta[dpath + (fname,)], at = at, at + _align(ROMFS_FILE_ENTRY + len(fname), 4)
+
+    # the root's own row is skipped: it has no parent and its sibling stays -1
+    dir_sib, first_dir = _sibling_chain([(p, dir_meta[p]) for p, _ in dirs if p],
+                                        lambda p: p[:-1])
+    file_sib, first_file = _sibling_chain([(p + (n,), file_meta[p + (n,)]) for p, n, _ in file_rows],
+                                          lambda p: p[:-1])
+
+    d_buckets = [-1] * _prime_at_least(len(dirs))
+    d_next = {}
+    for path, _ in dirs:
+        parent = dir_meta.get(path[:-1], 0) if path else 0
+        b = _romfs_name_hash(parent, path[-1].encode() if path else b'') % len(d_buckets)
+        d_next[path] = d_buckets[b]
+        d_buckets[b] = dir_meta[path]
+    f_buckets = [-1] * _prime_at_least(len(file_rows))
+    f_next = {}
+    for dpath, fname, content in file_rows:
+        b = _romfs_name_hash(dir_meta[dpath], fname.encode()) % len(f_buckets)
+        f_next[dpath + (fname,)] = f_buckets[b]
+        f_buckets[b] = file_meta[dpath + (fname,)]
+
+    dblob = bytearray()
+    for path, node in dirs:
+        name = b'' if not path else path[-1].encode()
+        parent = 0 if not path else dir_meta[path[:-1]]
+        sib = dir_sib.get(path, -1) if path else -1
+        dblob += struct.pack('<IiiiiI', parent, sib, first_dir.get(path, -1),
+                             first_file.get(path, -1), d_next[path], len(name))
+        dblob += name
+        used = ROMFS_DIR_ENTRY + len(name)
+        dblob += b'\0' * (_align(used, 4) - used)
+    fblob = bytearray()
+    for dpath, fname, content in file_rows:
+        key = dpath + (fname,)
+        name = fname.encode()
+        fblob += struct.pack('<IiQQi' + 'I', dir_meta[dpath], file_sib.get(key, -1),
+                             file_data[key], len(content), f_next[key], len(name))
+        fblob += name
+        used = ROMFS_FILE_ENTRY + len(name)
+        fblob += b'\0' * (_align(used, 4) - used)
+
+    dh_off = 0x50
+    dm_off = _align(dh_off + len(d_buckets) * 4, 4)
+    fh_off = _align(dm_off + len(dblob), 4)
+    fm_off = _align(fh_off + len(f_buckets) * 4, 4)
+    data_off = _align(fm_off + len(fblob), 16)
+    # RomfsHeader reads the nine offsets as u64s from 0x08 (the u32 at 0x04 is unused)
+    header = struct.pack('<II', 0x50, 0) + struct.pack(
+        '<9Q', dh_off, len(d_buckets) * 4, dm_off, len(dblob),
+        fh_off, len(f_buckets) * 4, fm_off, len(fblob), data_off)
+    image = bytearray(header)
+    image += b'\0' * (dh_off - len(image))      # the header block is 0x50 bytes
+    assert len(image) == dh_off
+    image += struct.pack('<%di' % len(d_buckets), *d_buckets)
+    assert len(image) == dm_off
+    image += dblob
+    assert len(image) == fh_off
+    image += struct.pack('%di' % len(f_buckets), *f_buckets)
+    assert len(image) == fm_off
+    image += fblob
+    assert len(image) <= data_off
+    image += b'\0' * (data_off - len(image))    # data starts at its own aligned offset
+    assert len(image) == data_off
+    pos = data_off
+    for dpath, fname, content in file_rows:
+        assert pos == data_off + file_data[dpath + (fname,)]
+        image += content
+        pos += len(content)
+    image += b'\0' * (_align(len(image), 16) - len(image))
+    return bytes(image)
+
+def _block_hashes(data, unit):
+    """SHA-256 per unit-sized block, the last zero-padded. The reader computes each
+    level's digest over the touched sector with the read's tail zeroed (RomFs type
+    hashes the padded sector), so the stored digests must cover the padding."""
+    out = bytearray()
+    for i in range(0, len(data), unit):
+        chunk = data[i:i + unit]
+        out += hashlib.sha256(chunk + b'\0' * (unit - len(chunk))).digest()
+    return bytes(out)
+
+def build_fs_header_romfs(master, regions, image_len, counter=(1, 0)):
+    """FS header of a Data section: RomFS / IVFC / CTR. The ivfc struct sits at
+    +0x08: magic, version 0x10000, master hash size, level count 4; six level
+    entries at +0x18 (three used: region 0 = the table over region 1, region 1
+    = the table over the data, region 2 = the data), the salt source at +0xA8
+    left zero (RomFs hashing takes no salt), the master hash at +0xC8, the CTR
+    counter pair at +0x140."""
+    fs = bytearray(0x200)
+    struct.pack_into('<H', fs, 0, 2)                    # header version
+    fs[2] = FS_FORMAT_ROMFS
+    fs[3] = FS_HASH_IVFC
+    fs[4] = FS_ENCRYPT_CTR
+    struct.pack_into('<4siii', fs, 8, IVFC_MAGIC, IVFC_VERSION, len(master), IVFC_LEVELS)
+    for j, (off, size, bsp) in enumerate(regions):
+        struct.pack_into('<qqii', fs, 24 + j * 24, off, size, bsp, 0)
+    fs[200:200 + len(master)] = master
+    struct.pack_into('<ii', fs, 320, counter[0], counter[1])
+    return fs
+
+def build_romfs_section(image):
+    """(fs header, section data) for the Data section: region 0, region 1, then the
+    RomFS image. The master hash covers region 0 as one 0x1000 block, so region
+    0 (one digest per 0x1000 of region 1) stays a single-entry table and the
+    image stays under 2 MiB at the current block sizes."""
+    assert len(image) and len(image) % 16 == 0
+    assert len(image) <= (ROMFS_TABLE_LIMIT // 32) * ROMFS_DATA_UNIT
+    r1 = _block_hashes(image, ROMFS_DATA_UNIT)
+    r0 = _block_hashes(r1, 1 << ROMFS_BSP[1])
+    master = _block_hashes(r0, 1 << ROMFS_BSP[0])
+    assert len(r0) <= ROMFS_TABLE_LIMIT
+    r1_off = _align(len(r0), 16)
+    data_off = _align(r1_off + len(r1), 16)
+    section = r0 + b'\0' * (r1_off - len(r0)) + r1 + b'\0' * (data_off - r1_off - len(r1)) + image
+    fs = build_fs_header_romfs(master, [(0, len(r0), ROMFS_BSP[0]),
+                                        (r1_off, len(r1), ROMFS_BSP[1]),
+                                        (data_off, len(image), ROMFS_BSP[2])], len(image))
+    return fs, section
+
 # --- NCA3 ------------------------------------------------------------------------------
 
 def build_fs_header_pfs(hash_table_len, data_len, block_size=HASH_UNIT, counter=(1, 0)):
@@ -266,11 +478,28 @@ def _module(rng, kind):
     data = b'\0' * 0x1000
     return build_nso(text, ro, data, 0x4000, rng.randbytes(0x20))
 
-def make_game_nca(header_key, kaek, module):
+def make_romfs(variant):
+    """The fake game's RomFS: two text files and a pseudorandom blob spanning the
+    0x4000 data-block boundary, so reads touch more than one integrity block.
+    The update ships a changed config and a file the base does not have."""
+    files = {
+        'data/config.txt': b'synthetic romfs config\nvariant: %s\n' % variant.encode(),
+        'assets/greeting.txt': b'hello from the synthetic RomFS (%s)\n' % variant.encode(),
+        'assets/tile.dat': rng_rand(0x7171, 0x4800),
+    }
+    if variant == 'update':
+        files['data/extra.txt'] = b'only in the update\n'
+    return build_romfs(files)
+
+def make_game_nca(header_key, kaek, module, romfs=None):
+    """The program NCA: the code section's PFS0 with the module, and (by default)
+    the Data section with the variant's RomFS."""
     pfs = build_pfs0([('main', module)])
     assert len(pfs) % 16 == 0
-    return build_nca3([build_pfs_section(pfs)], TITLE_ID, CONTENT_TYPE_PROGRAM,
-                      header_key, kaek)
+    sections = [build_pfs_section(pfs)]
+    if romfs is not None:
+        sections.append(build_romfs_section(romfs))
+    return build_nca3(sections, TITLE_ID, CONTENT_TYPE_PROGRAM, header_key, kaek)
 
 def synth_sequence(seed):
     """The exact byte stream write_all generates, so tests can expect outputs:
@@ -280,7 +509,7 @@ def synth_sequence(seed):
     kaek = rng.randbytes(16)
     return header_key, kaek, _module(rng, 'base'), _module(rng, 'patch')
 
-def write_all(out, seed=DEFAULT_SEED):
+def write_all(out, seed=DEFAULT_SEED, with_romfs=True):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     header_key, kaek, base_module, update_module = synth_sequence(seed)
@@ -288,8 +517,9 @@ def write_all(out, seed=DEFAULT_SEED):
         '# synthetic keyset for the pipeline tests (docs/plan.md); not from any console\n'
         f'header_key = {header_key.hex()}\n'
         f'key_area_key_application_00 = {kaek.hex()}\n')
+    romfs = {'base.nsp': make_romfs('base'), 'update.nsp': make_romfs('update')} if with_romfs else {}
     for name, module in (('base.nsp', base_module), ('update.nsp', update_module)):
-        nca = make_game_nca(header_key, kaek, module)
+        nca = make_game_nca(header_key, kaek, module, romfs.get(name))
         (out / name).write_bytes(build_pfs0([(content_id(nca) + '.nca', nca)]))
     print(f'wrote {out}/prod.keys base.nsp update.nsp (seed {seed:#x})')
 
@@ -298,9 +528,12 @@ def content_id(nca):
     return hashlib.sha256(nca).hexdigest()[:32]
 
 def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else 'work/synth'
-    seed = int(sys.argv[2], 0) if len(sys.argv) > 2 else DEFAULT_SEED
-    write_all(out, seed)
+    args = sys.argv[1:]
+    with_romfs = '--no-romfs' not in args
+    args = [a for a in args if a != '--no-romfs']
+    out = args[0] if args else 'work/synth'
+    seed = int(args[1], 0) if len(args) > 1 else DEFAULT_SEED
+    write_all(out, seed, with_romfs)
 
 if __name__ == '__main__':
     sys.exit(main())
