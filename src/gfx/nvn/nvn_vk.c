@@ -10,6 +10,8 @@
 #include "nvn_obj.h"
 #include "nvn_mtl.h"
 #include "nvn_vk.h"
+#include "nvn_vk_priv.h"
+#include "nvn_timestamp.h"
 #include "../vk/vkctx.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -19,6 +21,13 @@
 
 #define MAX_POOLS 1024
 #define MAX_INFLIGHT 64
+
+uint64_t guest_ns(void);                                 // the guest clock (hostsvc.c)
+void dm_guest_write_prepare(void *addr, size_t len);     // the host is about to write guest memory (dirty tracking)
+
+// Host actions that follow a submission's completion
+typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; } post_op;   // kind 1 event, 2 counter report
+typedef struct { uint64_t value; int n, nstg; post_op *ops; vkbuf_t *stg; } sub_rec;
 
 typedef struct {
     uint64_t base, size;               // as the game gave it
@@ -33,7 +42,11 @@ static struct {
     VkCommandBuffer cur;                                 // the submission being recorded
     struct { VkCommandBuffer cb; uint64_t value; } flight[MAX_INFLIGHT]; int nflight;
     _Atomic uint64_t submitted;                          // last timeline value handed to the queue
-} G = {.once = PTHREAD_ONCE_INIT, .pool_mu = PTHREAD_MUTEX_INITIALIZER};
+    // the submission being recorded: actions to run after it completes, and staging buffers it reads
+    post_op *ops; int nops, capops; vkbuf_t *stg; int nstg, capstg;
+    // submissions waiting for the GPU, oldest first; the completion thread and any waiter drain it
+    pthread_mutex_t q_mu; pthread_cond_t q_cv; sub_rec *q; size_t qhead, qn, qcap; pthread_t thread; int thread_up;
+} G = {.once = PTHREAD_ONCE_INIT, .pool_mu = PTHREAD_MUTEX_INITIALIZER, .q_mu = PTHREAD_MUTEX_INITIALIZER, .q_cv = PTHREAD_COND_INITIALIZER};
 
 static void gpu_init(void) {
     if (getenv("NX_NULL_GPU")) { fprintf(stderr, "[dm] [nvn] NX_NULL_GPU set: no Vulkan device is opened\n"); return; }
@@ -50,6 +63,76 @@ int nvn_gpu_ok(void) { return gpu(); }
 const char *nvn_gpu_name(void) { return gpu() ? G.c.props.deviceName : "none"; }
 unsigned nvn_gpu_pools(void) { unsigned n = 0; pthread_mutex_lock(&G.pool_mu); for (int i = 0; i < G.npool; i++) n += G.pool[i].buf != VK_NULL_HANDLE; pthread_mutex_unlock(&G.pool_mu); return n; }
 uint64_t nvn_gpu_completed(void) { uint64_t v = 0; if (gpu()) vkGetSemaphoreCounterValue(G.c.dev, G.tl, &v); return v; }
+
+vkctx_t *nvn_vk_ctx(void) { return gpu() ? &G.c : NULL; }
+VkCommandBuffer nvn_vk_cmd(void) { return G.ok ? G.cur : NULL; }
+uint64_t nvn_vk_next_fence(void) { return gpu() ? atomic_load(&G.submitted) + 1 : 0; }
+
+// ---- effects of completion
+static void post_add(post_op o) {
+    if (G.nops == G.capops) { G.capops = G.capops ? G.capops * 2 : 64; G.ops = realloc(G.ops, (size_t)G.capops * sizeof *G.ops); }
+    G.ops[G.nops++] = o;
+}
+void nvn_vk_post_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post_add((post_op){1, val, mode, v, 0, 0}); }
+void nvn_vk_post_counter(uint64_t addr, uint32_t type) { post_add((post_op){2, NULL, 0, 0, addr, type}); }
+void nvn_vk_keep(const vkbuf_t *b) {
+    if (G.nstg == G.capstg) { G.capstg = G.capstg ? G.capstg * 2 : 8; G.stg = realloc(G.stg, (size_t)G.capstg * sizeof *G.stg); }
+    G.stg[G.nstg++] = *b;
+}
+static void post_run(post_op *ops, int n) {
+    for (int i = 0; i < n; i++) {
+        post_op *o = &ops[i];
+        if (o->kind == 1) {
+            dm_guest_write_prepare((void *)o->val, 4);
+            if (o->mode == 1) __atomic_fetch_add(o->val, o->v, __ATOMIC_RELEASE); else __atomic_store_n(o->val, o->v, __ATOMIC_RELEASE);
+        } else {
+            // A counter report is {counter, timestamp}; the timestamp counts 614.4 MHz ticks of the guest clock. Timestamp types report the
+            // time in both words, other counters (not measured here yet) report 0 as their count.
+            uint64_t t = nvn_timestamp_from_ns(guest_ns()), rec[2] = {(o->type == 0 || o->type == 0x10) ? t : 0, t};
+            dm_guest_write_prepare((void *)(uintptr_t)o->addr, sizeof rec);
+            memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
+        }
+    }
+}
+// Run the records of every submission the GPU has completed, oldest first. Holding q_mu while the writes land makes a second caller wait
+// for them: whoever sees a fence complete has also seen its effects, which is the ordering NVN's events and sync objects rely on.
+static void post_drain(uint64_t completed) {
+    pthread_mutex_lock(&G.q_mu);
+    while (G.qn && G.q[G.qhead].value <= completed) {
+        sub_rec r = G.q[G.qhead]; G.qhead = (G.qhead + 1) % G.qcap; G.qn--;
+        post_run(r.ops, r.n);
+        for (int i = 0; i < r.nstg; i++) vkbuf_destroy(&G.c, &r.stg[i]);
+        free(r.ops); free(r.stg);
+    }
+    pthread_mutex_unlock(&G.q_mu);
+}
+static void *completion_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&G.q_mu);
+        while (!G.qn) pthread_cond_wait(&G.q_cv, &G.q_mu);
+        uint64_t v = G.q[G.qhead].value;
+        pthread_mutex_unlock(&G.q_mu);
+        VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &G.tl, .pValues = &v};
+        if (vkWaitSemaphores(G.c.dev, &wi, 100000000ull) == VK_SUCCESS) post_drain(v);
+    }
+    return NULL;
+}
+static void post_enqueue(uint64_t value) {      // the submission just committed: hand its actions to the completion side
+    if (!G.nops && !G.nstg) return;
+    sub_rec r = {value, G.nops, G.nstg, G.ops, G.stg};
+    G.ops = NULL; G.stg = NULL; G.nops = G.capops = G.nstg = G.capstg = 0;
+    pthread_mutex_lock(&G.q_mu);
+    if (G.qn == G.qcap) {                        // grow the ring, keeping the order
+        size_t nc = G.qcap ? G.qcap * 2 : 64; sub_rec *nq = malloc(nc * sizeof *nq);
+        for (size_t i = 0; i < G.qn; i++) nq[i] = G.q[(G.qhead + i) % G.qcap];
+        free(G.q); G.q = nq; G.qcap = nc; G.qhead = 0;
+    }
+    G.q[(G.qhead + G.qn++) % G.qcap] = r;
+    if (!G.thread_up) { G.thread_up = 1; pthread_create(&G.thread, NULL, completion_thread, NULL); pthread_detach(G.thread); }
+    pthread_cond_signal(&G.q_cv);
+    pthread_mutex_unlock(&G.q_mu);
+}
 
 // ---- memory pools
 static void pool_import(gpool_t *p) {
@@ -114,6 +197,14 @@ static gpool_t *pool_find(uint64_t addr, uint64_t len) {
     }
     return NULL;
 }
+int nvn_vk_pool_buffer(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
+    pthread_mutex_lock(&G.pool_mu);
+    gpool_t *p = pool_find(addr, len);
+    int ok = p && p->buf;
+    if (ok) { *buf = p->buf; *off = addr - p->abase; }
+    pthread_mutex_unlock(&G.pool_mu);
+    return ok;
+}
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     pthread_mutex_lock(&G.pool_mu);
     gpool_t *p = pool_find(addr, len);
@@ -139,7 +230,12 @@ void mtl_sub_begin(void) {
     if (!G.cur) fprintf(stderr, "[dm] [RED] [nvn] could not start a command buffer\n");
 }
 uint64_t mtl_sub_commit(void) {
-    if (!gpu()) { static _Atomic uint64_t n; return atomic_fetch_add(&n, 1) + 1; }
+    if (!gpu()) {          // the null GPU completes the moment it is committed
+        static _Atomic uint64_t n;
+        post_run(G.ops, G.nops); for (int i = 0; i < G.nstg; i++) vkbuf_destroy(&G.c, &G.stg[i]);
+        G.nops = G.nstg = 0;
+        return atomic_fetch_add(&n, 1) + 1;
+    }
     uint64_t value = atomic_load(&G.submitted) + 1;
     VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = G.cur};
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = G.tl, .value = value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
@@ -150,19 +246,28 @@ uint64_t mtl_sub_commit(void) {
     if (G.cur) { if (G.nflight < MAX_INFLIGHT) { G.flight[G.nflight].cb = G.cur; G.flight[G.nflight++].value = value; } else { vkQueueWaitIdle(G.c.queue); vkFreeCommandBuffers(G.c.dev, G.c.pool, 1, &G.cur); } }
     G.cur = NULL;
     atomic_store(&G.submitted, value);
+    post_enqueue(value);
     return value;
 }
 uint64_t mtl_last_fence(void) { return gpu() ? atomic_load(&G.submitted) : 0; }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     if (!gpu() || !fence) return 1;
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &G.tl, .pValues = &fence};
-    return vkWaitSemaphores(G.c.dev, &wi, timeout_ns) == VK_SUCCESS;
+    if (vkWaitSemaphores(G.c.dev, &wi, timeout_ns) != VK_SUCCESS) return 0;
+    post_drain(fence);                                    // the effects of everything up to the fence land before this returns
+    return 1;
 }
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, timeout_ns); }
 void mtl_finish(void) { if (gpu()) mtl_wait(atomic_load(&G.submitted), UINT64_MAX); }
 void mtl_drain(void) { mtl_finish(); }
 
 // ---- operations inside the submission being recorded
+void nvn_vk_barrier_all(VkCommandBuffer cb) {
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+}
 static void barrier_transfer(VkCommandBuffer cb) {        // later copies and fills may depend on this one
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
@@ -190,3 +295,6 @@ void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
     vkCmdFillBuffer(G.cur, db, off, n & ~3ull, value);     // Vulkan fills whole words; a tail of 1-3 bytes would need a read-modify-write
     barrier_transfer(G.cur);
 }
+
+void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { nvn_vk_post_event(val, mode, v); }
+void mtl_sub_counter(uint64_t addr, uint32_t type) { nvn_vk_post_counter(addr, type); }

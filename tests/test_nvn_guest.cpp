@@ -5,6 +5,7 @@ extern "C" {
 #include "../src/host/module.h"
 #include "../src/host/hle_stub.h"
 #include "../src/host/kernel.h"
+#include "../src/gfx/nvn/nvn_vk.h"
 void hle_collect_sections(void);
 }
 #include <elf.h>
@@ -54,8 +55,17 @@ int main(int argc, char **argv) {
     EXPECT(6, 1); EXPECT(7, 1); EXPECT(8, 1);
     EXPECT(9, 1); EXPECT(10, 1); EXPECT(11, 1); EXPECT(12, 1);
     EXPECT(13, 1); EXPECT(14, 1); EXPECT(15, 1); EXPECT(16, 1);
-    EXPECT(17, 1); EXPECT(18, 1); EXPECT(19, 0x5555);
+    EXPECT(17, 1); EXPECT(18, 1);
+    EXPECT(19, 1); EXPECT(20, 1); EXPECT(21, 1); EXPECT(22, 1); EXPECT(23, 1);
+    EXPECT(24, 42);                                            // the event: written 7, then 35 added
+    EXPECT(25, 1); EXPECT(26, 1); EXPECT(27, 1); EXPECT(28, 1); EXPECT(29, 1); EXPECT(30, 1);
+    EXPECT(31, 0x5555);
     CHECK(hle_unimplemented_calls == 0);
+    printf("replayed on %s: END %llu, COPY_B2B %llu, CLEAR_BUF %llu, UPDATE_UB %llu, SIGNAL_EVENT %llu, REPORT_COUNTER %llu, FENCE_SYNC %llu, BARRIER %llu\n", nvn_gpu_name(),
+           (unsigned long long)nvn_replay_ops_named("OP_END"), (unsigned long long)nvn_replay_ops_named("OP_COPY_B2B"), (unsigned long long)nvn_replay_ops_named("OP_CLEAR_BUF"),
+           (unsigned long long)nvn_replay_ops_named("OP_UPDATE_UB"), (unsigned long long)nvn_replay_ops_named("OP_SIGNAL_EVENT"), (unsigned long long)nvn_replay_ops_named("OP_REPORT_COUNTER"),
+           (unsigned long long)nvn_replay_ops_named("OP_FENCE_SYNC"), (unsigned long long)nvn_replay_ops_named("OP_BARRIER"));
+    CHECK(nvn_replay_ops_named("OP_COPY_B2B") >= 3 && nvn_replay_ops_named("OP_CLEAR_BUF") >= 1 && nvn_replay_ops_named("OP_UPDATE_UB") >= 1 && nvn_replay_ops_named("OP_SIGNAL_EVENT") >= 2);
     puts(g_fail ? "FAIL" : "PASS");
     return g_fail;
 }

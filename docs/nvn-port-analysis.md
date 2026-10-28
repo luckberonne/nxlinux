@@ -75,3 +75,18 @@ statistics and the command replay (`mtl_exec`) until those are written. Set `NX_
 - Tests: `test_nvn_vk_pool` (pools, lookups, copies between pools, fill -> copy -> copy, fences, 200 submissions, pool removal and re-add) and
   `test_nvn_guest` (the guest program of the previous section, now on the GPU).
 Not yet: events and counters written after completion (`mtl_sub_event`, `mtl_sub_counter`), pools larger than `maxBufferSize`, virtual pools.
+
+## Command replay, first part (src/gfx/nvn/nvn_replay.c)
+`mtl_exec` walks the record lists the way nxnative's does (END, JUMP, CALL with return) and executes, on the Vulkan backend:
+`OP_COPY_B2B`, `OP_CLEAR_BUF`, `OP_UPDATE_UB` (inline data: `vkCmdUpdateBuffer` when it fits, otherwise a staging buffer kept until the
+submission completes), `OP_BARRIER` (a full memory barrier covers every combination of the game's bits), `OP_SIGNAL_EVENT`,
+`OP_REPORT_COUNTER` and `OP_FENCE_SYNC`. Everything that draws is accepted and announced once (`replay: OP_X is recorded but not executed yet`).
+- **Effects of completion** (event writes and adds, counter reports) are queued with the submission and performed after the GPU has completed
+  it, in submission order, by a completion thread. A waiter on a fence drains the queue up to that fence before it returns, so whoever sees a
+  fence complete has also seen its effects: events never lag behind their sync objects. A counter report is `{counter, timestamp}`, the
+  timestamp in 614.4 MHz ticks of the guest clock (`nvn_timestamp.h`).
+- **Checked** by `test_nvn_guest` (a guest records a fill, a copy, a barrier, a copy of that copy, an inline uniform update whose source it
+  then overwrites, a timestamp report, two event signals and a fence; the memory is verified after the fence, and the event reads 42: written
+  7, then 35 added). A control run with `NX_NULL_GPU=1` fails exactly the data checks, so the test does discriminate. `test_nvn_vk_pool` covers
+  the order of effects over many submissions and hand-built lists (CALL, JUMP, the staging path with an odd size and offset).
+Not yet: the samples-passed counter (needs occlusion queries), conditional rendering, and every op that draws.

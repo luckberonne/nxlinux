@@ -100,7 +100,7 @@ add_custom_target(game_profile DEPENDS ${NX_GEN_DIR}/game_profile.h)
 add_custom_command(OUTPUT ${NX_GEN_DIR}/nvn_names.c
     COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/gen_nvn_names.py ${CMAKE_SOURCE_DIR}/src/gfx/nvn/names.txt ${NX_GEN_DIR}/nvn_names.c
     DEPENDS tools/gen_nvn_names.py src/gfx/nvn/names.txt)
-add_library(nxnvn STATIC src/gfx/nvn/hle_nvn.c src/gfx/nvn/nvn_dirty.c src/gfx/nvn/nvn_capture.c src/gfx/nvn/nvn_tex.c src/gfx/nvn/nvn_null.c src/gfx/nvn/nvn_vk.c
+add_library(nxnvn STATIC src/gfx/nvn/hle_nvn.c src/gfx/nvn/nvn_dirty.c src/gfx/nvn/nvn_capture.c src/gfx/nvn/nvn_tex.c src/gfx/nvn/nvn_null.c src/gfx/nvn/nvn_vk.c src/gfx/nvn/nvn_replay.c
     src/gfx/tex/nvn_deswizzle.c src/host/sha256.c src/host/faults.c src/host/hostsvc.c ${NX_GEN_DIR}/nvn_names.c)
 target_link_libraries(nxnvn PUBLIC nxhost nxvk m)
 target_include_directories(nxnvn PUBLIC ${NX_GEN_DIR} src/host src/gfx/nvn src/gfx/nvn/include src/gfx third_party/vulkan-headers/include)

@@ -7,7 +7,7 @@ typedef unsigned long u64;
 extern void *nvnBootstrapLoader(const char *name);       // imported: the host takes it over
 #define FN(name) NVNT_##name name = (NVNT_##name)nvnBootstrapLoader(#name)
 
-u64 g_res[48];
+u64 g_res[64];
 static NVNdevice g_dev __attribute__((aligned(64)));
 static NVNdeviceBuilder g_dev_b __attribute__((aligned(64)));
 static NVNmemoryPool g_pool __attribute__((aligned(64)));
@@ -17,7 +17,9 @@ static NVNqueueBuilder g_queue_b __attribute__((aligned(64)));
 static NVNcommandBuffer g_cb __attribute__((aligned(64)));
 static NVNbuffer g_src __attribute__((aligned(64))), g_dst __attribute__((aligned(64)));
 static NVNbufferBuilder g_buf_b __attribute__((aligned(64)));
-static NVNsync g_sync __attribute__((aligned(64)));
+static NVNsync g_sync __attribute__((aligned(64))), g_sync2 __attribute__((aligned(64)));
+static NVNevent g_event __attribute__((aligned(64)));
+static NVNeventBuilder g_event_b __attribute__((aligned(64)));
 static char g_poolmem[0x100000] __attribute__((aligned(0x10000)));    // the game's own memory, aligned to the pool page size: GPU address == CPU address
 static char g_queuemem[0x80000] __attribute__((aligned(0x1000)));
 static char g_ctl[0x1000] __attribute__((aligned(16)));
@@ -35,6 +37,9 @@ void guest_main(u64 arg) {
     FN(nvnCommandBufferEndRecording); FN(nvnCommandBufferSetViewport); FN(nvnCommandBufferSetScissor); FN(nvnCommandBufferCopyBufferToBuffer);
     FN(nvnCommandBufferGetCommandMemoryUsed); FN(nvnCommandBufferFinalize);
     FN(nvnSyncInitialize); FN(nvnSyncWait); FN(nvnSyncFinalize);
+    FN(nvnCommandBufferClearBuffer); FN(nvnCommandBufferUpdateUniformBuffer); FN(nvnCommandBufferReportCounter); FN(nvnCommandBufferSignalEvent);
+    FN(nvnCommandBufferFenceSync); FN(nvnCommandBufferBarrier); FN(nvnCommandBufferCallCommands);
+    FN(nvnEventBuilderSetDefaults); FN(nvnEventBuilderSetStorage); FN(nvnEventInitialize); FN(nvnEventGetValue); FN(nvnEventFinalize);
     g_res[n++] = nvnBootstrapLoader != 0 && nvnDeviceInitialize != 0 && nvnSyncWait != 0;                 // 0: the loader answered with callable addresses
 
     // ---- device
@@ -96,9 +101,51 @@ void guest_main(u64 arg) {
     g_res[n++] = w == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED || w == NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED;   // 18
     nvnQueueFinish(&g_queue);
 
+    // ---- recorded commands that have an effect: they run on the GPU in order, and what they write is visible once the fence is
+    volatile unsigned *src = (volatile unsigned *)(g_poolmem + 0x20000), *dst = (volatile unsigned *)(g_poolmem + 0x30000);
+    for (int i = 0; i < 0x4000 / 4; i++) { src[i] = 0xC0DE0000u + (unsigned)i; dst[i] = 0; }
+    u64 evaddr = 0x60000, rep_addr = 0x61000;
+    nvnEventBuilderSetDefaults(&g_event_b);
+    nvnEventBuilderSetStorage(&g_event_b, &g_pool, evaddr);
+    g_res[n++] = nvnEventInitialize(&g_event, &g_event_b) & 0xFF;                                         // 19
+    g_res[n++] = nvnEventGetValue(&g_event) == 0;                                                         // 20
+    volatile unsigned *cnt = (volatile unsigned *)(g_poolmem + rep_addr);
+    cnt[0] = cnt[1] = cnt[2] = cnt[3] = 0xFFFFFFFFu;
+    static unsigned ub[16];
+    for (int i = 0; i < 16; i++) ub[i] = 0x7000u + (unsigned)i;
+    NVNbufferAddress a_src = nvnBufferGetAddress(&g_src), a_dst = nvnBufferGetAddress(&g_dst);
+    nvnCommandBufferBeginRecording(&g_cb);
+    nvnCommandBufferClearBuffer(&g_cb, a_dst + 0x100, 0x100, 0xAAAAAAAAu);                                // a fill
+    nvnCommandBufferCopyBufferToBuffer(&g_cb, a_src, a_dst + 0x400, 0x200, 0);                            // a copy into the middle
+    nvnCommandBufferBarrier(&g_cb, NVN_BARRIER_ORDER_PRIMITIVES_BIT);
+    nvnCommandBufferCopyBufferToBuffer(&g_cb, a_dst + 0x400, a_dst + 0x1000, 0x200, 0);                   // ... and the copy of that copy: needs the order
+    nvnCommandBufferUpdateUniformBuffer(&g_cb, a_dst, 0x4000, 0x2000, sizeof ub, ub);                     // 64 bytes of inline data
+    for (int i = 0; i < 16; i++) ub[i] = 0;                                                               // the record keeps its own copy of the data
+    nvnCommandBufferReportCounter(&g_cb, NVN_COUNTER_TYPE_TIMESTAMP, (NVNbufferAddress)(g_poolmem + rep_addr));
+    nvnCommandBufferSignalEvent(&g_cb, &g_event, NVN_EVENT_SIGNAL_MODE_WRITE, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 7);
+    nvnCommandBufferSignalEvent(&g_cb, &g_event, NVN_EVENT_SIGNAL_MODE_ADD, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 35);
+    nvnCommandBufferFenceSync(&g_cb, &g_sync2, NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
+    NVNcommandHandle h2 = nvnCommandBufferEndRecording(&g_cb);
+    g_res[n++] = nvnSyncInitialize(&g_sync2, &g_dev) & 0xFF;                                              // 21
+    g_res[n++] = nvnEventGetValue(&g_event) == 0;                                                         // 22: nothing written before the GPU gets there
+    nvnQueueSubmitCommands(&g_queue, 1, &h2);
+    nvnQueueFlush(&g_queue);
+    int w2 = nvnSyncWait(&g_sync2, 5000000000ull);
+    g_res[n++] = w2 == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED || w2 == NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED;   // 23: the fence recorded in the list
+    g_res[n++] = nvnEventGetValue(&g_event);                                                              // 24: write 7, then add 35 = 42, visible after the fence
+    int fill_ok = 1, copy_ok = 1, chain_ok = 1, ub_ok = 1, edge_ok = 1;
+    for (int i = 0; i < 0x100 / 4; i++) fill_ok &= dst[0x100 / 4 + i] == 0xAAAAAAAAu;
+    for (int i = 0; i < 0x200 / 4; i++) copy_ok &= dst[0x400 / 4 + i] == 0xC0DE0000u + (unsigned)i;
+    for (int i = 0; i < 0x200 / 4; i++) chain_ok &= dst[0x1000 / 4 + i] == 0xC0DE0000u + (unsigned)i;
+    for (int i = 0; i < 16; i++) ub_ok &= dst[0x2000 / 4 + i] == 0x7000u + (unsigned)i;
+    edge_ok = dst[0xFC / 4] == 0 && dst[0x200 / 4] == 0 && dst[0x3FC / 4] == 0 && dst[0x600 / 4] == 0;     // neighbours untouched
+    g_res[n++] = fill_ok; g_res[n++] = copy_ok; g_res[n++] = chain_ok; g_res[n++] = ub_ok; g_res[n++] = edge_ok;   // 25-29
+    g_res[n++] = cnt[2] != 0xFFFFFFFFu || cnt[3] != 0xFFFFFFFFu;                                          // 30: the timestamp report landed
+    nvnQueueFinish(&g_queue);
+
     // ---- teardown in reverse
-    nvnSyncFinalize(&g_sync); nvnCommandBufferFinalize(&g_cb); nvnQueueFinalize(&g_queue);
+    nvnEventFinalize(&g_event); nvnSyncFinalize(&g_sync2); nvnSyncFinalize(&g_sync); nvnCommandBufferFinalize(&g_cb); nvnQueueFinalize(&g_queue);
     nvnBufferFinalize(&g_dst); nvnBufferFinalize(&g_src); nvnMemoryPoolFinalize(&g_pool); nvnDeviceFinalize(&g_dev);
-    g_res[n++] = 0x5555;                                                                                  // 19: reached the end
+    g_res[n++] = 0x5555;                                                                                  // 31: reached the end
     exit_thread();
 }

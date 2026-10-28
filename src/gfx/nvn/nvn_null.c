@@ -36,8 +36,6 @@ void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { if (lib_ns) *lib_ns = 0
 void mtl_create_stats(uint64_t *lib, uint64_t *pso) { if (lib) *lib = 0; if (pso) *pso = 0; }
 uint64_t mtl_drawable_ns_take(void) { return 0; }
 uint64_t mtl_ds_omit(void) { return 0; }
-void mtl_exec(const uint8_t *handle) { (void)handle; }
-void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 double mtl_gpu_ms(uint64_t f) { (void)f; return 0.0; }
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { if (t0) *t0 = 0; if (t1) *t1 = 0; return 0; }
 void mtl_hybrid_stats(uint64_t *draws, uint64_t *made, uint64_t *none) { if (draws) *draws = 0; if (made) *made = 0; if (none) *none = 0; }
@@ -61,7 +59,6 @@ void mtl_set_origin_lower_left(int on) { (void)on; }
 void mtl_set_queue_origin_lower_left(int on) { (void)on; }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 void mtl_stats(uint64_t *passes, uint64_t *draws) { if (passes) *passes = 0; if (draws) *draws = 0; }
-void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
 void mtl_tex_init(const tex_t *t) { (void)t; }
 void mtl_tex_release(tex_t *t) { (void)t; }

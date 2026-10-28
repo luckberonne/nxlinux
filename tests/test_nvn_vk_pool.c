@@ -63,6 +63,58 @@ int main(void) {
     CHECK(last == f3 + 200 && mtl_wait(last, 5000000000ull));
     mtl_drain();
 
+    // Effects of completion: events and counter reports are written after the GPU gets there, in submission order, and are visible
+    // once the fence they belong to is waited on
+    volatile uint32_t *ev = (volatile uint32_t *)(c + 0x20000);
+    *ev = 0;
+    mtl_sub_begin(); mtl_sub_event(ev, 0, 5);  uint64_t e1 = mtl_sub_commit();      // write 5
+    mtl_sub_begin(); mtl_sub_event(ev, 1, 10); uint64_t e2 = mtl_sub_commit();      // add 10
+    mtl_sub_begin(); mtl_sub_event(ev, 1, 100); mtl_sub_event(ev, 0, 1); mtl_sub_event(ev, 1, 2); uint64_t e3 = mtl_sub_commit();   // add 100, write 1, add 2, in this order
+    CHECK(e1 < e2 && e2 < e3);
+    CHECK(mtl_wait(e1, 5000000000ull) && *ev >= 5);                                  // the first has landed (later ones may be on their way)
+    CHECK(mtl_wait(e3, 5000000000ull) && *ev == 3);                                  // 5, +10, +100, =1, +2: the order held
+    for (int i = 0; i < 100; i++) { mtl_sub_begin(); mtl_sub_event(ev, 1, 1); last = mtl_sub_commit(); }
+    CHECK(mtl_wait(last, 5000000000ull) && *ev == 103);                             // none lost, none twice
+
+    volatile uint64_t *rep = (volatile uint64_t *)(c + 0x21000);
+    rep[0] = rep[1] = rep[2] = rep[3] = 0;
+    mtl_sub_begin(); mtl_sub_counter((uint64_t)(uintptr_t)rep, 0); uint64_t r1 = mtl_sub_commit();          // timestamp
+    CHECK(mtl_wait(r1, 5000000000ull));
+    uint64_t t1 = rep[1];
+    CHECK(t1 != 0 && rep[0] == t1);                                                  // a timestamp report carries the time in both words
+    mtl_sub_begin(); mtl_sub_counter((uint64_t)(uintptr_t)(rep + 2), 0); uint64_t r2 = mtl_sub_commit();
+    CHECK(mtl_wait(r2, 5000000000ull) && rep[3] >= t1);                              // time does not go back
+
+    // Command lists built by hand: UPDATE_UB with a size and an offset that rule out vkCmdUpdateBuffer (staging path), CALL into a sub-list that
+    // returns, JUMP to a list that ends the walk. A record is {op, size} + payload, size in 8-byte steps (nvn_obj.h).
+    {
+        uint8_t *L1 = (uint8_t *)guest_alloc(0x1000, 16), *L2 = (uint8_t *)guest_alloc(0x1000, 16), *L3 = (uint8_t *)guest_alloc(0x1000, 16);
+        uint8_t data[101]; for (int i = 0; i < 101; i++) data[i] = (uint8_t)(0x40 + i);
+        uint8_t *w = L2;                                                         // sub-list: copy 0x100 bytes of a to b+0x7000, then end
+        { op_hdr h = {OP_COPY_B2B, 8 + 24}; uint64_t pl[3] = {(uint64_t)a + 0x100, (uint64_t)b + 0x7000, 0x100}; memcpy(w, &h, 8); memcpy(w + 8, pl, 24); w += h.size; }
+        { op_hdr h = {OP_END, 8}; memcpy(w, &h, 8); }
+        w = L3;                                                                  // reached by JUMP: fill 0x40 bytes of c, then end
+        { op_hdr h = {OP_CLEAR_BUF, 8 + sizeof(p_clear_buf)}; p_clear_buf cb = {(uint64_t)c + 0x9000, 0x40, 0x11223344u, 0}; memcpy(w, &h, 8); memcpy(w + 8, &cb, sizeof cb); w += h.size; }
+        { op_hdr h = {OP_END, 8}; memcpy(w, &h, 8); }
+        w = L1;
+        { op_hdr h = {OP_UPDATE_UB, 8 + 16 + 104}; uint64_t pl[2] = {(uint64_t)b + 0x5003, 101}; memcpy(w, &h, 8); memcpy(w + 8, pl, 16); memcpy(w + 24, data, 101); w += h.size; }
+        { op_hdr h = {OP_CALL, 16}; uint64_t t = (uint64_t)(uintptr_t)L2; memcpy(w, &h, 8); memcpy(w + 8, &t, 8); w += h.size; }
+        { op_hdr h = {OP_BARRIER, 16}; uint32_t bits = 1; memcpy(w, &h, 8); memcpy(w + 8, &bits, 4); w += h.size; }
+        { op_hdr h = {OP_VIEWPORTS, 8 + sizeof(p_viewports)}; p_viewports v = {0}; memcpy(w, &h, 8); memcpy(w + 8, &v, sizeof v); w += h.size; }   // not executed yet: skipped, not fatal
+        { op_hdr h = {OP_JUMP, 16}; uint64_t t = (uint64_t)(uintptr_t)L3; memcpy(w, &h, 8); memcpy(w + 8, &t, 8); }
+        memset(b + 0x5000, 0, 0x200); memset(b + 0x7000, 0, 0x100); memset(c + 0x9000, 0, 0x40);
+        mtl_sub_begin(); mtl_exec(L1); uint64_t lf = mtl_sub_commit();
+        CHECK(mtl_wait(lf, 5000000000ull));
+        int u_ok = 1; for (int i = 0; i < 101; i++) if (b[0x5003 + i] != data[i]) u_ok = 0;
+        CHECK(u_ok && b[0x5002] == 0 && b[0x5003 + 101] == 0);                   // 101 bytes at an odd offset, neighbours untouched
+        int c_ok = 1; for (int i = 0; i < 0x100 / 4; i++) if (((uint32_t *)(b + 0x7000))[i] != 0xA0000000u + 0x40 + (uint32_t)i) c_ok = 0;
+        CHECK(c_ok);                                                              // the CALLed sub-list ran and returned
+        int f_ok = 1; for (int i = 0; i < 0x40 / 4; i++) if (((uint32_t *)(c + 0x9000))[i] != 0x11223344u) f_ok = 0;
+        CHECK(f_ok && ((uint32_t *)(c + 0x9000))[0x40 / 4] == 0);               // the JUMPed list ran
+        printf("hand-built lists (UPDATE_UB staging, CALL, JUMP): %s\n", u_ok && c_ok && f_ok ? "ok" : "MISMATCH");
+    }
+    mtl_drain();
+
     // A pool removed, and added again over the same memory
     mtl_pool_del(c);
     CHECK(!mtl_addr((uint64_t)c, 4, &buf, &off) && nvn_gpu_pools() == 2);
