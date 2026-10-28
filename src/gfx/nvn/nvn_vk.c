@@ -1,0 +1,192 @@
+// Memory pools, submissions and fences on Vulkan.
+//
+// A memory pool is guest memory (GPU address == CPU address). It is imported as Vulkan memory with VK_EXT_external_memory_host, so the CPU
+// and the GPU see the same bytes with no copy, and bound to one buffer that covers the pool. An NVN buffer address then resolves to
+// (pool buffer, offset) by an interval lookup, as the Metal layer does with its zero-copy MTLBuffers.
+//
+// A submission is one primary command buffer, recorded between mtl_sub_begin and mtl_sub_commit and submitted with a timeline semaphore
+// signal. The fence value of a submission is the timeline value it signals: it completes when the GPU has actually reached it, and every
+// visible effect of "GPU completion" waits for that, as nxnative's ordering convention requires.
+#include "nvn_obj.h"
+#include "nvn_mtl.h"
+#include "nvn_vk.h"
+#include "../vk/vkctx.h"
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_POOLS 1024
+#define MAX_INFLIGHT 64
+
+typedef struct {
+    uint64_t base, size;               // as the game gave it
+    uint64_t abase, asize;             // widened to the import alignment: what Vulkan sees
+    VkBuffer buf; VkDeviceMemory mem; VkDeviceAddress gpu;
+} gpool_t;
+
+static struct {
+    pthread_once_t once; vkctx_t c; int ok;
+    VkSemaphore tl;
+    pthread_mutex_t pool_mu; gpool_t pool[MAX_POOLS]; int npool;
+    VkCommandBuffer cur;                                 // the submission being recorded
+    struct { VkCommandBuffer cb; uint64_t value; } flight[MAX_INFLIGHT]; int nflight;
+    _Atomic uint64_t submitted;                          // last timeline value handed to the queue
+} G = {.once = PTHREAD_ONCE_INIT, .pool_mu = PTHREAD_MUTEX_INITIALIZER};
+
+static void gpu_init(void) {
+    if (getenv("NX_NULL_GPU")) { fprintf(stderr, "[dm] [nvn] NX_NULL_GPU set: no Vulkan device is opened\n"); return; }
+    if (vkctx_create(&G.c)) { fprintf(stderr, "[dm] [RED] [nvn] no usable Vulkan device: running on the null GPU\n"); return; }
+    if (!G.c.has_ext_mem_host) { fprintf(stderr, "[dm] [RED] [nvn] %s lacks VK_EXT_external_memory_host: running on the null GPU\n", G.c.props.deviceName); return; }
+    VkSemaphoreTypeCreateInfo ti = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, NULL, VK_SEMAPHORE_TYPE_TIMELINE, 0};
+    VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti};
+    if (vkCreateSemaphore(G.c.dev, &si, NULL, &G.tl)) { fprintf(stderr, "[dm] [RED] [nvn] timeline semaphore creation failed\n"); return; }
+    G.ok = 1;
+    fprintf(stderr, "[dm] [nvn] Vulkan backend on %s%s\n", G.c.props.deviceName, G.c.validation ? " (validation layers on)" : "");
+}
+static inline int gpu(void) { pthread_once(&G.once, gpu_init); return G.ok; }
+int nvn_gpu_ok(void) { return gpu(); }
+const char *nvn_gpu_name(void) { return gpu() ? G.c.props.deviceName : "none"; }
+unsigned nvn_gpu_pools(void) { unsigned n = 0; pthread_mutex_lock(&G.pool_mu); for (int i = 0; i < G.npool; i++) n += G.pool[i].buf != VK_NULL_HANDLE; pthread_mutex_unlock(&G.pool_mu); return n; }
+uint64_t nvn_gpu_completed(void) { uint64_t v = 0; if (gpu()) vkGetSemaphoreCounterValue(G.c.dev, G.tl, &v); return v; }
+
+// ---- memory pools
+static void pool_import(gpool_t *p) {
+    uint64_t al = G.c.host_import_align ? G.c.host_import_align : 4096;
+    p->abase = p->base & ~(al - 1); p->asize = ((p->base + p->size + al - 1) & ~(al - 1)) - p->abase;
+    void *host = (void *)(uintptr_t)p->abase;
+    VkMemoryHostPointerPropertiesEXT hp = {VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    VkResult r = G.c.GetMemoryHostPointerProperties(G.c.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &hp);
+    if (r) { fprintf(stderr, "[dm] [RED] [nvn] pool %#llx+%#llx: the host pointer cannot be imported (%d)\n", (unsigned long long)p->base, (unsigned long long)p->size, (int)r); return; }
+    VkExternalMemoryBufferCreateInfo ebi = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ebi, .size = p->asize, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+    if (vkCreateBuffer(G.c.dev, &bi, NULL, &p->buf)) { fprintf(stderr, "[dm] [RED] [nvn] pool buffer of %#llx bytes could not be created\n", (unsigned long long)p->asize); p->buf = VK_NULL_HANDLE; return; }
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(G.c.dev, p->buf, &mr);
+    uint32_t mt = vkctx_memtype(&G.c, mr.memoryTypeBits & hp.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkImportMemoryHostPointerInfoEXT imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, &fi, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host};
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, p->asize, mt};
+    if (mt == UINT32_MAX || vkAllocateMemory(G.c.dev, &ai, NULL, &p->mem) || vkBindBufferMemory(G.c.dev, p->buf, p->mem, 0)) {
+        fprintf(stderr, "[dm] [RED] [nvn] pool %#llx+%#llx: importing the memory failed\n", (unsigned long long)p->base, (unsigned long long)p->size);
+        vkDestroyBuffer(G.c.dev, p->buf, NULL); p->buf = VK_NULL_HANDLE; p->mem = VK_NULL_HANDLE; return;
+    }
+    VkBufferDeviceAddressInfo di = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = p->buf};
+    p->gpu = vkGetBufferDeviceAddress(G.c.dev, &di);
+}
+static void pool_release(gpool_t *p) {
+    if (!p->buf) return;
+    vkDeviceWaitIdle(G.c.dev);                            // the GPU may still read it: the guest is about to reuse or free this memory
+    vkDestroyBuffer(G.c.dev, p->buf, NULL); vkFreeMemory(G.c.dev, p->mem, NULL);
+    p->buf = VK_NULL_HANDLE; p->mem = VK_NULL_HANDLE;
+}
+
+void mtl_pool_add(const void *mem, uint64_t size) {
+    int on = gpu();
+    pthread_mutex_lock(&G.pool_mu);
+    int i = 0;
+    for (; i < G.npool; i++) if (G.pool[i].base == (uint64_t)(uintptr_t)mem) break;
+    if (i == G.npool && G.npool == MAX_POOLS) { pthread_mutex_unlock(&G.pool_mu); fprintf(stderr, "[dm] [RED] [nvn] pool table full\n"); return; }
+    if (i < G.npool && on) pool_release(&G.pool[i]);      // the same base again: a pool re-created over its memory
+    gpool_t *p = &G.pool[i];
+    memset(p, 0, sizeof *p); p->base = (uint64_t)(uintptr_t)mem; p->size = size;
+    if (i == G.npool) G.npool++;
+    if (on) pool_import(p);
+    pthread_mutex_unlock(&G.pool_mu);
+}
+void mtl_pool_del(const void *mem) {
+    int on = gpu();
+    pthread_mutex_lock(&G.pool_mu);
+    for (int i = 0; i < G.npool; i++)
+        if (G.pool[i].base == (uint64_t)(uintptr_t)mem) { if (on) pool_release(&G.pool[i]); G.pool[i] = G.pool[--G.npool]; break; }
+    pthread_mutex_unlock(&G.pool_mu);
+}
+void mtl_alias_drop_pool(const void *pool) { (void)pool; }
+
+// The pool that holds [addr, addr+len): caller holds pool_mu. The returned pointer is valid until the table changes.
+static gpool_t *pool_find(uint64_t addr, uint64_t len) {
+    for (int i = 0; i < G.npool; i++) {
+        gpool_t *p = &G.pool[i];
+        if (addr >= p->base && len <= p->size && addr - p->base <= p->size - len) return p;
+    }
+    return NULL;
+}
+int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+    pthread_mutex_lock(&G.pool_mu);
+    gpool_t *p = pool_find(addr, len);
+    if (p) { if (buf) *buf = (void *)(uintptr_t)p->buf; if (off) *off = addr - p->abase; }
+    pthread_mutex_unlock(&G.pool_mu);
+    return p != NULL;
+}
+
+// ---- submissions
+static void reap(void) {                                  // return command buffers the GPU has finished with
+    uint64_t done = nvn_gpu_completed();
+    int k = 0;
+    for (int i = 0; i < G.nflight; i++) {
+        if (G.flight[i].value <= done) vkFreeCommandBuffers(G.c.dev, G.c.pool, 1, &G.flight[i].cb);
+        else G.flight[k++] = G.flight[i];
+    }
+    G.nflight = k;
+}
+void mtl_sub_begin(void) {
+    if (!gpu()) return;
+    reap();
+    G.cur = vkctx_begin(&G.c);
+    if (!G.cur) fprintf(stderr, "[dm] [RED] [nvn] could not start a command buffer\n");
+}
+uint64_t mtl_sub_commit(void) {
+    if (!gpu()) { static _Atomic uint64_t n; return atomic_fetch_add(&n, 1) + 1; }
+    uint64_t value = atomic_load(&G.submitted) + 1;
+    VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = G.cur};
+    VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = G.tl, .value = value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = G.cur ? 1 : 0, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    if (G.cur) vkEndCommandBuffer(G.cur);
+    VkResult r = vkQueueSubmit2(G.c.queue, 1, &si, VK_NULL_HANDLE);
+    if (r) fprintf(stderr, "[dm] [RED] [nvn] vkQueueSubmit2 failed (%d)\n", (int)r);
+    if (G.cur) { if (G.nflight < MAX_INFLIGHT) { G.flight[G.nflight].cb = G.cur; G.flight[G.nflight++].value = value; } else { vkQueueWaitIdle(G.c.queue); vkFreeCommandBuffers(G.c.dev, G.c.pool, 1, &G.cur); } }
+    G.cur = NULL;
+    atomic_store(&G.submitted, value);
+    return value;
+}
+uint64_t mtl_last_fence(void) { return gpu() ? atomic_load(&G.submitted) : 0; }
+int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
+    if (!gpu() || !fence) return 1;
+    VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &G.tl, .pValues = &fence};
+    return vkWaitSemaphores(G.c.dev, &wi, timeout_ns) == VK_SUCCESS;
+}
+int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, timeout_ns); }
+void mtl_finish(void) { if (gpu()) mtl_wait(atomic_load(&G.submitted), UINT64_MAX); }
+void mtl_drain(void) { mtl_finish(); }
+
+// ---- operations inside the submission being recorded
+static void barrier_transfer(VkCommandBuffer cb) {        // later copies and fills may depend on this one
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+}
+void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
+    if (!G.ok || !G.cur || !n) return;
+    pthread_mutex_lock(&G.pool_mu);
+    gpool_t *a = pool_find(src, n), *b = pool_find(dst, n);
+    VkBuffer sb = a ? a->buf : VK_NULL_HANDLE, db = b ? b->buf : VK_NULL_HANDLE;
+    VkBufferCopy rg = {a ? src - a->abase : 0, b ? dst - b->abase : 0, n};
+    pthread_mutex_unlock(&G.pool_mu);
+    if (!sb || !db) { fprintf(stderr, "[dm] [RED] [nvn] buffer copy %#llx -> %#llx (%#llx bytes): an address is outside the memory pools\n", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n); return; }
+    vkCmdCopyBuffer(G.cur, sb, db, 1, &rg);
+    barrier_transfer(G.cur);
+}
+void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
+    if (!G.ok || !G.cur || !n) return;
+    pthread_mutex_lock(&G.pool_mu);
+    gpool_t *b = pool_find(dst, n);
+    VkBuffer db = b ? b->buf : VK_NULL_HANDLE; uint64_t off = b ? dst - b->abase : 0;
+    pthread_mutex_unlock(&G.pool_mu);
+    if (!db || (off & 3)) { fprintf(stderr, "[dm] [RED] [nvn] buffer fill %#llx (%#llx bytes) is outside the memory pools or unaligned\n", (unsigned long long)dst, (unsigned long long)n); return; }
+    vkCmdFillBuffer(G.cur, db, off, n & ~3ull, value);     // Vulkan fills whole words; a tail of 1-3 bytes would need a read-modify-write
+    barrier_transfer(G.cur);
+}

@@ -61,3 +61,17 @@ An aarch64 program built against the real `nvn.h` runs on the emulated CPU and d
 pool over its own `.bss` (`nvnMemoryPoolMap` returns that address), two buffers in the pool whose GPU addresses equal their CPU addresses,
 a queue, a command buffer (viewport, scissor, buffer copy), `EndRecording`, `QueueSubmitCommands`, a fence and `SyncWait`, then teardown.
 Path: guest code -> svc stub -> `hle_call` -> the NVN function in `hle_nvn.c` -> the null GPU. No `[RED]` line, no unimplemented import.
+
+## Vulkan backend, first part (src/gfx/nvn/nvn_vk.c)
+Replaces the pool, address, fence and in-submission copy/fill entry points of the null GPU; `nvn_null.c` keeps presentation, pacing,
+statistics and the command replay (`mtl_exec`) until those are written. Set `NX_NULL_GPU=1` to run without opening a Vulkan device.
+- **Pools**: a pool is guest memory imported with `VK_EXT_external_memory_host` and bound to one buffer; `mtl_addr` resolves an address to
+  (buffer, offset) by interval lookup. The range is widened to the import alignment (4096); a pool that cannot be imported is reported in red.
+- **Submissions**: one command buffer between `mtl_sub_begin` and `mtl_sub_commit`, submitted with a timeline semaphore signal. The fence
+  value is the timeline value, `mtl_wait` is `vkWaitSemaphores`, so a fence completes only when the GPU has reached it. Command buffers are
+  recycled once the timeline passes them.
+- **Operations**: `mtl_sub_copy` and `mtl_sub_fill` record `vkCmdCopyBuffer` / `vkCmdFillBuffer` with a transfer barrier after each, so
+  dependent operations in one submission see each other's writes.
+- Tests: `test_nvn_vk_pool` (pools, lookups, copies between pools, fill -> copy -> copy, fences, 200 submissions, pool removal and re-add) and
+  `test_nvn_guest` (the guest program of the previous section, now on the GPU).
+Not yet: events and counters written after completion (`mtl_sub_event`, `mtl_sub_counter`), pools larger than `maxBufferSize`, virtual pools.

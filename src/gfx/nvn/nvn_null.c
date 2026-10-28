@@ -1,52 +1,10 @@
-// A null GPU behind the Metal-layer interface that hle_nvn.c calls (nvn_mtl.h): every call is accepted, nothing is drawn,
-// and every submission is complete the moment it is committed. It keeps the memory-pool table, which is real (GPU address = CPU address),
-// so address lookups work. The statistics and pacing functions report zero. The Vulkan backend replaces this file function by function.
+// What the Vulkan backend (nvn_vk.c) does not do yet, behind the Metal-layer interface that hle_nvn.c calls (nvn_mtl.h): presentation,
+// pacing, statistics, and the replay of recorded commands are accepted and do nothing. Each is replaced by a real one as it is written.
 #include "nvn_obj.h"
 #include "nvn_mtl.h"
-#include <pthread.h>
 #include <stdatomic.h>
 
-// ---- memory pools: [base, base+size) of guest memory; GPU address == CPU address
-#define MAX_POOLS 1024
-static struct { uint64_t base, size; } g_pool[MAX_POOLS];
-static int g_npool;
-static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
-
-void mtl_pool_add(const void *mem, uint64_t size) {
-    pthread_mutex_lock(&g_pool_mu);
-    int i = 0;
-    for (; i < g_npool; i++) if (g_pool[i].base == (uint64_t)(uintptr_t)mem) break;
-    if (i < g_npool || g_npool < MAX_POOLS) { g_pool[i].base = (uint64_t)(uintptr_t)mem; g_pool[i].size = size; if (i == g_npool) g_npool++; }
-    pthread_mutex_unlock(&g_pool_mu);
-}
-void mtl_pool_del(const void *mem) {
-    pthread_mutex_lock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++) if (g_pool[i].base == (uint64_t)(uintptr_t)mem) { g_pool[i] = g_pool[--g_npool]; break; }
-    pthread_mutex_unlock(&g_pool_mu);
-}
-void mtl_alias_drop_pool(const void *pool) { (void)pool; }
-int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
-    int hit = 0;
-    pthread_mutex_lock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++)
-        if (addr >= g_pool[i].base && len <= g_pool[i].size && addr - g_pool[i].base <= g_pool[i].size - len) {
-            if (buf) *buf = (void *)(uintptr_t)g_pool[i].base;
-            if (off) *off = addr - g_pool[i].base;
-            hit = 1; break;
-        }
-    pthread_mutex_unlock(&g_pool_mu);
-    return hit;
-}
-
-// ---- submissions: the fence value of a submission, complete as soon as it is committed
-static _Atomic uint64_t g_fence;
-void mtl_sub_begin(void) {}
-uint64_t mtl_sub_commit(void) { return atomic_fetch_add(&g_fence, 1) + 1; }
-uint64_t mtl_last_fence(void) { return atomic_load(&g_fence); }
-int mtl_wait(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return 1; }
-int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return 1; }
-void mtl_finish(void) {}
-void mtl_drain(void) {}
+// Memory pools, submissions and fences are in nvn_vk.c.
 
 // ---- presentation: no window, no display link; the game paces itself against its own clock
 static _Atomic uint64_t g_ticket;

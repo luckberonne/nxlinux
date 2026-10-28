@@ -100,9 +100,9 @@ add_custom_target(game_profile DEPENDS ${NX_GEN_DIR}/game_profile.h)
 add_custom_command(OUTPUT ${NX_GEN_DIR}/nvn_names.c
     COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/gen_nvn_names.py ${CMAKE_SOURCE_DIR}/src/gfx/nvn/names.txt ${NX_GEN_DIR}/nvn_names.c
     DEPENDS tools/gen_nvn_names.py src/gfx/nvn/names.txt)
-add_library(nxnvn STATIC src/gfx/nvn/hle_nvn.c src/gfx/nvn/nvn_dirty.c src/gfx/nvn/nvn_capture.c src/gfx/nvn/nvn_tex.c src/gfx/nvn/nvn_null.c
+add_library(nxnvn STATIC src/gfx/nvn/hle_nvn.c src/gfx/nvn/nvn_dirty.c src/gfx/nvn/nvn_capture.c src/gfx/nvn/nvn_tex.c src/gfx/nvn/nvn_null.c src/gfx/nvn/nvn_vk.c
     src/gfx/tex/nvn_deswizzle.c src/host/sha256.c src/host/faults.c src/host/hostsvc.c ${NX_GEN_DIR}/nvn_names.c)
-target_link_libraries(nxnvn PUBLIC nxhost m)
+target_link_libraries(nxnvn PUBLIC nxhost nxvk m)
 target_include_directories(nxnvn PUBLIC ${NX_GEN_DIR} src/host src/gfx/nvn src/gfx/nvn/include src/gfx third_party/vulkan-headers/include)
 add_dependencies(nxnvn game_profile)
 target_compile_options(nxnvn PRIVATE -Wno-unused-function)
@@ -119,3 +119,6 @@ add_executable(test_nvn_guest tests/test_nvn_guest.cpp)
 target_link_libraries(test_nvn_guest PRIVATE -Wl,--whole-archive nxnvn -Wl,--no-whole-archive nxhost nxcpu dynarmic pthread m)
 add_dependencies(test_nvn_guest nvn_smoke_so)
 add_test(NAME nvn_guest COMMAND test_nvn_guest ${GUEST_NVN})
+add_executable(test_nvn_vk_pool tests/test_nvn_vk_pool.c)
+target_link_libraries(test_nvn_vk_pool PRIVATE nxnvn nxhost nxvk pthread m)
+add_test(NAME nvn_vk_pool COMMAND test_nvn_vk_pool)
