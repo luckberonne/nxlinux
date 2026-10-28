@@ -16,6 +16,12 @@ Consequence: the HLE code that dereferences guest pointers can be reused as is. 
    `MemoryWrite*` through dynarmic, as expected.
 Guest stores to write-protected tracked pages fault in JIT code and reach our handler, which unprotects and retries.
 
+## HLE call shim (src/host/hle_call.c): works
+`hle_call(fn, regs)` maps AAPCS64 argument registers to a SysV call: x0..x5 to rdi, rsi, rdx, rcx, r8, r9, x6 and x7 on
+the stack, d0..d7 to xmm0..7, and brings x0/d0 back. Tested with 8 integer arguments, mixed int/double/float, a float
+return, a pointer out-parameter and garbage in the upper half of a W register. It must be pure assembly: an inline
+`asm` version crashed because the compiler can place inputs in registers the sequence overwrites. Not covered:
+variadics, structs by value, x8 indirect results.
+
 ## Still open
-- Generic trampoline for HLE calls (x0..x7, d0..d7 to a SysV call).
 - Host page size is 4 KiB here; the Apple code assumes 16 KiB. Tracking granularity must be revisited in `nvn_dirty.c`.
