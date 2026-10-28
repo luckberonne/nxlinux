@@ -25,3 +25,11 @@ variadics, structs by value, x8 indirect results.
 
 ## Still open
 - Host page size is 4 KiB here; the Apple code assumes 16 KiB. Tracking granularity must be revisited in `nvn_dirty.c`.
+
+## Jit per guest thread does not scale (found while building the kernel)
+Creating a dynarmic `Jit` takes ~18 ms and every Jit has its own code cache, so one Jit per guest thread would
+retranslate all code for every thread. `src/host/cpu.cpp` instead keeps a pool of Jits (NX_JITS, default 8) and a saved
+register context per guest thread. A thread borrows a Jit only while it runs guest code: `svc` leaves `Run()`
+(CallSVC halts with UserDefined2), the kernel handles it outside, where it may block without holding a Jit, and the
+thread resumes on any free Jit. Creating a guest thread is now free. Pool ids are the exclusive-monitor slots and must be
+reserved under the lock (two Jits with the same id lost atomic updates).

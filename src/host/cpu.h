@@ -17,7 +17,7 @@ typedef struct {
 enum { CPU_HALT_NONE = 0, CPU_HALT_REQUESTED = 1, CPU_HALT_FAULT = 2 };
 
 // core: 0..cpu_max_cores-1, the exclusive-monitor slot of this thread (one per concurrently running guest thread).
-enum { CPU_MAX_CORES = 64 };
+enum { CPU_MAX_CORES = 256 };
 cpu_t *cpu_create(const cpu_ops_t *ops, void *user, unsigned core);
 void cpu_destroy(cpu_t *c);
 
