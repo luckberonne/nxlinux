@@ -73,23 +73,73 @@ static VkSampler make_sampler(vkctx_t *c, const samp_par *p) {
     return s;
 }
 
-// A bound handle's texture and sampler as a descriptor; `want` is the SamplerType the shader declares for the binding.
-// 1 = filled; 0 = the texture id is not registered or has no image; 2 = the sampler id is not registered; 3 = the texture is not of the type the shader samples
+// ---- what an empty slot reads: a 1x1 texture of zeros of the type the shader samples, with a nearest sampler (NVN: an unregistered descriptor reads 0)
+typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; int made; } dummy_t;
+static dummy_t g_dummy[8];
+static VkSampler g_dummy_samp;
+static int dummy_index(int code) {
+    int base = code & 0xFF, arr = (code >> 8) & 1, i = base == 1 ? 0 : base == 3 ? 1 : base == 4 ? 2 : base == 5 ? 3 : -1;
+    return i < 0 || (base == 4 && arr) || (code & ~0x1FF) ? -1 : i * 2 + arr;
+}
+static int dummy_get(vkctx_t *c, int code, VkDescriptorImageInfo *out) {
+    int di = dummy_index(code);
+    if (di < 0) return 0;
+    pthread_mutex_lock(&g_mu);
+    dummy_t *d = &g_dummy[di];
+    if (!d->made) {
+        int base = code & 0xFF, arr = (code >> 8) & 1, cube = base == 5;
+        uint32_t layers = cube ? 6 : 1;
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
+            .imageType = base == 1 ? VK_IMAGE_TYPE_1D : base == 4 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {1, 1, 1},
+            .mipLevels = 1, .arrayLayers = layers, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        VkMemoryRequirements mr;
+        if (vkCreateImage(c->dev, &ii, NULL, &d->img)) { pthread_mutex_unlock(&g_mu); return 0; }
+        vkGetImageMemoryRequirements(c->dev, d->img, &mr);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vkctx_memtype(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+        VkImageViewType vt = base == 1 ? (arr ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D) : base == 4 ? VK_IMAGE_VIEW_TYPE_3D
+                           : cube ? (arr ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE) : (arr ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D);
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = d->img, .viewType = vt, .format = ii.format, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}};
+        VkCommandBuffer cb;
+        if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(c->dev, &ai, NULL, &d->mem) || vkBindImageMemory(c->dev, d->img, d->mem, 0) || vkCreateImageView(c->dev, &vi, NULL, &d->view) ||
+            !(cb = vkctx_begin(c))) { pthread_mutex_unlock(&g_mu); return 0; }
+        vk_barrier_image_all(cb, d->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkClearColorValue zero = {{0, 0, 0, 0}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+        vkCmdClearColorImage(cb, d->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &rg);
+        vk_barrier_image_all(cb, d->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                             VK_ACCESS_2_MEMORY_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        vkctx_end(c, cb);
+        d->made = 1;
+    }
+    if (!g_dummy_samp) {
+        VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                  .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+        vkCreateSampler(c->dev, &si, NULL, &g_dummy_samp);
+    }
+    *out = (VkDescriptorImageInfo){g_dummy_samp, d->view, VK_IMAGE_LAYOUT_GENERAL};
+    pthread_mutex_unlock(&g_mu);
+    return 1;
+}
+
+// A bound handle's texture and sampler as a descriptor; `want` is the SamplerType the shader declares for the binding (the shadow bit, 1024, is the sampler's business).
+// 1 = filled; 0 = the texture or sampler cannot be used and there is no stand-in for this type; 3 = the texture is not of the type the shader samples.
+// A texture id or sampler id that is not registered reads as an empty slot (zeros through a nearest sampler), as it does on the hardware.
 int nvn_vk_desc_sampled(uint32_t handle, int want, VkDescriptorImageInfo *out) {
     vkctx_t *c = nvn_vk_ctx();
     uint32_t tid = handle & 0xfffff, sid = handle >> 20;
     if (!c) return 0;
+    int shadow = (want & 1024) != 0; want &= ~1024;
     pthread_mutex_lock(&g_mu);
     tdesc td = (int)tid < g_ntex ? g_tex[tid] : (tdesc){0};
     sdesc *sd = (int)sid < g_nsamp && g_samp[sid].used ? &g_samp[sid] : NULL;
     if (sd && !sd->s) sd->s = make_sampler(c, &sd->p);
     VkSampler smp = sd ? sd->s : VK_NULL_HANDLE;
     pthread_mutex_unlock(&g_mu);
-    if (!td.used) return 0;
-    if (!smp) return 2;
+    if (!td.used) return shadow ? 0 : dummy_get(c, want, out);
     VkImageView iv; int code;
-    if (!nvn_vk_tex_sampled(td.serial, &td.v, td.has_view, td.set_swz, td.swz, &iv, &code)) return 0;
+    if (!nvn_vk_tex_sampled(td.serial, &td.v, td.has_view, td.set_swz, td.swz, &iv, &code)) return shadow ? 0 : dummy_get(c, want, out);
     if (code != want) return 3;
+    if (!smp) { VkDescriptorImageInfo tmp; if (!dummy_get(c, 3, &tmp)) return 0; smp = tmp.sampler; }
     *out = (VkDescriptorImageInfo){smp, iv, VK_IMAGE_LAYOUT_GENERAL};
     return 1;
 }

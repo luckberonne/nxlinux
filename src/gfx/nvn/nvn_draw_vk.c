@@ -347,8 +347,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
                 int r = nvn_vk_desc_sampled(S.tex[si][b[i].reg], (int)b[i].aux, &ti[nt]);
                 if (r != 1) {
                     char why[160]; uint32_t h = S.tex[si][b[i].reg];
-                    snprintf(why, sizeof why, r == 2 ? "texture slot %u of a shader is bound with sampler %u, which is not registered" : r == 3 ? "texture slot %u (id %u) is not the type the shader samples" : "texture slot %u of a shader is bound to texture id %u, which is not registered or has no image",
-                             b[i].reg, r == 2 ? h >> 20 : h & 0xfffff);
+                    snprintf(why, sizeof why, r == 3 ? "texture slot %u (id %u) is not the type the shader samples" : "texture slot %u (id %u) has no image the shader can sample and no stand-in for its type", b[i].reg, h & 0xfffff);
                     skip(why, &f_tex); return 0;
                 }
                 tbind[nt++] = b[i].binding;

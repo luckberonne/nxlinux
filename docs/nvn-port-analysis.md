@@ -204,3 +204,7 @@ frees when it completes (`driver_buffer` in nvn_draw_vk.c):
 - **support buffer** (1392 bytes, std140 as the translator declares it): viewport inverse and size from the current viewport, every render scale 1.0, no alpha test, no BGRA swap.
 Stage thirteen of the draw test reads all three from one machine-code fragment shader and checks the colour it writes. Still missing: the shader's own constant segment c[1],
 storage buffers, images, geometry helpers.
+
+An unregistered texture or sampler id now reads as an empty slot, as on the hardware: a 1x1 texture of zeros of the type the shader samples (1D, 2D, 3D, cube, and arrays of them; made on first
+use, cleared to zero) through a nearest-filter sampler. Shadow samplers have no stand-in (a draw that needs one is skipped). The library accepts those types for combined textures; multisampled
+ones and buffer textures still set `needs`. Stage fourteen of the draw test checks the zeros.

@@ -16,15 +16,15 @@ from pathlib import Path
 
 STAGE = {'vs': 0, 'ps': 1, 'cs': 5}          # NVN_STAGE_VERTEX, FRAGMENT, COMPUTE
 KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2 = 1, 2, 3, 4, 5
-SAMPLER_2D = 3                                # the translator's SamplerType.Texture2D, with no array, multisample or shadow bits
+SAMPLER_TYPES = {1, 3, 4, 5}                 # the translator's SamplerType 1D, 2D, 3D and cube; Array (256) and Shadow (1024) may be added, Multisample (512) and buffers (2) may not
 C2_TEX, C2_SEPTEX = 0x20, 0x168               # byte offsets in driver segment c[2] (src/gfx/nvn/dmsh_abi.h): combined handles, and where the separate textures start
 
 
 def combined_slot(t):
-    """The c[2] combined-texture slot of a plain 2D texture read through a combined handle, or None for anything the draw path cannot bind yet.
+    """The c[2] combined-texture slot of a 1D, 2D, 3D or cube texture (or array of them) read through a combined handle, or None for anything the draw path cannot bind yet.
     The reflection's `handle` packs the cbuf word offsets: bits 0-13 the first, 14-27 the second, 28-31 the handle type (0 = combined sampler); cbuf_slot -1 is a texture bound the usual way (its handle is in c[2])."""
     h = t['handle']
-    if t.get('separate') or t.get('array', 1) > 1 or t['cbuf_slot'] not in (-1, 2) or (h >> 28) != 0 or t['type'] != SAMPLER_2D: return None
+    if t.get('separate') or t.get('array', 1) > 1 or t['cbuf_slot'] not in (-1, 2) or (h >> 28) != 0 or (t['type'] & 0xFF) not in SAMPLER_TYPES or t['type'] & 512 or (t['type'] & 0xFF) == 4 and t['type'] & 256: return None
     b = (h & 0x3FFF) * 4
     if b % 8 or not C2_TEX <= b < C2_SEPTEX: return None
     return (b - C2_TEX) // 8

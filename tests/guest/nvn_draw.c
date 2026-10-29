@@ -1,6 +1,6 @@
 // Guest program for tests/test_nvn_draw.cpp: draws through the NVN API, as a game does. The host registers SPIR-V for the two shaders the program names.
 // The shader "code" is a few bytes in the memory pool and the control section a block in .bss; the host fills both in before the program runs and computes the
-// key the way hle_nvn.c does. Thirteen stages, each checking one thing; the results go to g_res[].
+// key the way hle_nvn.c does. Fourteen stages, each checking one thing; the results go to g_res[].
 #include "nvn_protos.h"
 
 typedef unsigned long u64;
@@ -274,6 +274,12 @@ void guest_main(u64 arg) {
         nvnCommandBufferBindTexture(&g_cb, NVN_SHADER_STAGE_FRAGMENT, 0, th);
         nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, UV_TRI, 3); copy_out(0); submit();
         g_res[18] = okm && is(12, 32, 128, 159, 50, 3) && is(52, 32, 128, 159, 209, 3);
+        // ---- N: a texture slot bound to ids that were never registered reads as zeros (all four channels) instead of stopping the draw
+        begin(); target(blue, 0); bind_all(UBO_VS0, UBO_FS_WHITE); nvnCommandBufferBindProgram(&g_cb, &g_prog_l, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        nvnCommandBufferSetTexturePool(&g_cb, &g_tpool); nvnCommandBufferSetSamplerPool(&g_cb, &g_spool);
+        nvnCommandBufferBindTexture(&g_cb, NVN_SHADER_STAGE_FRAGMENT, 0, nvnDeviceGetTextureHandle(&g_dev, 300, 301));
+        nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, UV_TRI, 3); copy_out(0); submit();
+        g_res[19] = is_a(12, 32, 0, 0, 0, 1, 0) && is_a(52, 32, 0, 0, 0, 1, 0);
         g_res[23] = (u64)px(52, 32)[0] | (u64)px(52, 32)[1] << 8 | (u64)px(52, 32)[2] << 16 | (u64)px(52, 32)[3] << 24;
     }
 

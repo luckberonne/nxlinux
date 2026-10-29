@@ -1,7 +1,7 @@
 // Draws from guest code through the NVN API on the Vulkan backend: tests/guest/nvn_draw.c records six stages of draws, each checking one behaviour
 // (default state, culling, blending, depth, channel mask, uniform buffers) against pixels the GPU produced. The shaders are registered by hand as SPIR-V:
 // the translated library that normally supplies them is not loaded yet. With a fourth argument, a shader library built from Maxwell machine code by the translator
-// (tests/make_maxwell_lib.py) supplies stages nine to thirteen's fragment shader.
+// (tests/make_maxwell_lib.py) supplies stages nine to fourteen's fragment shader.
 extern "C" {
 #include "../src/host/guest_mem.h"
 #include "../src/host/module.h"
@@ -112,9 +112,9 @@ int main(int argc, char **argv) {
     EXPECT(11, 1);       // G  an indexed draw: the indices pick the vertices
     EXPECT(12, 1);       // G  the same indices backwards is the mirror image, which the culling removes: the order is the index buffer's
     EXPECT(13, 1);       // H  a program with no registered shaders: the draw is skipped and the frame goes on
-    if (have_lib) { EXPECT(14, 1); EXPECT(15, 1); EXPECT(16, 1); EXPECT(17, 1); EXPECT(18, 1); }   // I  a fragment shader translated from Maxwell machine code: constant orange; J  a translated vertex/fragment pair; K  one that reads a uniform buffer; L  one that samples a texture; M  one that reads the driver segments c0 and c2 and the support buffer
+    if (have_lib) { EXPECT(14, 1); EXPECT(15, 1); EXPECT(16, 1); EXPECT(17, 1); EXPECT(18, 1); EXPECT(19, 1); }   // I  a fragment shader translated from Maxwell machine code: constant orange; J  a translated vertex/fragment pair; K  one that reads a uniform buffer; L  one that samples a texture; M  one that reads the driver segments c0 and c2 and the support buffer; N  an unregistered texture reads zeros
     EXPECT(10, 0x5555);
-    CHECK(nvn_draw_count() == (have_lib ? 18u : 13u) && nvn_draw_skipped() == (have_lib ? 1u : 6u));
+    CHECK(nvn_draw_count() == (have_lib ? 19u : 13u) && nvn_draw_skipped() == (have_lib ? 1u : 7u));
     CHECK(nvn_pipeline_count() >= 5);
     puts(g_fail ? "FAIL" : "PASS");
     return g_fail;

@@ -26,12 +26,12 @@ class Assembler(unittest.TestCase):
 
 class Packer(unittest.TestCase):
     def test_needs_and_bindings(self):
-        res = {'stage': 'ps', 'cbufs': [{'binding': 0, 'slot': 0}, {'binding': 1, 'slot': 3}, {'binding': 2, 'slot': 5}], 'textures': [{'binding': 3, 'type': 5, 'handle': 8, 'cbuf_slot': 2, 'array': 1, 'separate': False}], 'sbufs': [], 'images': []}
+        res = {'stage': 'ps', 'cbufs': [{'binding': 0, 'slot': 0}, {'binding': 1, 'slot': 3}, {'binding': 2, 'slot': 5}], 'textures': [{'binding': 3, 'type': 3 | 512, 'handle': 8, 'cbuf_slot': 2, 'array': 1, 'separate': False}], 'sbufs': [], 'images': []}
         lib = shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\x03\x02\x23\x07' * 2, res)])
         [e] = shader_pack.unpack(lib)
         self.assertEqual(e['key'], '0123456789abcdef')
         self.assertEqual(e['stage'], 1)
-        self.assertEqual(e['needs'], shader_pack.NEEDS_TEX)         # a cube map: not bindable yet
+        self.assertEqual(e['needs'], shader_pack.NEEDS_TEX)         # multisampled: not bindable yet
         self.assertEqual(e['binds'], [(0, shader_pack.KIND_DRV0, 0, 0), (1, shader_pack.KIND_CBUF, 0, 0), (2, shader_pack.KIND_CBUF, 2, 0)])        # c[3 + reg]
 
     def test_combined_2d_texture_is_a_binding(self):
@@ -39,7 +39,10 @@ class Packer(unittest.TestCase):
         res = {'stage': 'ps', 'cbufs': [], 'textures': [t]}
         [e] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', res)]))
         self.assertEqual((e['needs'], e['binds']), (0, [(2, shader_pack.KIND_TEX, 2, 3)]))
-        for bad in ({'separate': True}, {'cbuf_slot': 3}, {'handle': 8 + (1 << 28)}, {'handle': 9}, {'array': 4}, {'type': 3 | 256}):
+        for ty in (1, 5, 3 | 256, 5 | 256, 3 | 1024):             # 1D, cube, 2D array, cube array, a 2D shadow sampler
+            [x] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', {'stage': 'ps', 'textures': [{**t, 'type': ty}]})]))
+            self.assertEqual((x['needs'], x['binds'][0][3]), (0, ty))
+        for bad in ({'separate': True}, {'cbuf_slot': 3}, {'handle': 8 + (1 << 28)}, {'handle': 9}, {'array': 4}, {'type': 3 | 512}, {'type': 2}, {'type': 4 | 256}):
             [x] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', {'stage': 'ps', 'textures': [{**t, **bad}]})]))
             self.assertEqual((x['needs'], x['binds']), (shader_pack.NEEDS_TEX, []))
 
