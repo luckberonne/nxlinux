@@ -218,3 +218,12 @@ a game uniform buffer. The binding of c[0] itself is not in the reflection when 
 module's own uniform blocks (`<stage>_c<n>`). The replay keeps the storage buffers bound per stage and slot (`OP_BIND_SSBO`); a draw binds each as a storage buffer descriptor (an unbound slot
 reads zeros) and writes the same addresses and sizes into the c[0] table. Stage fifteen of the draw test loads a float that way.
 Not done yet: the shader's own constant segment c[1], images, the geometry helpers, separate textures and samplers, multisampled and buffer textures, and indexing storage buffers by a game-computed address.
+
+## Presentation
+
+`nvn_present_vk.c` implements `mtl_present` the plain way: the presented texture (RGBA8 or BGRA8, the crop of the window or the vi layer; an all-zero crop means the whole texture)
+is read back to the host after the GPU finished it, converted to RGBA8, and handed to a sink. The default sink keeps the last frame in memory (`nvn_present_last`, `nvn_present_count`),
+which is what the tests read: stage sixteen of the draw test presents a frame through a two-texture window and the host checks its pixels. `NX_PRESENT=sdl` (when SDL3 was found at
+configure time) starts a thread that owns an SDL window with a vsynced renderer and shows the frames; closing the window sets `nvn_present_quit_requested`. Tickets are completed when
+the sink has shown the frame, which is what `mtl_present_wait` (called from the window's acquire) waits for. Checked here with `SDL_VIDEO_DRIVER=offscreen`; a visible window has not been looked at yet.
+The readback of a 1080p frame is about 8 MB per present; a swapchain with a GPU blit replaces it when the cost shows.

@@ -7,12 +7,7 @@
 // Memory pools, submissions and fences are in nvn_vk.c; textures in nvn_tex_vk.c. On the null GPU there are no images: a texture the
 // game writes through the CPU is read back by de-swizzling its storage only, and a GPU-owned one reads as zero.
 
-// ---- presentation: no window, no display link; the game paces itself against its own clock
-static _Atomic uint64_t g_ticket;
-uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) { (void)t; (void)period_s; (void)crop; return atomic_fetch_add(&g_ticket, 1) + 1; }
-void mtl_present_wait(uint64_t ticket) { (void)ticket; }
-int mtl_has_window(void) { return 0; }
-int mtl_display_hz(void) { return 60; }
+// ---- presentation is in nvn_present_vk.c; there is no display link, so the game paces itself against its own clock
 int mtl_fps_target(void) { return 60; }              // hle_nvn.c divides by it
 int mtl_link_active(void) { return 0; }
 int mtl_link_rate(void) { return 60; }
@@ -45,7 +40,6 @@ uint64_t mtl_pkg_edge_skips(void) { return 0; }
 uint64_t mtl_pkg_miss(void) { return 0; }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { if (uploads) *uploads = 0; if (reuploads) *reuploads = 0; }
 uint32_t mtl_present_qos(void) { return 0; }
-double mtl_presented_time(uint64_t n) { (void)n; return 0.0; }
 void mtl_prog_release(prog_t *p) { (void)p; }
 void mtl_pso_line(char *out, size_t n) { if (n) out[0] = 0; }
 void mtl_queue_activate(uint64_t serial) { (void)serial; }

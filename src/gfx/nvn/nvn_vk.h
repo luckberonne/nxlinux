@@ -1,6 +1,7 @@
 // Vulkan backend of the NVN layer: the entry points of nvn_mtl.h that touch the GPU. Replaces nvn_null.c function by function.
 // Falls back to the null behaviour when no Vulkan device can be opened, so the layer still runs (and says so once).
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
@@ -18,6 +19,10 @@ uint64_t nvn_replay_ops_named(const char *name);
 uint64_t nvn_draw_count(void);
 uint64_t nvn_draw_skipped(void);
 uint64_t nvn_pipeline_count(void);
+// Presentation (nvn_present_vk.c): frames shown so far, the last one as RGBA8 (returns 0 before the first), and whether the window was closed (NX_PRESENT=sdl)
+uint64_t nvn_present_count(void);
+int nvn_present_last(uint32_t *w, uint32_t *h, uint8_t *rgba, size_t cap);
+int nvn_present_quit_requested(void);
 #ifdef __cplusplus
 }
 #endif

@@ -1,6 +1,6 @@
 // Guest program for tests/test_nvn_draw.cpp: draws through the NVN API, as a game does. The host registers SPIR-V for the two shaders the program names.
 // The shader "code" is a few bytes in the memory pool and the control section a block in .bss; the host fills both in before the program runs and computes the
-// key the way hle_nvn.c does. Fifteen stages, each checking one thing; the results go to g_res[].
+// key the way hle_nvn.c does. Sixteen stages, each checking one thing; the results go to g_res[].
 #include "nvn_protos.h"
 
 typedef unsigned long u64;
@@ -19,7 +19,7 @@ extern void *nvnBootstrapLoader(const char *name);
     X(nvnCommandBufferDrawArrays) X(nvnCommandBufferDrawElements) X(nvnCommandBufferCopyTextureToBuffer) X(nvnCommandBufferCopyBufferToTexture) \
     X(nvnTexturePoolInitialize) X(nvnTexturePoolRegisterTexture) X(nvnSamplerPoolInitialize) X(nvnSamplerPoolRegisterSampler) X(nvnSamplerBuilderSetDevice) X(nvnSamplerBuilderSetDefaults) \
     X(nvnSamplerBuilderSetMinMagFilter) X(nvnSamplerBuilderSetWrapMode) X(nvnSamplerInitialize) X(nvnDeviceGetTextureHandle) X(nvnCommandBufferSetTexturePool) X(nvnCommandBufferSetSamplerPool) \
-    X(nvnCommandBufferBindTexture) X(nvnCommandBufferBindStorageBuffer) \
+    X(nvnCommandBufferBindTexture) X(nvnCommandBufferBindStorageBuffer) X(nvnWindowBuilderSetDevice) X(nvnWindowBuilderSetDefaults) X(nvnWindowBuilderSetTextures) X(nvnWindowInitialize) X(nvnQueuePresentTexture) \
     X(nvnTextureBuilderSetDevice) X(nvnTextureBuilderSetDefaults) X(nvnTextureBuilderSetTarget) X(nvnTextureBuilderSetSize2D) X(nvnTextureBuilderSetFormat) \
     X(nvnTextureBuilderSetLevels) X(nvnTextureBuilderSetStorage) X(nvnTextureInitialize) \
     X(nvnProgramInitialize) X(nvnProgramSetShaders) \
@@ -43,6 +43,7 @@ static NVNtexture g_rt __attribute__((aligned(64))), g_depth __attribute__((alig
 static NVNtextureBuilder g_tb __attribute__((aligned(64)));
 static NVNprogram g_prog __attribute__((aligned(64))), g_prog_x __attribute__((aligned(64))), g_prog_t __attribute__((aligned(64))), g_prog_j __attribute__((aligned(64))), g_prog_k __attribute__((aligned(64))), g_prog_l __attribute__((aligned(64))), g_prog_m __attribute__((aligned(64))), g_prog_o __attribute__((aligned(64)));
 static NVNtexture g_tex __attribute__((aligned(64))); static NVNtexturePool g_tpool __attribute__((aligned(64))); static NVNsamplerPool g_spool __attribute__((aligned(64)));
+static NVNwindow g_win __attribute__((aligned(64))); static NVNwindowBuilder g_wb __attribute__((aligned(64)));
 static NVNsampler g_samp __attribute__((aligned(64))); static NVNsamplerBuilder g_sb __attribute__((aligned(64)));
 static NVNblendState g_blend __attribute__((aligned(16))); static NVNcolorState g_color __attribute__((aligned(16)));
 static NVNchannelMaskState g_mask __attribute__((aligned(16))); static NVNmultisampleState g_ms __attribute__((aligned(16)));
@@ -292,6 +293,16 @@ void guest_main(u64 arg) {
         nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, UV_TRI, 3); copy_out(0); submit();
         g_res[24] = oko && is(30, 30, 64, 64, 64, 1);
         g_res[23] = (u64)px(52, 32)[0] | (u64)px(52, 32)[1] << 8 | (u64)px(52, 32)[2] << 16 | (u64)px(52, 32)[3] << 24;
+    }
+
+    // ---- P: presenting. A frame is drawn (the green triangle of stage A on blue) and presented through a window of two textures; the host reads back what the presenter received
+    {
+        NVNtexture *wt[2] = {&g_rt, &g_rt};
+        nvnWindowBuilderSetDevice(&g_wb, &g_dev); nvnWindowBuilderSetDefaults(&g_wb); nvnWindowBuilderSetTextures(&g_wb, 2, wt);
+        int okp = nvnWindowInitialize(&g_win, &g_wb) & 0xFF;
+        begin(); target(blue, 0); bind_all(UBO_VS0, UBO_FS_WHITE); nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, LEFT_GREEN, 3); submit();
+        nvnQueuePresentTexture(&g_queue, &g_win, 0); nvnQueueFinish(&g_queue);
+        g_res[25] = okp;
     }
 
     g_res[10] = 0x5555;

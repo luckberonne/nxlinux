@@ -102,13 +102,20 @@ add_custom_target(game_profile DEPENDS ${NX_GEN_DIR}/game_profile.h)
 add_custom_command(OUTPUT ${NX_GEN_DIR}/nvn_names.c
     COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/gen_nvn_names.py ${CMAKE_SOURCE_DIR}/src/gfx/nvn/names.txt ${NX_GEN_DIR}/nvn_names.c
     DEPENDS tools/gen_nvn_names.py src/gfx/nvn/names.txt)
-add_library(nxnvn STATIC src/gfx/nvn/hle_nvn.c src/gfx/nvn/nvn_dirty.c src/gfx/nvn/nvn_capture.c src/gfx/nvn/nvn_tex.c src/gfx/nvn/nvn_null.c src/gfx/nvn/nvn_vk.c src/gfx/nvn/nvn_replay.c src/gfx/nvn/nvn_tex_vk.c src/gfx/nvn/nvn_desc_vk.c src/gfx/nvn/nvn_draw_vk.c src/gfx/nvn/nvn_shader_vk.c
+add_library(nxnvn STATIC src/gfx/nvn/hle_nvn.c src/gfx/nvn/nvn_dirty.c src/gfx/nvn/nvn_capture.c src/gfx/nvn/nvn_tex.c src/gfx/nvn/nvn_null.c src/gfx/nvn/nvn_vk.c src/gfx/nvn/nvn_replay.c src/gfx/nvn/nvn_tex_vk.c src/gfx/nvn/nvn_desc_vk.c src/gfx/nvn/nvn_present_vk.c src/gfx/nvn/nvn_draw_vk.c src/gfx/nvn/nvn_shader_vk.c
     src/gfx/tex/nvn_deswizzle.c src/host/sha256.c src/host/faults.c src/host/hostsvc.c ${NX_GEN_DIR}/nvn_names.c)
 target_link_libraries(nxnvn PUBLIC nxhost nxvk nxfmt m)
 target_include_directories(nxnvn PUBLIC ${NX_GEN_DIR} src/host src/gfx/nvn src/gfx/nvn/include src/gfx third_party/vulkan-headers/include)
 add_dependencies(nxnvn game_profile)
 target_compile_options(nxnvn PRIVATE -Wno-unused-function)
 target_compile_definitions(nxnvn PRIVATE _GNU_SOURCE)
+find_package(SDL3 QUIET)
+if(SDL3_FOUND)
+    target_compile_definitions(nxnvn PRIVATE NX_HAVE_SDL3)
+    target_link_libraries(nxnvn PUBLIC SDL3::SDL3)
+else()
+    message(STATUS "SDL3 not found: NX_PRESENT=sdl will fall back to memory")
+endif()
 add_executable(nvn_link_check tests/nvn_link_check.c)
 target_link_libraries(nvn_link_check PRIVATE -Wl,--whole-archive nxnvn -Wl,--no-whole-archive nxhost nxcpu dynarmic pthread m)
 set(GUEST_NVN ${CMAKE_BINARY_DIR}/nvn_smoke.so)

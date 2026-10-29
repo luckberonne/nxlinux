@@ -113,8 +113,17 @@ int main(int argc, char **argv) {
     EXPECT(12, 1);       // G  the same indices backwards is the mirror image, which the culling removes: the order is the index buffer's
     EXPECT(13, 1);       // H  a program with no registered shaders: the draw is skipped and the frame goes on
     if (have_lib) { EXPECT(14, 1); EXPECT(15, 1); EXPECT(16, 1); EXPECT(17, 1); EXPECT(18, 1); EXPECT(19, 1); EXPECT(24, 1); }   // I  a fragment shader translated from Maxwell machine code: constant orange; J  a translated vertex/fragment pair; K  one that reads a uniform buffer; L  one that samples a texture; M  one that reads the driver segments c0 and c2 and the support buffer; N  an unregistered texture reads zeros; O  a storage buffer
+    EXPECT(25, 1);       // P  a window was made and a frame presented
+    {
+        // what the presenter received: the stage's frame, the green triangle on blue, as RGBA8
+        uint32_t pw = 0, ph = 0; std::vector<uint8_t> fr(64 * 64 * 4);
+        CHECK(nvn_present_count() == 1);
+        CHECK(nvn_present_last(&pw, &ph, fr.data(), fr.size()) && pw == 64 && ph == 64);
+        auto at = [&](int x, int y, int r, int g, int b) { const uint8_t *p = &fr[(y * 64 + x) * 4]; return p[0] == r && p[1] == g && p[2] == b && p[3] == 255; };
+        CHECK(at(17, 23, 0, 255, 0) && at(50, 32, 0, 0, 255));
+    }
     EXPECT(10, 0x5555);
-    CHECK(nvn_draw_count() == (have_lib ? 20u : 13u) && nvn_draw_skipped() == (have_lib ? 1u : 8u));
+    CHECK(nvn_draw_count() == (have_lib ? 21u : 14u) && nvn_draw_skipped() == (have_lib ? 1u : 8u));
     CHECK(nvn_pipeline_count() >= 5);
     puts(g_fail ? "FAIL" : "PASS");
     return g_fail;
