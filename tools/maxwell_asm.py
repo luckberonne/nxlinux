@@ -61,6 +61,16 @@ def tex(rd, ra, slot, dim=2, lod=1):
     return (0b11000 << 59) | ((lod & 7) << 55) | (tid << 36) | (0xF << 31) | ((dim & 7) << 28) | (255 << 20) | (PT << 16) | ((ra & 0xFF) << 8) | (rd & 0xFF)
 
 
+def ldg(rd, ra, offset=0):
+    """LDG.E Rd, [Ra:Ra+1 + offset]: one 32-bit word from global memory (13 bits 1110111011010; E (64-bit address) is bit 45, size B32 = 4 in bits 48-50, offset bits 20-43)"""
+    return (0b1110111011010 << 51) | (4 << 48) | (1 << 45) | ((offset & 0xFFFFFF) << 20) | (PT << 16) | ((ra & 0xFF) << 8) | (rd & 0xFF)
+
+
+def stg(rd, ra, offset=0):
+    """STG.E [Ra:Ra+1 + offset], Rd: one 32-bit word to global memory (13 bits 1110111011011, the other fields as LDG)"""
+    return (0b1110111011011 << 51) | (4 << 48) | (1 << 45) | ((offset & 0xFFFFFF) << 20) | (PT << 16) | ((ra & 0xFF) << 8) | (rd & 0xFF)
+
+
 def fmul32i(rd, ra, value):
     """FMUL32I Rd, Ra, imm (7 bits 0011100, the immediate's top bit at 56, 5 bits 01101 below it; the immediate is the float's top 20 bits, bits 20-38 and 56)"""
     imm20 = f32(value) >> 12
@@ -127,6 +137,12 @@ def fragment_drivers():
     float with the same bits) scaled by 2^94 into green, and the fragment's x position (the translator divides it by the support buffer's render scale) over 64 into blue"""
     return program([ldc(4, 0, 0x610), ldc(5, 2, 0x20), ipa(6, 0x70), fmul32i(0, 4, 1 / 128), fmul32i(1, 5, 2.0 ** 94), fmul32i(2, 6, 1 / 64), mov32i(3, f32(1.0)), exit_()],
                    sph(FRAGMENT, omap_targets=0xF, imap=[0xAA]))
+
+
+def fragment_ssbo(table=0x510):
+    """A fragment shader that loads one float through the storage buffer whose descriptor (address, size) the driver keeps in c[0] at `table` (the pixel stage's first slot
+    is 0x510) and writes it as grey: the load goes through a global address, which the translator turns into a storage buffer access"""
+    return program([ldc(4, 0, table), ldc(5, 0, table + 4), ldg(0, 4), fadd(1, 0, 255), fadd(2, 0, 255), mov32i(3, f32(1.0)), exit_()], sph(FRAGMENT, omap_targets=0xF))
 
 
 if __name__ == '__main__':

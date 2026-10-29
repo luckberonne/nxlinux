@@ -39,7 +39,7 @@ static struct {
     const prog_t *prog; int nkeys; uint8_t keys[6][8];
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
     uint32_t attr[16]; int nattr; vs_st stream[16]; int nstream; NVNbufferRange vbuf[16];
-    p_bind_buf ubo[6][16];
+    p_bind_buf ubo[6][16], ssbo[6][16];
     uint32_t tex[6][NTEXSLOT];                  // the combined handle (texture id | sampler id << 20) bound to each texture slot of each stage
     float vp[16][6]; int has_vp; float dr[2]; int has_dr; p_poly_offset po; float blend_color[4];
     int st_vmask[2], st_wmask[2], st_ref[2];
@@ -98,6 +98,7 @@ int nvn_draw_state_op(uint32_t op, const void *a) {
             if (b->stage >= 0 && b->stage < 6 && slot >= 0 && slot < NTEXSLOT) S.tex[b->stage][slot] = (uint32_t)h;
         }
         return 1; }
+    case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) S.ssbo[b->stage][b->index] = *b; return 1; }
     case OP_VIEWPORTS: { const p_viewports *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) memcpy(S.vp[b->first + i], b->v[i], sizeof S.vp[0]); S.has_vp = 1; return 1; }
     case OP_DEPTH_RANGE: { const p_depth_range *b = a; S.dr[0] = b->n; S.dr[1] = b->f; S.has_dr = 1; return 1; }
     case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)a)->on; return 1;
@@ -177,7 +178,7 @@ static VkPipelineLayout make_layout(vkctx_t *c, const pkey *k, VkDescriptorSetLa
         for (int i = 0; i < n; i++) {
             VkShaderStageFlags st = si ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
             int j = 0; for (; j < nb; j++) if (lb[j].binding == b[i].binding) break;
-            if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].kind == NVN_SB_TEX ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL}; }
+            if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].kind == NVN_SB_TEX ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : b[i].kind == NVN_SB_SBUF ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL}; }
             lb[j].stageFlags |= st;
         }
     }
@@ -299,12 +300,22 @@ static VkDescriptorBufferInfo driver_buffer(vkctx_t *c, int kind, int stage, flo
         float ps = c->props.limits.pointSizeRange[1]; if (ps > 64.0f) ps = 64.0f;
         put_f(m, DMSH_C0_POINT_SIZE, ps);                                                // the largest point size GLSLC clamps to; 64 on every device that has at least that
         put_u(m, DMSH_C0_BASE_INSTANCE, (uint32_t)g_base_instance);
+        size_t tbl = stage == 0 ? DMSH_C0_SSBO_VS : DMSH_C0_SSBO_PS;                     // the stage's storage buffers: address and size, 0x10 per slot
+        for (int r = 0; r < DMSH_C0_SSBO_SLOTS; r++) {
+            memcpy(m + tbl + (size_t)r * DMSH_C0_ROW, &S.ssbo[stage][r].addr, 8);
+            put_u(m, tbl + (size_t)r * DMSH_C0_ROW + 8, (uint32_t)S.ssbo[stage][r].size);
+        }
     } else {                                                                             // c[2]: the handle of each bound texture slot, one word every DMSH_C2_ROW bytes
         for (int r = 0; r < DMSH_C2_TEX_SLOTS; r++) put_u(m, DMSH_C2_TEX + (size_t)r * DMSH_C2_ROW, S.tex[stage][r]);
         for (int r = 0; r < DMSH_C2_SEP_SLOTS; r++) put_u(m, DMSH_C2_SEPTEX + (size_t)r * DMSH_C2_ROW, S.tex[stage][DMSH_SEPTEX_SLOT0 + r]);
     }
     nvn_vk_keep(&b);                                                                     // freed once the submission has completed
     return (VkDescriptorBufferInfo){b.buf, 0, size};
+}
+static VkBuffer zero_storage(vkctx_t *c) {                        // what an unbound storage buffer slot reads
+    static vkbuf_t z; static int made;
+    if (!made) { made = 1; if (!vkbuf_create(c, &z, 65536, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 1)) memset(z.map, 0, 65536); }
+    return z.buf;
 }
 static void skip(const char *why, int *flag) {
     atomic_fetch_add(&g_nskip, 1);
@@ -433,6 +444,14 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
                 if (b[i].kind == NVN_SB_SUPPORT || b[i].kind == NVN_SB_DRV0 || b[i].kind == NVN_SB_DRV2) {
                     bi[nw] = driver_buffer(c, (int)b[i].kind, si, vw, vh);
                     wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nw]};
+                    nw++; continue;
+                }
+                if (b[i].kind == NVN_SB_SBUF && b[i].reg < 16) {
+                    const p_bind_buf *u = &S.ssbo[si][b[i].reg];
+                    VkBuffer sbuf; VkDeviceSize soff;
+                    if (u->addr && u->size && nvn_vk_pool_buffer(u->addr, u->size, &sbuf, &soff)) bi[nw] = (VkDescriptorBufferInfo){sbuf, soff, u->size};
+                    else bi[nw] = (VkDescriptorBufferInfo){zero_storage(c), 0, 4096};
+                    wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[nw]};
                     nw++; continue;
                 }
                 if (b[i].kind != NVN_SB_CBUF || b[i].reg >= 16) continue;

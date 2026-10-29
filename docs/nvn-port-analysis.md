@@ -208,3 +208,13 @@ storage buffers, images, geometry helpers.
 An unregistered texture or sampler id now reads as an empty slot, as on the hardware: a 1x1 texture of zeros of the type the shader samples (1D, 2D, 3D, cube, and arrays of them; made on first
 use, cleared to zero) through a nearest-filter sampler. Shadow samplers have no stand-in (a draw that needs one is skipped). The library accepts those types for combined textures; multisampled
 ones and buffer textures still set `needs`. Stage fourteen of the draw test checks the zeros.
+
+## Storage buffers
+
+A shader that reads or writes global memory through an address kept in the driver segment c[0] (the NVN convention: the stage's table at 0x110 vertex, 0x310 compute, 0x410 geometry,
+0x510 pixel, 0x10 bytes per slot, address then size) comes out of the translator with a storage buffer binding. The reflection gives the table slot (`slot`) and where the address
+is read (`cb_slot`, `cb_offset` in words); `shader_pack.py` accepts the ones inside the stage's table as kind 6 bindings (`reg` = the slot) and leaves `needs` set for an address kept in
+a game uniform buffer. The binding of c[0] itself is not in the reflection when only the storage conversion reads it, so the packer now takes every constant-buffer binding from the
+module's own uniform blocks (`<stage>_c<n>`). The replay keeps the storage buffers bound per stage and slot (`OP_BIND_SSBO`); a draw binds each as a storage buffer descriptor (an unbound slot
+reads zeros) and writes the same addresses and sizes into the c[0] table. Stage fifteen of the draw test loads a float that way.
+Not done yet: the shader's own constant segment c[1], images, the geometry helpers, separate textures and samplers, multisampled and buffer textures, and indexing storage buffers by a game-computed address.

@@ -15,7 +15,9 @@ import json, struct, sys
 from pathlib import Path
 
 STAGE = {'vs': 0, 'ps': 1, 'cs': 5}          # NVN_STAGE_VERTEX, FRAGMENT, COMPUTE
-KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2 = 1, 2, 3, 4, 5
+KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF = 1, 2, 3, 4, 5, 6
+C0_SSBO = {'vs': 0x110, 'cs': 0x310, 'gs': 0x410, 'ps': 0x510}      # the stage's storage buffer table in driver segment c[0] (src/gfx/nvn/dmsh_abi.h): 16 slots of 0x10 bytes
+C0_SSBO_SLOTS = 16
 SAMPLER_TYPES = {1, 3, 4, 5}                 # the translator's SamplerType 1D, 2D, 3D and cube; Array (256) and Shadow (1024) may be added, Multisample (512) and buffers (2) may not
 C2_TEX, C2_SEPTEX = 0x20, 0x168               # byte offsets in driver segment c[2] (src/gfx/nvn/dmsh_abi.h): combined handles, and where the separate textures start
 
@@ -29,6 +31,25 @@ def combined_slot(t):
     if b % 8 or not C2_TEX <= b < C2_SEPTEX: return None
     return (b - C2_TEX) // 8
 NEEDS_C0, NEEDS_C1, NEEDS_C2, NEEDS_SBUF, NEEDS_TEX, NEEDS_IMG, NEEDS_GEOM = 1, 2, 4, 8, 16, 32, 64
+
+
+def uniform_blocks(spirv):
+    """{binding: constant buffer slot} of the translator's uniform blocks, named <stage>_c<slot>. The reflection lists a block only when an instruction read it directly; the driver
+    segment c[0] a storage buffer's address comes from has a binding all the same, which only the module itself shows."""
+    w = struct.unpack(f'<{len(spirv) // 4}I', spirv)
+    names, bindings = {}, {}
+    i = 5
+    while i < len(w):
+        op, n = w[i] & 0xFFFF, w[i] >> 16
+        if n == 0: break
+        if op == 5: names[w[i + 1]] = struct.pack(f'<{n - 2}I', *w[i + 2:i + n]).split(b'\0')[0].decode(errors='replace')
+        elif op == 71 and w[i + 2] == 33: bindings[w[i + 1]] = w[i + 3]
+        i += n
+    out = {}
+    for k, nm in names.items():
+        parts = nm.split('_c')
+        if len(parts) == 2 and parts[0] in ('vp', 'fp', 'cp', 'gp', 'tcp', 'tep') and parts[1].isdigit() and k in bindings: out[bindings[k]] = int(parts[1])
+    return out
 
 
 def support_binding(spirv):
@@ -62,13 +83,23 @@ def entry(key_hex, spirv, res):
     key = bytes.fromhex(key_hex)
     if len(key) != 8: raise ValueError(f'a shader key is 8 bytes, got {key_hex!r}')
     needs, binds = 0, []
-    for cb in res.get('cbufs', []):
-        slot = cb['slot']
-        if slot == 0: binds.append((cb['binding'], KIND_DRV0, 0, 0))
+    for binding, slot in sorted(uniform_blocks(spirv).items()):
+        if slot == 0: binds.append((binding, KIND_DRV0, 0, 0))
         elif slot == 1: needs |= NEEDS_C1
-        elif slot == 2: binds.append((cb['binding'], KIND_DRV2, 0, 0))
-        else: binds.append((cb['binding'], KIND_CBUF, slot - 3, 0))
-    if res.get('sbufs'): needs |= NEEDS_SBUF
+        elif slot == 2: binds.append((binding, KIND_DRV2, 0, 0))
+        else: binds.append((binding, KIND_CBUF, slot - 3, 0))
+    for cb in res.get('cbufs', []):
+        if cb['binding'] not in (b[0] for b in binds):                 # a block the module does not name the usual way
+            slot = cb['slot']
+            if slot == 0: binds.append((cb['binding'], KIND_DRV0, 0, 0))
+            elif slot == 1: needs |= NEEDS_C1
+            elif slot == 2: binds.append((cb['binding'], KIND_DRV2, 0, 0))
+            else: binds.append((cb['binding'], KIND_CBUF, slot - 3, 0))
+    for sb in res.get('sbufs', []):
+        base = C0_SSBO.get(res['stage'])
+        if base is not None and sb['cb_slot'] == 0 and sb.get('cb_offset', 0) * 4 == base + 0x10 * sb['slot'] and sb['slot'] < C0_SSBO_SLOTS:
+            binds.append((sb['binding'], KIND_SBUF, sb['slot'], sb.get('flags', 0)))
+        else: needs |= NEEDS_SBUF                                         # an address kept elsewhere (the game's own uniform buffer)
     for t in res.get('textures', []):
         slot = combined_slot(t)
         if slot is None: needs |= NEEDS_TEX

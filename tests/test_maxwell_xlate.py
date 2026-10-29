@@ -92,6 +92,21 @@ class Translator(unittest.TestCase):
             self.assertEqual(e[k1]['needs'], 0)
             self.assertEqual(e[k2]['binds'], [])                    # declares the support buffer but never reads it
 
+    def test_storage_buffer_is_a_binding_with_its_driver_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            k = make_maxwell_lib.stand_in_key(0xAA, 0x4B)
+            out = make_maxwell_lib.translate(DLL, [{'key': k, 'stage': 'ps', 'code': maxwell_asm.fragment_ssbo(), 'fout': {'0': 'float'}}], d)
+            lib = Path(d) / 'm.nxsl'
+            shader_pack.main(['x', str(lib), str(out)])
+            [e] = shader_pack.unpack(lib.read_bytes())
+            self.assertEqual(e['needs'], 0)
+            self.assertEqual(sorted((b[1], b[2]) for b in e['binds']), [(shader_pack.KIND_DRV0, 0), (shader_pack.KIND_SBUF, 0)])    # c[0] holds the address; slot 0 of the pixel table
+
+    def test_sbuf_outside_the_driver_table_still_needs(self):
+        res = {'stage': 'ps', 'sbufs': [{'binding': 2, 'slot': 0, 'cb_slot': 3, 'cb_offset': 8, 'flags': 0}]}
+        [e] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', res)]))
+        self.assertEqual((e['needs'], e['binds']), (shader_pack.NEEDS_SBUF, []))
+
     def test_stand_in_key_is_stable(self):
         self.assertEqual(len(make_maxwell_lib.stand_in_key()), 16)
         self.assertNotEqual(make_maxwell_lib.stand_in_key(), make_maxwell_lib.stand_in_key(fill_code=0xE6))
