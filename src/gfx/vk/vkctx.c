@@ -76,7 +76,8 @@ int vkctx_create(vkctx_t *c) {
     VkPhysicalDeviceVulkan12Features e12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &e13, .bufferDeviceAddress = 1, .timelineSemaphore = 1,
         .runtimeDescriptorArray = 1, .shaderSampledImageArrayNonUniformIndexing = f12.shaderSampledImageArrayNonUniformIndexing,
         .descriptorBindingPartiallyBound = 1, .descriptorBindingSampledImageUpdateAfterBind = 1, .descriptorBindingUpdateUnusedWhilePending = f12.descriptorBindingUpdateUnusedWhilePending,
-        .descriptorBindingVariableDescriptorCount = f12.descriptorBindingVariableDescriptorCount, .descriptorIndexing = 1, .scalarBlockLayout = f12.scalarBlockLayout};
+        .descriptorBindingVariableDescriptorCount = f12.descriptorBindingVariableDescriptorCount, .descriptorIndexing = 1, .scalarBlockLayout = f12.scalarBlockLayout,
+        .samplerMirrorClampToEdge = f12.samplerMirrorClampToEdge};
     VkPhysicalDeviceFeatures ef = {.geometryShader = f->geometryShader, .tessellationShader = f->tessellationShader, .dualSrcBlend = f->dualSrcBlend,
         .independentBlend = f->independentBlend, .shaderInt64 = f->shaderInt64, .shaderFloat64 = f->shaderFloat64, .shaderImageGatherExtended = f->shaderImageGatherExtended,
         .shaderStorageImageReadWithoutFormat = f->shaderStorageImageReadWithoutFormat, .samplerAnisotropy = f->samplerAnisotropy,

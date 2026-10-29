@@ -34,6 +34,7 @@ typedef struct vktex {
     uint32_t nsub;                                             // subresources per level: the layers, or 1 for a 3D texture
     uint8_t *st;                                               // levels * nsub bytes of F_DIRTY | F_GPU, accessed atomically
     struct { VkFormat fmt; unsigned level, layer0, n; VkImageView v; } views[16]; int nviews;   // attachment views made so far; touched by the submit thread only
+    struct { VkFormat fmt; uint32_t l0, nl, a0, na; int vtype; uint32_t swz; VkImageView v; } svs[8]; int nsvs;   // sampling views, the same way
 } vktex_t;
 enum { F_DIRTY = 1, F_GPU = 2 };
 #define SUB(e, lv, ly) ((e)->st[(size_t)(lv) * (e)->nsub + (ly)])
@@ -114,6 +115,7 @@ void mtl_tex_release(tex_t *t) {
             vktex_t *e = *p; *p = e->next;
             pthread_mutex_unlock(&g_mu);
             for (int i = 0; i < e->nviews; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->views[i].v, VK_NULL_HANDLE);
+            for (int i = 0; i < e->nsvs; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->svs[i].v, VK_NULL_HANDLE);
             if (e->img) nvn_vk_defer_image(e->img, VK_NULL_HANDLE, e->vmem);           // a submission in flight may still use it
             free(e->st); free(e);
             return;
@@ -423,5 +425,72 @@ int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach
     if (!iv) return 0;
     mark_gpu(e, level, layer0, n);
     *out = (nvn_attach){iv, vf, area.extent.width, area.extent.height, n, e->aspect};
+    return 1;
+}
+
+// ---- sampling
+// NVN's texture target -> the Vulkan view type and the translator's SamplerType (nvn_shbind.aux: 1 1D, 3 2D, 4 3D, 5 cube, +256 for an array)
+static int sample_type(unsigned target, VkImageViewType *vt, int *code, int *fixed_layers) {
+    *fixed_layers = 1;
+    switch (target) {
+    case NVN_TEXTURE_TARGET_1D: *vt = VK_IMAGE_VIEW_TYPE_1D; *code = 1; return 1;
+    case NVN_TEXTURE_TARGET_2D: case NVN_TEXTURE_TARGET_RECTANGLE: *vt = VK_IMAGE_VIEW_TYPE_2D; *code = 3; return 1;
+    case NVN_TEXTURE_TARGET_3D: *vt = VK_IMAGE_VIEW_TYPE_3D; *code = 4; return 1;
+    case NVN_TEXTURE_TARGET_1D_ARRAY: *vt = VK_IMAGE_VIEW_TYPE_1D_ARRAY; *code = 1 | 256; *fixed_layers = 0; return 1;
+    case NVN_TEXTURE_TARGET_2D_ARRAY: *vt = VK_IMAGE_VIEW_TYPE_2D_ARRAY; *code = 3 | 256; *fixed_layers = 0; return 1;
+    case NVN_TEXTURE_TARGET_CUBEMAP: *vt = VK_IMAGE_VIEW_TYPE_CUBE; *code = 5; *fixed_layers = 6; return 1;
+    case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: *vt = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY; *code = 5 | 256; *fixed_layers = 0; return 1;
+    default: return 0;
+    }
+}
+// A texture's swizzle (NVN: 0 zero 1 one 2 R 3 G 4 B 5 A) laid over the one its format implies
+static VkComponentSwizzle swz_compose(unsigned user, const VkComponentSwizzle fmt[4]) {
+    if (user == 0) return VK_COMPONENT_SWIZZLE_ZERO;
+    if (user == 1) return VK_COMPONENT_SWIZZLE_ONE;
+    unsigned c = user - 2 > 3 ? 0 : user - 2;
+    return fmt[c] == VK_COMPONENT_SWIZZLE_IDENTITY ? (VkComponentSwizzle)(VK_COMPONENT_SWIZZLE_R + c) : fmt[c];
+}
+
+// A sampling view of a texture for the draw being prepared: the registered view's levels, layers, format and swizzle on the texture's own target. Fills the image from its storage first
+// when that is dirty, which ends the render pass (a copy cannot happen inside one), so the caller opens the pass after calling this. *code is the SamplerType the view presents.
+int nvn_vk_tex_sampled(uint64_t serial, const view_t *v, int has_view, int tex_set_swz, unsigned tex_swz, VkImageView *out, int *code) {
+    static int bad;
+    vkctx_t *c = nvn_vk_ctx();
+    vktex_t *e = find(serial);
+    if (!c || !e || !e->ok) return 0;
+    int dirty = !e->inited;
+    for (size_t i = 0; i < (size_t)e->levels * e->nsub && !dirty; i++) dirty = (__atomic_load_n(&e->st[i], __ATOMIC_ACQUIRE) & F_DIRTY) != 0;
+    if (dirty) { VkCommandBuffer cb = nvn_vk_cmd(); if (!cb || !use(e, c, cb)) return 0; }
+    unsigned target = has_view && v->set_target ? v->target : e->d.target;
+    VkImageViewType vt; int fixed;
+    if (!sample_type(target, &vt, code, &fixed)) { red_once(&bad, "this texture target cannot be sampled yet", e->d.format); return 0; }
+    uint32_t l0 = has_view && v->set_levels ? v->base_level : 0, nl = has_view && v->set_levels && v->nlevels ? v->nlevels : e->levels - l0;
+    uint32_t a0 = has_view && v->set_layers ? v->min_layer : 0, na = fixed ? (uint32_t)fixed : has_view && v->set_layers && v->nlayers ? v->nlayers : e->layers - a0;
+    if (e->is3d) { a0 = 0; na = 1; }
+    if (l0 >= e->levels) return 0;
+    if (l0 + nl > e->levels) nl = e->levels - l0;
+    if (a0 + na > (e->is3d ? 1u : e->layers)) { red_once(&bad, "a texture view names layers the texture does not have", e->d.format); return 0; }
+    VkFormat fmt = e->fmt; VkComponentSwizzle fs[4] = {0, 0, 0, 0};
+    if (has_view && v->set_format) { VkFormat vf; VkComponentSwizzle s4[4] = {0, 0, 0, 0}; if (nvn_fmt_to_vk(v->format, &vf, s4) && vf != VK_FORMAT_UNDEFINED) { fmt = vf; memcpy(fs, s4, sizeof fs); } }
+    else nvn_fmt_to_vk(e->d.format, &fmt, fs);
+    unsigned user[4] = {2, 3, 4, 5}; int set = 0;
+    if (has_view && v->set_swizzle) { for (int i = 0; i < 4; i++) user[i] = v->swz[i]; set = 1; }
+    else if (tex_set_swz) { for (int i = 0; i < 4; i++) user[i] = (tex_swz >> (3 * i)) & 7; set = 1; }
+    VkComponentMapping cm = {fs[0], fs[1], fs[2], fs[3]};
+    if (set) cm = (VkComponentMapping){swz_compose(user[0], fs), swz_compose(user[1], fs), swz_compose(user[2], fs), swz_compose(user[3], fs)};
+    uint32_t key = cm.r | cm.g << 4 | cm.b << 8 | cm.a << 12;
+    for (int i = 0; i < e->nsvs; i++) {
+        typeof(e->svs[0]) *s = &e->svs[i];
+        if (s->fmt == fmt && s->l0 == l0 && s->nl == nl && s->a0 == a0 && s->na == na && s->vtype == (int)vt && s->swz == key) { *out = s->v; return 1; }
+    }
+    VkImageAspectFlags asp = (e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : e->aspect;
+    VkImageViewUsageCreateInfo vu = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_SAMPLED_BIT};
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &vu, .image = e->img, .viewType = vt, .format = fmt, .components = cm,
+        .subresourceRange = {asp, l0, nl, a0, na}};
+    VkImageView iv;
+    if (vkCreateImageView(c->dev, &vi, NULL, &iv)) { red_once(&bad, "no sampling view for the texture", e->d.format); return 0; }
+    if (e->nsvs == 8) { nvn_vk_defer_image(VK_NULL_HANDLE, e->svs[0].v, VK_NULL_HANDLE); memmove(&e->svs[0], &e->svs[1], 7 * sizeof e->svs[0]); e->nsvs--; }
+    e->svs[e->nsvs++] = (typeof(e->svs[0])){fmt, l0, nl, a0, na, (int)vt, key, iv};
+    *out = iv;
     return 1;
 }

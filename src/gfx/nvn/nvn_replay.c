@@ -90,7 +90,7 @@ void mtl_exec(const uint8_t *p) {
         case OP_SCISSOR: { const p_scissor *sc = (const p_scissor *)a; g_sc.has = 1; g_sc.r[0] = sc->x; g_sc.r[1] = sc->y; g_sc.r[2] = sc->w; g_sc.r[3] = sc->h; break; }
         case OP_DRAW: { p_draw t; nvn_draw(draw_rec(a, h.size, &t)); break; }
         case OP_DRAW_IDX: { p_draw_idx t; nvn_draw_idx(draw_idx_rec(a, h.size, &t)); break; }
-        case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_UBO: case OP_BIND_UBO_SMALL:
+        case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_TEX: case OP_BIND_TEX1:
         case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_STENCIL: case OP_PRIM_RESTART: case OP_RAST_DISCARD:
             nvn_draw_state_op(h.op, a); break;
         case OP_CLEAR_COLOR: {

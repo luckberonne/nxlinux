@@ -53,6 +53,14 @@ def fadd(rd, ra, rb):
     return (0b0101110001011 << 51) | ((rb & 0xFF) << 20) | (PT << 16) | ((ra & 0xFF) << 8) | (rd & 0xFF)
 
 
+def tex(rd, ra, slot, dim=2, lod=1):
+    """TEX Rd.., Ra.., (texture slot): samples a combined texture, the coordinates in Ra, Ra+1 (...), all four components out to Rd..Rd+3 (5 bits 11000; the texture
+    handle word index in bits 36-48: driver segment c[2] holds combined handles from byte 0x20, 8 bytes per slot; component mask bits 31-34; dimension bits 28-30
+    (2 = 2D); level of detail mode bits 55-57, 1 = LZ: the base level)."""
+    tid = (0x20 + 8 * slot) // 4
+    return (0b11000 << 59) | ((lod & 7) << 55) | (tid << 36) | (0xF << 31) | ((dim & 7) << 28) | (255 << 20) | (PT << 16) | ((ra & 0xFF) << 8) | (rd & 0xFF)
+
+
 def f32(x):
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
@@ -100,6 +108,11 @@ def vertex_shifted(slot=3):
 def fragment_varying():
     """A fragment shader that writes generic input 0, perspective-interpolated, to target 0"""
     return program([ipa(0, 0x80), ipa(1, 0x84), ipa(2, 0x88), ipa(3, 0x8C), exit_()], sph(FRAGMENT, omap_targets=0xF, imap=[0xAA]))
+
+
+def fragment_textured(slot=0):
+    """A fragment shader that samples texture `slot` at the coordinates in generic input 0 (x, y) and writes it to target 0"""
+    return program([ipa(4, 0x80), ipa(5, 0x84), tex(0, 4, slot), exit_()], sph(FRAGMENT, omap_targets=0xF, imap=[0xAA]))
 
 
 if __name__ == '__main__':

@@ -171,3 +171,16 @@ DrawParameters (the device now enables `shaderDrawParameters`), and its `gl_PerV
 Stage eleven: `maxwell_asm.vertex_shifted()` reads the vertex uniform buffer with LDC from constant buffer 3 (NVN uniform slot 0) and adds it to the position, as stage F does with
 GLSL. The translator gives the buffer binding 1; binding 0 is its `support_buffer` (render scale, viewport size, y negate), which these shaders declare but never read.
 A shader that does read it (fragment coordinates, y flipped framebuffers) needs that buffer bound: not done yet, and `needs` does not flag it.
+
+## Sampled textures
+
+Stage twelve of the draw test samples a texture from a translated fragment shader (`maxwell_asm.fragment_textured()`: IPA of the coordinates, then TEX). What it took:
+- `nvn_desc_vk.c` keeps what the game registers into its pools by the host-table id (`mtl_reg_tex`: the texture's serial, the view and swizzle it asked for; `mtl_reg_samp`: the
+  sampler state) and turns a bound handle (texture id | sampler id << 20) into a `VkDescriptorImageInfo`. Samplers are made lazily from the NVN state (filters, wrap modes,
+  compare, anisotropy, LOD range; plain NEAREST / LINEAR clamp the LOD to the base level, as GL does; custom border colours are approximated by the three Vulkan presets).
+- `nvn_vk_tex_sampled` (nvn_tex_vk.c) makes the sampling view: the registered levels, layers, format and swizzle on the texture's own target, cached per texture. A dirty texture is
+  filled from its storage first, which ends the render pass, so `prepare()` resolves textures before it opens the pass.
+- The replay stores `OP_BIND_TEX` / `OP_BIND_TEX1` handles per stage and slot (a deferred bind is read when it runs); a shader's texture binding names its c[2] slot.
+- The shader library is version 2: a binding carries `aux`, the translator's SamplerType, so a draw refuses a texture of another type. `shader_pack.py` turns plain 2D textures read
+  through a combined handle into bindings; separate textures, arrays, cube maps, shadow samplers and bindless handles still set `needs`.
+A texture slot that is bound to an unregistered id skips the draw with a red line (nxnative reads zeros there; a dummy texture is still to do).

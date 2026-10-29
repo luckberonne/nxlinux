@@ -26,13 +26,22 @@ class Assembler(unittest.TestCase):
 
 class Packer(unittest.TestCase):
     def test_needs_and_bindings(self):
-        res = {'stage': 'ps', 'cbufs': [{'binding': 0, 'slot': 0}, {'binding': 1, 'slot': 3}, {'binding': 2, 'slot': 5}], 'textures': [{}], 'sbufs': [], 'images': []}
+        res = {'stage': 'ps', 'cbufs': [{'binding': 0, 'slot': 0}, {'binding': 1, 'slot': 3}, {'binding': 2, 'slot': 5}], 'textures': [{'binding': 3, 'type': 5, 'handle': 8, 'cbuf_slot': 2, 'array': 1, 'separate': False}], 'sbufs': [], 'images': []}
         lib = shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\x03\x02\x23\x07' * 2, res)])
         [e] = shader_pack.unpack(lib)
         self.assertEqual(e['key'], '0123456789abcdef')
         self.assertEqual(e['stage'], 1)
-        self.assertEqual(e['needs'], shader_pack.NEEDS_C0 | shader_pack.NEEDS_TEX)
-        self.assertEqual(e['binds'], [(1, shader_pack.KIND_CBUF, 0), (2, shader_pack.KIND_CBUF, 2)])        # c[3 + reg]
+        self.assertEqual(e['needs'], shader_pack.NEEDS_C0 | shader_pack.NEEDS_TEX)         # a cube map: not bindable yet
+        self.assertEqual(e['binds'], [(1, shader_pack.KIND_CBUF, 0, 0), (2, shader_pack.KIND_CBUF, 2, 0)])        # c[3 + reg]
+
+    def test_combined_2d_texture_is_a_binding(self):
+        t = {'binding': 2, 'type': 3, 'handle': 8 + 4, 'cbuf_slot': 2, 'array': 1, 'separate': False}       # word 12 = byte 0x30 = c2 slot 2
+        res = {'stage': 'ps', 'cbufs': [], 'textures': [t]}
+        [e] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', res)]))
+        self.assertEqual((e['needs'], e['binds']), (0, [(2, shader_pack.KIND_TEX, 2, 3)]))
+        for bad in ({'separate': True}, {'cbuf_slot': 3}, {'handle': 8 + (1 << 28)}, {'handle': 9}, {'array': 4}, {'type': 3 | 256}):
+            [x] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', {'stage': 'ps', 'textures': [{**t, **bad}]})]))
+            self.assertEqual((x['needs'], x['binds']), (shader_pack.NEEDS_TEX, []))
 
     def test_bad_input(self):
         with self.assertRaises(ValueError): shader_pack.entry('00', b'\0\0\0\0', {'stage': 'ps'})

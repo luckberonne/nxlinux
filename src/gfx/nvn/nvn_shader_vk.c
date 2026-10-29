@@ -67,17 +67,17 @@ int nvn_vk_shader_load_library(const char *path) {
     uint32_t ver, cnt;
     if (n < 12 || memcmp(d, "NXSL", 4)) { fprintf(stderr, "[dm] [RED] [nvn] %s is not a shader library\n", path); goto done; }
     memcpy(&ver, d + 4, 4); memcpy(&cnt, d + 8, 4);
-    if (ver != 1) { fprintf(stderr, "[dm] [RED] [nvn] shader library %s has version %u, expected 1\n", path, ver); goto done; }
+    if (ver != 2) { fprintf(stderr, "[dm] [RED] [nvn] shader library %s has version %u, expected 2\n", path, ver); goto done; }
     size_t off = 12; count = 0;
     for (uint32_t i = 0; i < cnt; i++) {
         uint32_t h[4];
         if (off + 24 > (size_t)n) { fprintf(stderr, "[dm] [RED] [nvn] shader library %s is cut short\n", path); count = -1; goto done; }
         const uint8_t *key = d + off; memcpy(h, d + off + 8, 16); off += 24;
         uint32_t stage = h[0], needs = h[1], nb = h[2], nbytes = h[3];
-        if (nb > 256 || (size_t)nb * 12 + nbytes > (size_t)n - off || (nbytes & 3)) { fprintf(stderr, "[dm] [RED] [nvn] shader library %s: entry %u is damaged\n", path, i); count = -1; goto done; }
+        if (nb > 256 || (size_t)nb * 16 + nbytes > (size_t)n - off || (nbytes & 3)) { fprintf(stderr, "[dm] [RED] [nvn] shader library %s: entry %u is damaged\n", path, i); count = -1; goto done; }
         nvn_shbind *binds = malloc((nb ? nb : 1) * sizeof *binds);
-        for (uint32_t b = 0; b < nb; b++) memcpy(&binds[b], d + off + 12 * b, 12);
-        off += (size_t)nb * 12;
+        for (uint32_t b = 0; b < nb; b++) memcpy(&binds[b], d + off + 16 * b, 16);
+        off += (size_t)nb * 16;
         uint32_t *code = malloc(nbytes); memcpy(code, d + off, nbytes); off += nbytes;
         nvn_shader_desc desc = {(int)stage, needs, code, nbytes, binds, (int)nb};
         nvn_vk_shader_register(key, &desc);

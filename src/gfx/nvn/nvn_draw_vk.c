@@ -33,12 +33,14 @@ uint64_t nvn_draw_skipped(void) { return atomic_load(&g_nskip); }
 uint64_t nvn_pipeline_count(void) { return atomic_load(&g_npipe); }
 
 // ---- state
+enum { NTEXSLOT = 256 };                        // DMSH_C2_TEX_SLOTS combined slots, then the separate textures from NVN_SEPTEX_SLOT0
 static struct {
     int init;
     const prog_t *prog; int nkeys; uint8_t keys[6][8];
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
     uint32_t attr[16]; int nattr; vs_st stream[16]; int nstream; NVNbufferRange vbuf[16];
     p_bind_buf ubo[6][16];
+    uint32_t tex[6][NTEXSLOT];                  // the combined handle (texture id | sampler id << 20) bound to each texture slot of each stage
     float vp[16][6]; int has_vp; float dr[2]; int has_dr; p_poly_offset po; float blend_color[4];
     int st_vmask[2], st_wmask[2], st_ref[2];
     int depth_clamp, rast_discard; p_prim_restart restart;
@@ -86,6 +88,15 @@ int nvn_draw_state_op(uint32_t op, const void *a) {
     case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) S.stream[b->first + i] = b->st[i]; S.nstream = b->first + b->n > 16 ? 16 : b->first + b->n; return 1; }
     case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf tmp; const p_bind_vbuf *b = vbuf_rec(op, a, &tmp); for (int i = 0; i < b->n && b->first + i < 16; i++) S.vbuf[b->first + i] = b->r[i]; return 1; }
     case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tmp; const p_bind_buf *b = bind_buf_rec(op, a, &tmp); if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) S.ubo[b->stage][b->index] = *b; return 1; }
+    case OP_BIND_TEX: case OP_BIND_TEX1: {
+        p_bind_handles tmp; const p_bind_handles *b = bind_rec(op, a, &tmp);
+        for (int i = 0; i < b->n; i++) {
+            uint64_t h = b->h[i];
+            if (op == OP_BIND_TEX && b->defer && b->src) h = ((const uint64_t *)(uintptr_t)b->src)[i];     // BindTexturesDeferred: the handle is read when the command runs
+            int slot = b->first + i;
+            if (b->stage >= 0 && b->stage < 6 && slot >= 0 && slot < NTEXSLOT) S.tex[b->stage][slot] = (uint32_t)h;
+        }
+        return 1; }
     case OP_VIEWPORTS: { const p_viewports *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) memcpy(S.vp[b->first + i], b->v[i], sizeof S.vp[0]); S.has_vp = 1; return 1; }
     case OP_DEPTH_RANGE: { const p_depth_range *b = a; S.dr[0] = b->n; S.dr[1] = b->f; S.has_dr = 1; return 1; }
     case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)a)->on; return 1;
@@ -165,7 +176,7 @@ static VkPipelineLayout make_layout(vkctx_t *c, const pkey *k, VkDescriptorSetLa
         for (int i = 0; i < n; i++) {
             VkShaderStageFlags st = si ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
             int j = 0; for (; j < nb; j++) if (lb[j].binding == b[i].binding) break;
-            if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL}; }
+            if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].kind == NVN_SB_TEX ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL}; }
             lb[j].stageFlags |= st;
         }
     }
@@ -277,7 +288,7 @@ static void skip(const char *why, int *flag) {
 
 // Everything shared by the plain and the indexed draw: the pipeline, the pass, the dynamic state, the vertex buffers and the uniforms. 0 when the draw cannot be made.
 static int prepare(unsigned prim, pipe_entry **pe_out) {
-    static int f_needs, f_noprog, f_noshader, f_prim, f_vbuf, f_vattr, f_nort, f_pipe, f_fmt, f_off;
+    static int f_ntex, f_tex, f_needs, f_noprog, f_noshader, f_prim, f_vbuf, f_vattr, f_nort, f_pipe, f_fmt, f_off;
     state_init();
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd_raw();
     if (!c || !cb) return 0;
@@ -298,6 +309,26 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
         snprintf(why, sizeof why, "the shader needs%s%s%s%s%s%s%s (not supported yet)", n & NVN_NEED_C0 ? " driver segment c0," : "", n & NVN_NEED_C1 ? " constant segment c1," : "",
                  n & NVN_NEED_C2 ? " driver segment c2," : "", n & NVN_NEED_SBUF ? " storage buffers," : "", n & NVN_NEED_TEX ? " textures," : "", n & NVN_NEED_IMG ? " images," : "", n & NVN_NEED_GEOM ? " geometry helper buffers," : "");
         skip(why, &f_needs); return 0;
+    }
+    // Textures first: filling a dirty one copies into its image, which cannot happen inside a render pass (this ends the pass; it is opened below)
+    VkDescriptorImageInfo ti[16]; uint32_t tbind[16]; int nt = 0;
+    {
+        const nvn_shader *sh[2] = {vs, fs};
+        for (int si = 0; si < 2; si++) {
+            int n; const nvn_shbind *b = nvn_shader_binds(sh[si], &n);
+            for (int i = 0; i < n; i++) {
+                if (b[i].kind != NVN_SB_TEX) continue;
+                if (b[i].reg >= NTEXSLOT || nt == 16) { skip("a shader samples more textures than the draw path binds", &f_ntex); return 0; }
+                int r = nvn_vk_desc_sampled(S.tex[si][b[i].reg], (int)b[i].aux, &ti[nt]);
+                if (r != 1) {
+                    char why[160]; uint32_t h = S.tex[si][b[i].reg];
+                    snprintf(why, sizeof why, r == 2 ? "texture slot %u of a shader is bound with sampler %u, which is not registered" : r == 3 ? "texture slot %u (id %u) is not the type the shader samples" : "texture slot %u of a shader is bound to texture id %u, which is not registered or has no image",
+                             b[i].reg, r == 2 ? h >> 20 : h & 0xfffff);
+                    skip(why, &f_tex); return 0;
+                }
+                tbind[nt++] = b[i].binding;
+            }
+        }
     }
     VkPrimitiveTopology topo;
     if (!topology(prim, &topo, c->enabled.geometryShader)) { skip("this primitive type needs an index list built for it", &f_prim); return 0; }
@@ -384,6 +415,8 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
                 nw++;
             }
         }
+        for (int i = 0; i < nt && nw < 32; i++)
+            wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = tbind[i], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ti[i]};
         if (nw) c->CmdPushDescriptorSet(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pe->layout, 0, (uint32_t)nw, wr);
     }
     *pe_out = pe;

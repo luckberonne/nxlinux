@@ -1,6 +1,6 @@
 // Guest program for tests/test_nvn_draw.cpp: draws through the NVN API, as a game does. The host registers SPIR-V for the two shaders the program names.
 // The shader "code" is a few bytes in the memory pool and the control section a block in .bss; the host fills both in before the program runs and computes the
-// key the way hle_nvn.c does. Eleven stages, each checking one thing; the results go to g_res[].
+// key the way hle_nvn.c does. Twelve stages, each checking one thing; the results go to g_res[].
 #include "nvn_protos.h"
 
 typedef unsigned long u64;
@@ -16,7 +16,10 @@ extern void *nvnBootstrapLoader(const char *name);
     X(nvnCommandBufferBindProgram) X(nvnCommandBufferBindBlendState) X(nvnCommandBufferBindColorState) X(nvnCommandBufferBindChannelMaskState) \
     X(nvnCommandBufferBindMultisampleState) X(nvnCommandBufferBindPolygonState) X(nvnCommandBufferBindDepthStencilState) \
     X(nvnCommandBufferBindVertexAttribState) X(nvnCommandBufferBindVertexStreamState) X(nvnCommandBufferBindVertexBuffer) X(nvnCommandBufferBindUniformBuffer) \
-    X(nvnCommandBufferDrawArrays) X(nvnCommandBufferDrawElements) X(nvnCommandBufferCopyTextureToBuffer) \
+    X(nvnCommandBufferDrawArrays) X(nvnCommandBufferDrawElements) X(nvnCommandBufferCopyTextureToBuffer) X(nvnCommandBufferCopyBufferToTexture) \
+    X(nvnTexturePoolInitialize) X(nvnTexturePoolRegisterTexture) X(nvnSamplerPoolInitialize) X(nvnSamplerPoolRegisterSampler) X(nvnSamplerBuilderSetDevice) X(nvnSamplerBuilderSetDefaults) \
+    X(nvnSamplerBuilderSetMinMagFilter) X(nvnSamplerBuilderSetWrapMode) X(nvnSamplerInitialize) X(nvnDeviceGetTextureHandle) X(nvnCommandBufferSetTexturePool) X(nvnCommandBufferSetSamplerPool) \
+    X(nvnCommandBufferBindTexture) \
     X(nvnTextureBuilderSetDevice) X(nvnTextureBuilderSetDefaults) X(nvnTextureBuilderSetTarget) X(nvnTextureBuilderSetSize2D) X(nvnTextureBuilderSetFormat) \
     X(nvnTextureBuilderSetLevels) X(nvnTextureBuilderSetStorage) X(nvnTextureInitialize) \
     X(nvnProgramInitialize) X(nvnProgramSetShaders) \
@@ -30,7 +33,7 @@ extern void *nvnBootstrapLoader(const char *name);
 FUNCS(DECL)
 
 u64 g_res[64];
-char g_vs_control[0x880] __attribute__((aligned(16))), g_fs_control[0x880] __attribute__((aligned(16))), g_x_control[0x880] __attribute__((aligned(16))), g_t_control[0x880] __attribute__((aligned(16))), g_v2_control[0x880] __attribute__((aligned(16))), g_p2_control[0x880] __attribute__((aligned(16))), g_v3_control[0x880] __attribute__((aligned(16)));   /* g_x: a shader nobody registered; g_t: the translated Maxwell one */
+char g_vs_control[0x880] __attribute__((aligned(16))), g_fs_control[0x880] __attribute__((aligned(16))), g_x_control[0x880] __attribute__((aligned(16))), g_t_control[0x880] __attribute__((aligned(16))), g_v2_control[0x880] __attribute__((aligned(16))), g_p2_control[0x880] __attribute__((aligned(16))), g_v3_control[0x880] __attribute__((aligned(16))), g_p3_control[0x880] __attribute__((aligned(16)));   /* g_x: a shader nobody registered; g_t: the translated Maxwell one */
 char g_poolmem[0x100000] __attribute__((aligned(0x10000)));          // exported: the host writes the shader code into it before the program runs
 static NVNdevice g_dev __attribute__((aligned(64))); static NVNdeviceBuilder g_dev_b __attribute__((aligned(64)));
 static NVNmemoryPool g_pool __attribute__((aligned(64))); static NVNmemoryPoolBuilder g_pool_b __attribute__((aligned(64)));
@@ -38,7 +41,9 @@ static NVNqueue g_queue __attribute__((aligned(64))); static NVNqueueBuilder g_q
 static NVNcommandBuffer g_cb __attribute__((aligned(64)));
 static NVNtexture g_rt __attribute__((aligned(64))), g_depth __attribute__((aligned(64)));
 static NVNtextureBuilder g_tb __attribute__((aligned(64)));
-static NVNprogram g_prog __attribute__((aligned(64))), g_prog_x __attribute__((aligned(64))), g_prog_t __attribute__((aligned(64))), g_prog_j __attribute__((aligned(64))), g_prog_k __attribute__((aligned(64)));
+static NVNprogram g_prog __attribute__((aligned(64))), g_prog_x __attribute__((aligned(64))), g_prog_t __attribute__((aligned(64))), g_prog_j __attribute__((aligned(64))), g_prog_k __attribute__((aligned(64))), g_prog_l __attribute__((aligned(64)));
+static NVNtexture g_tex __attribute__((aligned(64))); static NVNtexturePool g_tpool __attribute__((aligned(64))); static NVNsamplerPool g_spool __attribute__((aligned(64)));
+static NVNsampler g_samp __attribute__((aligned(64))); static NVNsamplerBuilder g_sb __attribute__((aligned(64)));
 static NVNblendState g_blend __attribute__((aligned(16))); static NVNcolorState g_color __attribute__((aligned(16)));
 static NVNchannelMaskState g_mask __attribute__((aligned(16))); static NVNmultisampleState g_ms __attribute__((aligned(16)));
 static NVNpolygonState g_poly __attribute__((aligned(16))); static NVNdepthStencilState g_ds __attribute__((aligned(16)));
@@ -57,7 +62,11 @@ static void exit_thread(void) { register u64 x0 __asm__("x0"); __asm__ volatile(
 #define IDX 0x20600       /* 16-bit indices */
 #define OUT_COLOR 0xA0000
 #define OUT_DEPTH 0xA8000
-enum { LEFT_RED = 0, RIGHT_GREEN_CW = 3, LEFT_GREEN_HALF = 6, LEFT_WHITE = 9, LEFT_GREEN = 12 };   /* first vertex of each triangle */
+#define TEX_STORE 0xB0000    /* the 2x1 texture's storage */
+#define TEX_SRC 0xB8000      /* its texels, uploaded with a buffer-to-texture copy */
+#define TPOOL 0xC0000        /* descriptor pools */
+#define SPOOL 0xC8000
+enum { LEFT_RED = 0, RIGHT_GREEN_CW = 3, LEFT_GREEN_HALF = 6, LEFT_WHITE = 9, LEFT_GREEN = 12, UV_TRI = 15 };   /* first vertex of each triangle */
 
 static void tri(V *v, float x0, float y0, float x1, float y1, float x2, float y2, float r, float g, float b, float a) {
     v[0] = (V){x0, y0, r, g, b, a}; v[1] = (V){x1, y1, r, g, b, a}; v[2] = (V){x2, y2, r, g, b, a};
@@ -80,7 +89,7 @@ static void bind_all(int vs_ubo, int fs_ubo) {
     nvnCommandBufferBindBlendState(&g_cb, &g_blend); nvnCommandBufferBindColorState(&g_cb, &g_color); nvnCommandBufferBindChannelMaskState(&g_cb, &g_mask);
     nvnCommandBufferBindMultisampleState(&g_cb, &g_ms); nvnCommandBufferBindPolygonState(&g_cb, &g_poly); nvnCommandBufferBindDepthStencilState(&g_cb, &g_ds);
     nvnCommandBufferBindVertexAttribState(&g_cb, 2, g_attr); nvnCommandBufferBindVertexStreamState(&g_cb, 1, &g_stream);
-    nvnCommandBufferBindVertexBuffer(&g_cb, 0, POOL(VTX), 15 * sizeof(V));
+    nvnCommandBufferBindVertexBuffer(&g_cb, 0, POOL(VTX), 18 * sizeof(V));
     nvnCommandBufferBindUniformBuffer(&g_cb, NVN_SHADER_STAGE_VERTEX, 0, POOL(vs_ubo), 16);
     nvnCommandBufferBindUniformBuffer(&g_cb, NVN_SHADER_STAGE_FRAGMENT, 0, POOL(fs_ubo), 16);
 }
@@ -228,6 +237,33 @@ void guest_main(u64 arg) {
     begin(); target(blue, 0); bind_all(UBO_VS_SHIFT, UBO_FS_WHITE); nvnCommandBufferBindProgram(&g_cb, &g_prog_k, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
     nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, LEFT_GREEN, 3); copy_out(0); submit();
     g_res[16] = okk && is(33, LY, 0, 255, 0, 1) && is(LX, LY, 0, 0, 255, 1);
+
+    // ---- L: a translated fragment shader that samples a texture. A 2x1 texture (red, green) is uploaded, registered in a texture pool with a nearest-filter sampler and bound to
+    //      slot 0; a triangle covering the screen carries u = (x + 1) / 2 in the colour attribute, so the left half of the target samples red and the right half green
+    {
+        V *uv = (V *)(g_poolmem + VTX) + UV_TRI;
+        uv[0] = (V){-1, -1, 0, 0.5f, 0, 1}; uv[1] = (V){3, -1, 2, 0.5f, 0, 1}; uv[2] = (V){-1, 3, 0, 0.5f, 0, 1};
+        volatile unsigned char *src = (volatile unsigned char *)(g_poolmem + TEX_SRC);
+        src[0] = 255; src[1] = 0; src[2] = 0; src[3] = 255; src[4] = 0; src[5] = 255; src[6] = 0; src[7] = 255;
+        nvnTextureBuilderSetSize2D(&g_tb, 2, 1); nvnTextureBuilderSetFormat(&g_tb, NVN_FORMAT_RGBA8); nvnTextureBuilderSetStorage(&g_tb, &g_pool, TEX_STORE);
+        int okl = nvnTextureInitialize(&g_tex, &g_tb) & 0xFF;
+        okl &= nvnTexturePoolInitialize(&g_tpool, &g_pool, TPOOL, 256) & 0xFF; okl &= nvnSamplerPoolInitialize(&g_spool, &g_pool, SPOOL, 256) & 0xFF;
+        nvnSamplerBuilderSetDevice(&g_sb, &g_dev); nvnSamplerBuilderSetDefaults(&g_sb);
+        nvnSamplerBuilderSetMinMagFilter(&g_sb, NVN_MIN_FILTER_NEAREST, NVN_MAG_FILTER_NEAREST); nvnSamplerBuilderSetWrapMode(&g_sb, NVN_WRAP_MODE_CLAMP, NVN_WRAP_MODE_CLAMP, NVN_WRAP_MODE_CLAMP);
+        okl &= nvnSamplerInitialize(&g_samp, &g_sb) & 0xFF;
+        nvnTexturePoolRegisterTexture(&g_tpool, 257, &g_tex, 0); nvnSamplerPoolRegisterSampler(&g_spool, 258, &g_samp);
+        NVNtextureHandle th = nvnDeviceGetTextureHandle(&g_dev, 257, 258);
+        NVNsamplerBuilder dummy; (void)dummy;
+        NVNcopyRegion all = {0, 0, 0, 2, 1, 1};
+        begin(); nvnCommandBufferCopyBufferToTexture(&g_cb, POOL(TEX_SRC), &g_tex, 0, &all, 0); submit();
+        NVNshaderData sl[2] = {{POOL(0x500), g_v2_control}, {POOL(0x800), g_p3_control}};
+        okl &= nvnProgramInitialize(&g_prog_l, &g_dev) & 0xFF; okl &= nvnProgramSetShaders(&g_prog_l, 2, sl) & 0xFF;
+        begin(); target(blue, 0); bind_all(UBO_VS0, UBO_FS_WHITE); nvnCommandBufferBindProgram(&g_cb, &g_prog_l, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        nvnCommandBufferSetTexturePool(&g_cb, &g_tpool); nvnCommandBufferSetSamplerPool(&g_cb, &g_spool);
+        nvnCommandBufferBindTexture(&g_cb, NVN_SHADER_STAGE_FRAGMENT, 0, th);
+        nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, UV_TRI, 3); copy_out(0); submit();
+        g_res[17] = okl && is(12, 32, 255, 0, 0, 1) && is(52, 32, 0, 255, 0, 1);
+    }
 
     g_res[10] = 0x5555;
     exit_thread();

@@ -5,9 +5,10 @@
 #include <stdint.h>
 
 enum { NVN_STAGE_VERTEX = 0, NVN_STAGE_FRAGMENT = 1, NVN_STAGE_GEOMETRY = 2, NVN_STAGE_TESS_CONTROL = 3, NVN_STAGE_TESS_EVAL = 4, NVN_STAGE_COMPUTE = 5 };   // NVNshaderStage
-enum { NVN_SB_CBUF = 1 };    // binding kinds (dmsh_abi.h DMSH_KIND_*); more as the draw path grows: storage buffers, textures, the driver segments
+enum { NVN_SB_CBUF = 1, NVN_SB_TEX = 2 };    // binding kinds (dmsh_abi.h DMSH_KIND_*); more as the draw path grows: storage buffers, the driver segments
 
-typedef struct { uint32_t binding; uint32_t kind; uint32_t reg; } nvn_shbind;   // Vulkan binding in descriptor set 0, what it is, and its slot (a cbuf's uniform slot)
+// Vulkan binding in descriptor set 0, what it is, and its slot (a cbuf's uniform slot; a combined texture's c2 slot). aux: for a texture, the translator's SamplerType (3 = 2D)
+typedef struct { uint32_t binding; uint32_t kind; uint32_t reg; uint32_t aux; } nvn_shbind;
 
 // What a shader reads that the draw path cannot supply yet (shader_pack.py): a draw with such a shader is skipped and says which
 enum { NVN_NEED_C0 = 1, NVN_NEED_C1 = 2, NVN_NEED_C2 = 4, NVN_NEED_SBUF = 8, NVN_NEED_TEX = 16, NVN_NEED_IMG = 32, NVN_NEED_GEOM = 64 };

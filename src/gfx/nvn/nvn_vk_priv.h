@@ -30,4 +30,9 @@ void nvn_vk_clear_ds(uint64_t serial, const view_t *v, int has_view, float depth
 // The draw path (nvn_draw_vk.c, nvn_tex_vk.c)
 typedef struct { VkImageView view; VkFormat fmt; uint32_t w, h, layers; VkImageAspectFlags aspect; } nvn_attach;
 int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach *out);
+// A sampling view of a texture (it fills a dirty image first, which ends the render pass), and the SamplerType it presents (nvn_tex_vk.c)
+// Texture and sampler descriptors registered by the game (nvn_desc_vk.c): a bound handle (texture id | sampler id << 20) as a descriptor for a binding that samples SamplerType `want`.
+// 1 = filled; 0 = texture not registered or without an image; 2 = sampler not registered; 3 = the texture is of another type
+int nvn_vk_desc_sampled(uint32_t handle, int want, VkDescriptorImageInfo *out);
+int nvn_vk_tex_sampled(uint64_t serial, const view_t *v, int has_view, int tex_set_swz, unsigned tex_swz, VkImageView *out, int *code);
 VkCommandBuffer nvn_vk_cmd_raw(void);       // the submission's command buffer without ending an open render pass: for the draw path only
