@@ -82,6 +82,7 @@ def entry(key_hex, spirv, res):
     """One library entry from a translated shader"""
     key = bytes.fromhex(key_hex)
     if len(key) != 8: raise ValueError(f'a shader key is 8 bytes, got {key_hex!r}')
+    if len(spirv) % 4: raise ValueError('SPIR-V is a whole number of words')
     needs, binds = 0, []
     for binding, slot in sorted(uniform_blocks(spirv).items()):
         if slot == 0: binds.append((binding, KIND_DRV0, 0, 0))
@@ -106,7 +107,6 @@ def entry(key_hex, spirv, res):
         else: binds.append((t['binding'], KIND_TEX, slot, t['type']))
     if res.get('images'): needs |= NEEDS_IMG
     if res.get('geometry_stride'): needs |= NEEDS_GEOM
-    if len(spirv) % 4: raise ValueError('SPIR-V is a whole number of words')
     sb = support_binding(spirv)
     if sb is not None: binds.append((sb, KIND_SUPPORT, 0, 0))
     stage = STAGE[res['stage']]
