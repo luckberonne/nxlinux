@@ -40,7 +40,8 @@ def main(argv):
         {'key': stand_in_key(0x55, 0xF6), 'stage': 'vs', 'code': maxwell_asm.vertex_passthrough(), 'attr': {'0': 'float', '1': 'float'}},
         {'key': stand_in_key(0x66, 0x07), 'stage': 'ps', 'code': maxwell_asm.fragment_varying(), 'fout': {'0': 'float'}},
         {'key': stand_in_key(0x77, 0x18), 'stage': 'vs', 'code': maxwell_asm.vertex_shifted(), 'attr': {'0': 'float', '1': 'float'}},
-        {'key': stand_in_key(0x88, 0x29), 'stage': 'ps', 'code': maxwell_asm.fragment_textured(0), 'fout': {'0': 'float'}, 'tex': {'0': '2d'}}], work)
+        {'key': stand_in_key(0x88, 0x29), 'stage': 'ps', 'code': maxwell_asm.fragment_textured(0), 'fout': {'0': 'float'}, 'tex': {'0': '2d'}},
+        {'key': stand_in_key(0x99, 0x3A), 'stage': 'ps', 'code': maxwell_asm.fragment_drivers(), 'fout': {'0': 'float'}}], work)
     shader_pack.main(['shader_pack.py', lib, str(out)])
 
 

@@ -31,8 +31,8 @@ class Packer(unittest.TestCase):
         [e] = shader_pack.unpack(lib)
         self.assertEqual(e['key'], '0123456789abcdef')
         self.assertEqual(e['stage'], 1)
-        self.assertEqual(e['needs'], shader_pack.NEEDS_C0 | shader_pack.NEEDS_TEX)         # a cube map: not bindable yet
-        self.assertEqual(e['binds'], [(1, shader_pack.KIND_CBUF, 0, 0), (2, shader_pack.KIND_CBUF, 2, 0)])        # c[3 + reg]
+        self.assertEqual(e['needs'], shader_pack.NEEDS_TEX)         # a cube map: not bindable yet
+        self.assertEqual(e['binds'], [(0, shader_pack.KIND_DRV0, 0, 0), (1, shader_pack.KIND_CBUF, 0, 0), (2, shader_pack.KIND_CBUF, 2, 0)])        # c[3 + reg]
 
     def test_combined_2d_texture_is_a_binding(self):
         t = {'binding': 2, 'type': 3, 'handle': 8 + 4, 'cbuf_slot': 2, 'array': 1, 'separate': False}       # word 12 = byte 0x30 = c2 slot 2
@@ -75,6 +75,19 @@ class Translator(unittest.TestCase):
                 if shutil.which('spirv-val'): subprocess.run(['spirv-val', '--target-env', 'vulkan1.3', str(out / f'{k}.spv')], check=True)
             vs = (out / f'{kv}.spv').read_bytes()
             self.assertNotIn(b'gl_CullDistance', vs)            # the patched per-vertex block has no cull member (Vulkan caps clip + cull sizes together)
+
+    def test_driver_segments_and_support_buffer_are_bindings(self):
+        with tempfile.TemporaryDirectory() as d:
+            k1, k2 = make_maxwell_lib.stand_in_key(0x99, 0x3A), make_maxwell_lib.stand_in_key()
+            out = make_maxwell_lib.translate(DLL, [
+                {'key': k1, 'stage': 'ps', 'code': maxwell_asm.fragment_drivers(), 'fout': {'0': 'float'}},
+                {'key': k2, 'stage': 'ps', 'code': maxwell_asm.fragment_constant(1, 0.5, 0, 1), 'fout': {'0': 'float'}}], d)
+            lib = Path(d) / 'm.nxsl'
+            shader_pack.main(['x', str(lib), str(out)])
+            e = {x['key']: x for x in shader_pack.unpack(lib.read_bytes())}
+            self.assertEqual(sorted(b[1] for b in e[k1]['binds']), [shader_pack.KIND_SUPPORT, shader_pack.KIND_DRV0, shader_pack.KIND_DRV2])
+            self.assertEqual(e[k1]['needs'], 0)
+            self.assertEqual(e[k2]['binds'], [])                    # declares the support buffer but never reads it
 
     def test_stand_in_key_is_stable(self):
         self.assertEqual(len(make_maxwell_lib.stand_in_key()), 16)

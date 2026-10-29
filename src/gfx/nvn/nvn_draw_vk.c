@@ -47,6 +47,7 @@ static struct {
 } S;
 static _Atomic int g_origin_ll = 1, g_depth_zero;   // NVN's defaults: lower-left origin, -w..w depth
 static int g_queue_ll;
+static int g_base_instance;                      // the draw being prepared: c[0] carries it for the shaders (DMSH_C0_BASE_INSTANCE)
 
 void mtl_set_origin_lower_left(int on) { atomic_store(&g_origin_ll, on != 0); }
 void mtl_set_queue_origin_lower_left(int on) { g_queue_ll = on != 0; }
@@ -281,6 +282,30 @@ static VkBuffer zero_buffer(vkctx_t *c) {                         // what an unb
     if (!made) { made = 1; if (!vkbuf_create(c, &z, 65536, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 1)) memset(z.map, 0, 65536); }
     return z.buf;
 }
+// ---- the driver's constant segments and the translator's support buffer: built per draw from the bound state, as nvn_mtl.m encode_args does
+enum { SUPPORT_SIZE = 1392 };                                         // the translator's SupportBuffer (std140: alpha test 0, is_bgra 16, viewport inverse 144, size 160, frag scale count 176, render scale 192)
+static void put_f(uint8_t *b, size_t off, float v) { memcpy(b + off, &v, 4); }
+static void put_u(uint8_t *b, size_t off, uint32_t v) { memcpy(b + off, &v, 4); }
+static VkDescriptorBufferInfo driver_buffer(vkctx_t *c, int kind, int stage, float vw, float vh) {
+    size_t size = kind == NVN_SB_SUPPORT ? SUPPORT_SIZE : DMSH_DRV_SIZE;
+    vkbuf_t b;
+    if (vkbuf_create(c, &b, size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 1)) return (VkDescriptorBufferInfo){zero_buffer(c), 0, 4096};
+    uint8_t *m = b.map; memset(m, 0, size);
+    if (kind == NVN_SB_SUPPORT) {
+        put_f(m, 144, vw > 0 ? 2.0f / vw : 0); put_f(m, 148, vh > 0 ? 2.0f / vh : 0);   // viewport inverse: what a shader with the viewport transform off scales to clip space with
+        put_f(m, 160, vw); put_f(m, 164, vh);
+        for (int i = 0; i < 73; i++) put_f(m, 192 + 16 * i, 1.0f);                       // no resolution scaling
+    } else if (kind == NVN_SB_DRV0) {
+        float ps = c->props.limits.pointSizeRange[1]; if (ps > 64.0f) ps = 64.0f;
+        put_f(m, DMSH_C0_POINT_SIZE, ps);                                                // the largest point size GLSLC clamps to; 64 on every device that has at least that
+        put_u(m, DMSH_C0_BASE_INSTANCE, (uint32_t)g_base_instance);
+    } else {                                                                             // c[2]: the handle of each bound texture slot, one word every DMSH_C2_ROW bytes
+        for (int r = 0; r < DMSH_C2_TEX_SLOTS; r++) put_u(m, DMSH_C2_TEX + (size_t)r * DMSH_C2_ROW, S.tex[stage][r]);
+        for (int r = 0; r < DMSH_C2_SEP_SLOTS; r++) put_u(m, DMSH_C2_SEPTEX + (size_t)r * DMSH_C2_ROW, S.tex[stage][DMSH_SEPTEX_SLOT0 + r]);
+    }
+    nvn_vk_keep(&b);                                                                     // freed once the submission has completed
+    return (VkDescriptorBufferInfo){b.buf, 0, size};
+}
 static void skip(const char *why, int *flag) {
     atomic_fetch_add(&g_nskip, 1);
     if (!__atomic_exchange_n(flag, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [RED] [nvn] draw skipped: %s\n", why);
@@ -406,6 +431,11 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
         for (int si = 0; si < 2; si++) {
             int n; const nvn_shbind *b = nvn_shader_binds(sh[si], &n);
             for (int i = 0; i < n && nw < 32; i++) {
+                if (b[i].kind == NVN_SB_SUPPORT || b[i].kind == NVN_SB_DRV0 || b[i].kind == NVN_SB_DRV2) {
+                    bi[nw] = driver_buffer(c, (int)b[i].kind, si, vw, vh);
+                    wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nw]};
+                    nw++; continue;
+                }
                 if (b[i].kind != NVN_SB_CBUF || b[i].reg >= 16) continue;
                 const p_bind_buf *u = &S.ubo[si][b[i].reg];
                 VkBuffer ub; VkDeviceSize uoff;
@@ -426,6 +456,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
 void nvn_draw(const p_draw *d) {
     pipe_entry *pe;
     if (d->ind) { static int f; skip("indirect draws are not supported yet", &f); return; }
+    g_base_instance = d->base_instance;
     if (!prepare(d->prim, &pe)) return;
     vkCmdDraw(nvn_vk_cmd_raw(), (uint32_t)d->count, d->instances ? (uint32_t)d->instances : 1, (uint32_t)d->first, (uint32_t)d->base_instance);
     atomic_fetch_add(&g_ndraw, 1);
@@ -436,6 +467,7 @@ void nvn_draw_idx(const p_draw_idx *d) {
     pipe_entry *pe;
     if (d->ind) { skip("indirect draws are not supported yet", &f_ind); return; }
     if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) { skip("8-bit indices need widening first", &f_byte); return; }
+    g_base_instance = d->base_instance;
     if (!prepare(d->prim, &pe)) return;
     VkCommandBuffer cb = nvn_vk_cmd_raw(); VkBuffer ib; VkDeviceSize ioff;
     uint64_t isz = d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 4;

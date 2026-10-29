@@ -6,8 +6,8 @@ Usage: shader_pack.py out.nxsl <translator output dir>          (every <key>.spv
 Library (little endian): "NXSL", u32 version (2), u32 count; per shader: key[8], u32 stage (NVN_STAGE_*), u32 needs, u32 nbinds, u32 spirv bytes, then nbinds x
 {u32 binding, u32 kind, u32 reg, u32 aux}, then the SPIR-V. `needs` marks what the shader reads that the draw path cannot supply yet, so the host can say so and skip the draw
 instead of running it wrong:
-  1 driver segment c[0] (storage buffer table, point size, base instance)   2 the shader's own constant segment c[1]   4 driver segment c[2] (texture and sampler handles)
-  8 storage buffers   16 textures   32 images   64 a geometry shader's helper buffers
+  2 the shader's own constant segment c[1]   8 storage buffers   16 textures   32 images   64 a geometry shader's helper buffers
+  (1 and 4, the driver segments c[0] and c[2], are bindings now: kinds 4 and 5, filled by the host per draw; so is the translator's support buffer, kind 3, when the module reads it)
 Uniform buffers c[3 + reg] are plain bindings (kind 1 = cbuf, reg = the NVN uniform slot); a plain 2D texture read through a combined handle is kind 2 (reg = its c[2] slot,
 aux = the SamplerType).
 """
@@ -15,7 +15,7 @@ import json, struct, sys
 from pathlib import Path
 
 STAGE = {'vs': 0, 'ps': 1, 'cs': 5}          # NVN_STAGE_VERTEX, FRAGMENT, COMPUTE
-KIND_CBUF, KIND_TEX = 1, 2
+KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2 = 1, 2, 3, 4, 5
 SAMPLER_2D = 3                                # the translator's SamplerType.Texture2D, with no array, multisample or shadow bits
 C2_TEX, C2_SEPTEX = 0x20, 0x168               # byte offsets in driver segment c[2] (src/gfx/nvn/dmsh_abi.h): combined handles, and where the separate textures start
 
@@ -31,6 +31,32 @@ def combined_slot(t):
 NEEDS_C0, NEEDS_C1, NEEDS_C2, NEEDS_SBUF, NEEDS_TEX, NEEDS_IMG, NEEDS_GEOM = 1, 2, 4, 8, 16, 32, 64
 
 
+def support_binding(spirv):
+    """The binding of the translator's support buffer when the module reads it (render scale, viewport size, alpha test...), else None. It is the uniform block named
+    support_buffer; a module declares it always, so only a load through it counts."""
+    w = struct.unpack(f'<{len(spirv) // 4}I', spirv)
+    names, bindings, ptr_id = {}, {}, None
+    i = 5
+    while i < len(w):
+        op, n = w[i] & 0xFFFF, w[i] >> 16
+        if n == 0: break
+        if op == 5:                                                    # OpName
+            nm = struct.pack(f'<{n - 2}I', *w[i + 2:i + n]).split(b'\0')[0]
+            names[w[i + 1]] = nm.decode(errors='replace')
+        elif op == 71 and w[i + 2] == 33: bindings[w[i + 1]] = w[i + 3]            # OpDecorate Binding
+        i += n
+    ptr_id = next((k for k, v in names.items() if v == 'support_buffer'), None)
+    if ptr_id is None: return None
+    i = 5
+    while i < len(w):
+        op, n = w[i] & 0xFFFF, w[i] >> 16
+        if n == 0: break
+        if op in (65, 66, 61) and w[i + 3] == ptr_id:                  # OpAccessChain / OpInBoundsAccessChain / OpLoad of it
+            return bindings.get(ptr_id, 0)
+        i += n
+    return None
+
+
 def entry(key_hex, spirv, res):
     """One library entry from a translated shader"""
     key = bytes.fromhex(key_hex)
@@ -38,9 +64,9 @@ def entry(key_hex, spirv, res):
     needs, binds = 0, []
     for cb in res.get('cbufs', []):
         slot = cb['slot']
-        if slot == 0: needs |= NEEDS_C0
+        if slot == 0: binds.append((cb['binding'], KIND_DRV0, 0, 0))
         elif slot == 1: needs |= NEEDS_C1
-        elif slot == 2: needs |= NEEDS_C2
+        elif slot == 2: binds.append((cb['binding'], KIND_DRV2, 0, 0))
         else: binds.append((cb['binding'], KIND_CBUF, slot - 3, 0))
     if res.get('sbufs'): needs |= NEEDS_SBUF
     for t in res.get('textures', []):
@@ -50,6 +76,8 @@ def entry(key_hex, spirv, res):
     if res.get('images'): needs |= NEEDS_IMG
     if res.get('geometry_stride'): needs |= NEEDS_GEOM
     if len(spirv) % 4: raise ValueError('SPIR-V is a whole number of words')
+    sb = support_binding(spirv)
+    if sb is not None: binds.append((sb, KIND_SUPPORT, 0, 0))
     stage = STAGE[res['stage']]
     return key + struct.pack('<4I', stage, needs, len(binds), len(spirv)) + b''.join(struct.pack('<4I', *b) for b in binds) + spirv
 

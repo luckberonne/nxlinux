@@ -1,6 +1,6 @@
 // Guest program for tests/test_nvn_draw.cpp: draws through the NVN API, as a game does. The host registers SPIR-V for the two shaders the program names.
 // The shader "code" is a few bytes in the memory pool and the control section a block in .bss; the host fills both in before the program runs and computes the
-// key the way hle_nvn.c does. Twelve stages, each checking one thing; the results go to g_res[].
+// key the way hle_nvn.c does. Thirteen stages, each checking one thing; the results go to g_res[].
 #include "nvn_protos.h"
 
 typedef unsigned long u64;
@@ -33,7 +33,7 @@ extern void *nvnBootstrapLoader(const char *name);
 FUNCS(DECL)
 
 u64 g_res[64];
-char g_vs_control[0x880] __attribute__((aligned(16))), g_fs_control[0x880] __attribute__((aligned(16))), g_x_control[0x880] __attribute__((aligned(16))), g_t_control[0x880] __attribute__((aligned(16))), g_v2_control[0x880] __attribute__((aligned(16))), g_p2_control[0x880] __attribute__((aligned(16))), g_v3_control[0x880] __attribute__((aligned(16))), g_p3_control[0x880] __attribute__((aligned(16)));   /* g_x: a shader nobody registered; g_t: the translated Maxwell one */
+char g_vs_control[0x880] __attribute__((aligned(16))), g_fs_control[0x880] __attribute__((aligned(16))), g_x_control[0x880] __attribute__((aligned(16))), g_t_control[0x880] __attribute__((aligned(16))), g_v2_control[0x880] __attribute__((aligned(16))), g_p2_control[0x880] __attribute__((aligned(16))), g_v3_control[0x880] __attribute__((aligned(16))), g_p3_control[0x880] __attribute__((aligned(16))), g_p4_control[0x880] __attribute__((aligned(16)));   /* g_x: a shader nobody registered; g_t: the translated Maxwell one */
 char g_poolmem[0x100000] __attribute__((aligned(0x10000)));          // exported: the host writes the shader code into it before the program runs
 static NVNdevice g_dev __attribute__((aligned(64))); static NVNdeviceBuilder g_dev_b __attribute__((aligned(64)));
 static NVNmemoryPool g_pool __attribute__((aligned(64))); static NVNmemoryPoolBuilder g_pool_b __attribute__((aligned(64)));
@@ -41,7 +41,7 @@ static NVNqueue g_queue __attribute__((aligned(64))); static NVNqueueBuilder g_q
 static NVNcommandBuffer g_cb __attribute__((aligned(64)));
 static NVNtexture g_rt __attribute__((aligned(64))), g_depth __attribute__((aligned(64)));
 static NVNtextureBuilder g_tb __attribute__((aligned(64)));
-static NVNprogram g_prog __attribute__((aligned(64))), g_prog_x __attribute__((aligned(64))), g_prog_t __attribute__((aligned(64))), g_prog_j __attribute__((aligned(64))), g_prog_k __attribute__((aligned(64))), g_prog_l __attribute__((aligned(64)));
+static NVNprogram g_prog __attribute__((aligned(64))), g_prog_x __attribute__((aligned(64))), g_prog_t __attribute__((aligned(64))), g_prog_j __attribute__((aligned(64))), g_prog_k __attribute__((aligned(64))), g_prog_l __attribute__((aligned(64))), g_prog_m __attribute__((aligned(64)));
 static NVNtexture g_tex __attribute__((aligned(64))); static NVNtexturePool g_tpool __attribute__((aligned(64))); static NVNsamplerPool g_spool __attribute__((aligned(64)));
 static NVNsampler g_samp __attribute__((aligned(64))); static NVNsamplerBuilder g_sb __attribute__((aligned(64)));
 static NVNblendState g_blend __attribute__((aligned(16))); static NVNcolorState g_color __attribute__((aligned(16)));
@@ -263,6 +263,18 @@ void guest_main(u64 arg) {
         nvnCommandBufferBindTexture(&g_cb, NVN_SHADER_STAGE_FRAGMENT, 0, th);
         nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, UV_TRI, 3); copy_out(0); submit();
         g_res[17] = okl && is(12, 32, 255, 0, 0, 1) && is(52, 32, 0, 255, 0, 1);
+
+        // ---- M: the driver's constant segments and the translator's support buffer, all supplied by the host. The fragment shader reads c[0] (the point size limit, 64: red 0.5),
+        //      c[2] (the bound handle of texture slot 0, texture 257 | sampler 258 << 20, taken as a float and scaled: green 0.625) and its own x position, which the translator
+        //      divides by the support buffer's render scale (1.0): blue = x / 64
+        NVNshaderData sm[2] = {{POOL(0x500), g_v2_control}, {POOL(0x900), g_p4_control}};
+        int okm = nvnProgramInitialize(&g_prog_m, &g_dev) & 0xFF; okm &= nvnProgramSetShaders(&g_prog_m, 2, sm) & 0xFF;
+        begin(); target(blue, 0); bind_all(UBO_VS0, UBO_FS_WHITE); nvnCommandBufferBindProgram(&g_cb, &g_prog_m, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
+        nvnCommandBufferSetTexturePool(&g_cb, &g_tpool); nvnCommandBufferSetSamplerPool(&g_cb, &g_spool);
+        nvnCommandBufferBindTexture(&g_cb, NVN_SHADER_STAGE_FRAGMENT, 0, th);
+        nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, UV_TRI, 3); copy_out(0); submit();
+        g_res[18] = okm && is(12, 32, 128, 159, 50, 3) && is(52, 32, 128, 159, 209, 3);
+        g_res[23] = (u64)px(52, 32)[0] | (u64)px(52, 32)[1] << 8 | (u64)px(52, 32)[2] << 16 | (u64)px(52, 32)[3] << 24;
     }
 
     g_res[10] = 0x5555;

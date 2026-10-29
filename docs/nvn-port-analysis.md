@@ -192,3 +192,15 @@ as an NSO, `tools/synth_nsp.py` packs it into an NSP with throwaway keys, `work/
 (with `NX_IMG_BSS` set) maps it through its MOD0, relocates it and runs all stages on the JIT. The linker script used to pin the data segment at 0x2000, which only fits a guest
 with under 8 KiB of text; the MOD0 pointer is now a link-time difference and the segment follows the read-only data. Skips itself without clang, the `.venv` with cryptography
 or a built `work/nx_extract`.
+
+## The driver's constant segments and the support buffer
+
+A translated shader no longer sets `needs` for c[0] and c[2]: the library carries them as bindings (kinds 4 and 5), as it does the translator's support buffer (kind 3, only when
+the module actually loads through it: `shader_pack.support_binding` reads the SPIR-V). The draw path builds each one per draw into a host-visible buffer that the submission
+frees when it completes (`driver_buffer` in nvn_draw_vk.c):
+- **c[0]** (DMSH_DRV_SIZE bytes): the point size limit (the device's, capped at 64) at 0x610 and the draw's base instance at 0x644. The storage buffer tables stay zero: shaders that use
+  storage buffers still set `needs`.
+- **c[2]**: the handle bound to each combined texture slot (0x20 + 8 r) and each separate one (0x168 + 8 r). Separate samplers (0x568) are not recorded yet.
+- **support buffer** (1392 bytes, std140 as the translator declares it): viewport inverse and size from the current viewport, every render scale 1.0, no alpha test, no BGRA swap.
+Stage thirteen of the draw test reads all three from one machine-code fragment shader and checks the colour it writes. Still missing: the shader's own constant segment c[1],
+storage buffers, images, geometry helpers.

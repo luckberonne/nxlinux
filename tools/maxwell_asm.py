@@ -61,6 +61,13 @@ def tex(rd, ra, slot, dim=2, lod=1):
     return (0b11000 << 59) | ((lod & 7) << 55) | (tid << 36) | (0xF << 31) | ((dim & 7) << 28) | (255 << 20) | (PT << 16) | ((ra & 0xFF) << 8) | (rd & 0xFF)
 
 
+def fmul32i(rd, ra, value):
+    """FMUL32I Rd, Ra, imm (7 bits 0011100, the immediate's top bit at 56, 5 bits 01101 below it; the immediate is the float's top 20 bits, bits 20-38 and 56)"""
+    imm20 = f32(value) >> 12
+    assert f32(value) & 0xFFF == 0, 'FMUL32I keeps only the top 20 bits of the float'
+    return (0b0011100 << 57) | (((imm20 >> 19) & 1) << 56) | (0b01101 << 51) | ((imm20 & 0x7FFFF) << 20) | (PT << 16) | ((ra & 0xFF) << 8) | (rd & 0xFF)
+
+
 def f32(x):
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
@@ -113,6 +120,13 @@ def fragment_varying():
 def fragment_textured(slot=0):
     """A fragment shader that samples texture `slot` at the coordinates in generic input 0 (x, y) and writes it to target 0"""
     return program([ipa(4, 0x80), ipa(5, 0x84), tex(0, 4, slot), exit_()], sph(FRAGMENT, omap_targets=0xF, imap=[0xAA]))
+
+
+def fragment_drivers():
+    """A fragment shader that reads what the host supplies: c[0] at 0x610 (the point size limit) scaled by 1/128 into red, c[2] at 0x20 (the handle of texture slot 0, read as the
+    float with the same bits) scaled by 2^94 into green, and the fragment's x position (the translator divides it by the support buffer's render scale) over 64 into blue"""
+    return program([ldc(4, 0, 0x610), ldc(5, 2, 0x20), ipa(6, 0x70), fmul32i(0, 4, 1 / 128), fmul32i(1, 5, 2.0 ** 94), fmul32i(2, 6, 1 / 64), mov32i(3, f32(1.0)), exit_()],
+                   sph(FRAGMENT, omap_targets=0xF, imap=[0xAA]))
 
 
 if __name__ == '__main__':
