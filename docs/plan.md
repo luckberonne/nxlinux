@@ -100,6 +100,45 @@ Esta máquina es un Ryzen 5 7535HS (x86_64) con una RTX 2050 y una Radeon 680M, 
 5. **Aceptación:** menús, carrera de demostración y Gran Premio completo con sonido, medido en fps.
 6. **Ensayo sintético (hecho):** `tools/synth_nsp.py` genera un `prod.keys` desechable y NSP de un juego falso (base + update, ExeFS con NSOs y RomFS con IVFC en la sección Data); el `nx_extract` vendido de `nxnative-src` los acepta de punta a punta: extrae el ExeFS, recorre el RomFS (copia en carpetas, `--manifest` y `--romfs-image` con la conversión DMROMFS1), combina base + update y detecta un byte corrupto (`[RED] hash check failed` + exit 3, `--allow-damaged` para leerlo tal cual). En `tests/test_synth_nsp.py` (21 pruebas): referencias XTS/CTR de OpenSSL, contenedores a mano e integración si hay `work/nx_extract`. Con archivos reales el punto 3 reutiliza el mismo camino. Detalles del RomFS sintético: árbol IVFC con región 0 (tabla SHA-256 de la región 1 en bloques de 0x1000), región 1 (tabla del RomFS en bloques de 0x4000) y master hash de una sola pieza sobre la región 0; los digests son SHA-256 puro de cada bloque rellenado con ceros (el lector de `Tools/FsSystem` rellena y compara a saco; el bit de validación es cosa de save data); dentro, header de 0x50 con las nueve posiciones en u64 desde 0x08, cubetas como `RomfsEntryKey.GetRomHashCode % primo`, entradas de 24/32 bytes con cadena de hermanos por directorio y cadena de cubetas por nombre. Extras para probar la ruta completa hasta el kernel: `--main-elf` mete al base un NSO aarch64 real embalado desde un ELF del huésped (el de clang+lld: hasta 3 PT_LOAD en orden texto→ro→data, cada vaddr en página de 0x1000, texto en 0, huecos de página permitidos, bss sólo al final; los vaddr quedan como memory offsets del NSO para que las direcciones preenlazadas sigan resolviendo, y el build id sale de la nota GNU del ELF); y el RomFS lleva `control.nacp` (0x4000, idioma/nombre/editor en la entrada 0, versión en 0x3000). El guion de link que respeta esa forma (lld no pagina sin `PHDRS` declarados): `PHDRS { text PT_LOAD FLAGS(5); ro PT_LOAD FLAGS(4); data PT_LOAD FLAGS(6); }` con `SECTIONS { . = 0; .text : {...} :text  . = ALIGN(0x1000); .rodata : {...} :ro  . = ALIGN(0x1000); .data : {...} :data }` y `-Wl,-T,script,-z,max-page-size=0x1000`; un `.so` viejo (4 LOADs, código a 0x10eac) lo rechaza con ese instructivo. Y para que el propio `main` del juego sea código compilado: `tools/synth_mod0.S` + `tools/synth_guest.ld` dan a un guest de clang+lld el MOD0, la sección dinámica y .dynsym/.dynstr/.rela.dyn dentro de la imagen (el bloque MOD0 va clavado por el guion al inicio del segmento data en 0x2000, la dinámica justo detrás; el huésped enlaza `-shared -fPIC -nostdlib -nostartfiles -fuse-ld=lld -Wl,-T,tools/synth_guest.ld,-z,max-page-size=0x1000`), y `--main-elf` lo embala. Probado de punta a punta por primera vez: `nx_extract` → `module_map`/`module_relocate` (MOD0, dinámica, relocations, 0 imports sueltos) → la CPU corre `main` de verdad (devuelve 42; deja en .bss `0x5A5A5A5A` y el puntero relocatado llega al texto de `hello[]`). Uso: `python tools/synth_nsp.py <dir> [--seed N] [--no-romfs] [--main-elf guest.elf]`.
 
+## Estado y hoja de ruta (actualizado el 2026-10-29)
+
+### Dónde estamos (todo probado sin material de ningún juego)
+| Fase | Estado |
+|---|---|
+| 0. Spikes | **Hecha.** dynarmic con fastmem de identidad (guest == host), trampolines HLE, seguimiento de páginas sucias. |
+| 1. CPU, loader, SVC | **Hecha con sintéticos.** Un `Jit` por hilo, cargador de NSO/ELF con relocaciones, HLE por `svc`, planificador de hilos Horizon, SVC de memoria, hilos, sincronización, eventos. Falta probarla con un NSO retail. |
+| 2. Servicios y plataforma | **No empezada** (salvo lo que NVN necesita). ~760 hooks `nn::*`, SDL3, audio, entrada, ffmpeg. |
+| 3. Vulkan | **Avanzada.** Pools importados con host-pointer, colas y fences, repetición de ~45 operaciones, texturas (subida por subrecurso), limpiezas, dibujos (estado, pipelines, blending, profundidad, índices, UBO) y muestreo de texturas 2D. Validación de Vulkan limpia. |
+| 4. Shaders | **Cadena montada.** Maxwell → SPIR-V (traductor Ryujinx vendido) → biblioteca NXSL v2 → registro por clave → dibujo. Probada con shaders ensamblados a mano (`tools/maxwell_asm.py`). |
+| 5. Pulido | No empezada. |
+
+17 etapas de dibujo, 16 tests en CTest. Los controles negativos con `NX_NULL_GPU=1` fallan como deben.
+
+### Lo que se puede avanzar sin juego, en este orden
+1. **Guest como NSO en un NSP sintético** (corto). Regla CMake que compile `tests/guest/nvn_draw.c` con `tools/synth_guest.ld` y `tools/synth_mod0.S`, que `synth_nsp.py` lo empaquete, y un test que recorra `nx_extract` → `nso.py` → `module` → kernel → NVN. Cierra el camino de carga real salvo las claves de verdad.
+2. **Segmentos de driver c0/c2 y `support_buffer`** (medio). Casi todo shader real los lee: tablas de handles de texturas, tablas de storage buffers, tamaño de punto, instancia base, y el buffer de soporte del traductor (escala de render, tamaño de viewport, inversión en y). Formato en `src/gfx/nvn/dmsh_abi.h`. Sin esto la mayoría de los shaders se salta por `needs`.
+3. **Resto de recursos de shader** (medio): textura ficticia para slots sin registrar, texturas separadas y samplers separados, cubos, arrays, 3D, sombras, storage buffers, imágenes, handles bindless por UBO.
+4. **Etapas que faltan** (medio a grande): geometry, tessellation, compute y dispatch; draws indirectos; transform feedback; MSAA; viewports múltiples; primitivas sin equivalente (line loop, quads, índices de 8 bits); logic op y alpha test.
+5. **Formatos que RADV no tiene** (medio): decodificar ASTC, ETC2 y D24S8 por compute o convertir a BC7 / D32S8.
+6. **Memoria virtual de NVN** (pequeño a medio): pools virtuales y dispersos necesitan una ventana de guest compartida (memfd); hoy es un caso abierto de `vm_remap`.
+7. **Presentación** (medio): ventana SDL3, swapchain para `NVNwindow`, pacing de frames. Se puede probar con un guest que dibuje en bucle.
+8. **Servicios HLE** (el trabajo más grande, ~760 hooks): portar en lotes los `hle_*.c` de nxnative en el orden en que los toque el arranque: `sm`/`sf`, `fs`, `time`, `account`, `hid`, `nvdrv`, `vi`, `audren`, resto. Cada lote se prueba con un guest sintético que llama al servicio. Entrada con SDL, audio con SDL.
+9. **Película y audio** (medio): H.264 con ffmpeg, VP9 con libvpx, `audren` hacia SDL.
+
+### Lo que necesita material que yo no puedo conseguir
+- **MK8D real**: `prod.keys` y las actualizaciones 4.0.0 y 4.0.1 de la propia consola del usuario (Lockpick_RCM, nxdumptool). Hoy solo existe la base 1.0.0, que no basta. Sin ellos no hay primer frame real, y no los busco ni descargo de terceros.
+- **Cadena de shaders del juego** (`dmsh_chain.py`, `shader_split.py`, `dmsh_facts.py`, una versión Linux de `build_ipa_from_nsp.py`): se porta ya, pero solo se ejecuta contra los NCA descifrados del usuario. Los ~29 785 shaders de MK8D se traducen una vez, fuera de línea.
+
+### Riesgos, por orden de daño
+1. Rendimiento del JIT en el hilo de render y en los bucles de espera activa (se mide recién con un juego real).
+2. Cantidad de servicios y su exactitud (un hook mal hecho cuelga el arranque; nxnative ya tiene los parches por juego como guía).
+3. Diferencias de Vulkan que solo salen con shaders reales: profundidad, orientación, subgrupos, precisión.
+4. Tamaño de página de 4 KiB frente a los supuestos de 16 KiB en `nvn_dirty.c`.
+5. La RTX 2050 no aparece en Vulkan (solo la Radeon 660M); si se quisiera usar, hace falta resolver el driver.
+
+### Cómo se mide el avance
+Cada paso cierra con un test que falla con `NX_NULL_GPU=1` o sin la pieza nueva, validación de Vulkan limpia y un commit de una línea. Los hitos de aceptación de la sección Verificación siguen siendo los de arriba.
+
 ## Requisitos y notas
 - **Sobre `prod.keys`:** revisé el repo (`README.md`, `docs/`, `scripts/build_ipa_from_nsp.py`) y la página que mandaste. Ninguno los incluye ni explica cómo obtenerlas; solo piden que las traigas (`-k prod.keys`). No se pueden evitar: los NCA del juego están cifrados y `nx_extract` (LibHac) las necesita para leer el RomFS y el ExeFS. Tampoco voy a buscar ni descargar claves de terceros. La vía legítima es sacarlas de tu propia consola con Lockpick_RCM (junto con el volcado de tus juegos con NXDumpTool). Si no tienes consola, la parte del juego real no se puede probar; el repo nuevo igual avanza con los programas de prueba.
 - Necesitas tus propios dumps de MK8D (NSP base + update 4.0.0 y 4.0.1) y `prod.keys`. Quedan fuera del repo (carpeta de trabajo aparte, nunca en git). Hasta tenerlos, las fases 0 y 3 se prueban con programas aarch64 de prueba y tests sintéticos; las fases 1–2 y 4–5 necesitan los archivos reales.
