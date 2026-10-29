@@ -275,6 +275,7 @@ void guest_main(u64 arg) {
         nvnCommandBufferDrawArrays(&g_cb, NVN_DRAW_PRIMITIVE_TRIANGLES, UV_TRI, 3); copy_out(0); submit();
         g_res[18] = okm && is(12, 32, 128, 159, 50, 3) && is(52, 32, 128, 159, 209, 3);
         // ---- N: a texture slot bound to ids that were never registered reads as zeros (all four channels) instead of stopping the draw
+        { volatile unsigned char *o = (volatile unsigned char *)(g_poolmem + OUT_COLOR); for (int i = 0; i < 64 * 64 * 4; i++) o[i] = 0xFF; }     // so that zeros can only come from the draw
         begin(); target(blue, 0); bind_all(UBO_VS0, UBO_FS_WHITE); nvnCommandBufferBindProgram(&g_cb, &g_prog_l, NVN_SHADER_STAGE_ALL_GRAPHICS_BITS);
         nvnCommandBufferSetTexturePool(&g_cb, &g_tpool); nvnCommandBufferSetSamplerPool(&g_cb, &g_spool);
         nvnCommandBufferBindTexture(&g_cb, NVN_SHADER_STAGE_FRAGMENT, 0, nvnDeviceGetTextureHandle(&g_dev, 300, 301));
