@@ -184,3 +184,11 @@ Stage twelve of the draw test samples a texture from a translated fragment shade
 - The shader library is version 2: a binding carries `aux`, the translator's SamplerType, so a draw refuses a texture of another type. `shader_pack.py` turns plain 2D textures read
   through a combined handle into bindings; separate textures, arrays, cube maps, shadow samplers and bindless handles still set `needs`.
 A texture slot that is bound to an unregistered id skips the draw with a red line (nxnative reads zeros there; a dummy texture is still to do).
+
+## The draw guest as an NSO from a synthetic NSP
+
+`tests/test_boot_synth.py` (ctest `boot_synth`) carries the whole draw test through the real load path: the guest is linked with `tools/synth_guest.ld` and `tools/synth_mod0.S`
+as an NSO, `tools/synth_nsp.py` packs it into an NSP with throwaway keys, `work/nx_extract` extracts the ExeFS, `tools/nso.py` makes the memory image, and `test_nvn_draw`
+(with `NX_IMG_BSS` set) maps it through its MOD0, relocates it and runs all stages on the JIT. The linker script used to pin the data segment at 0x2000, which only fits a guest
+with under 8 KiB of text; the MOD0 pointer is now a link-time difference and the segment follows the read-only data. Skips itself without clang, the `.venv` with cryptography
+or a built `work/nx_extract`.

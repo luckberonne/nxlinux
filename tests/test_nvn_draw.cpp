@@ -14,6 +14,7 @@ void hle_collect_sections(void);
 }
 #include <elf.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -45,16 +46,26 @@ int main(int argc, char **argv) {
 
     auto file = slurp(argv[1]);
     CHECK(!file.empty());
-    auto *eh = (Elf64_Ehdr *)file.data(); auto *ph = (Elf64_Phdr *)(file.data() + eh->e_phoff);
-    uint64_t end = 0, dyn = 0;
-    for (int i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr + ph[i].p_memsz > end) end = ph[i].p_vaddr + ph[i].p_memsz;
-    std::vector<uint8_t> img(end);
-    for (int i = 0; i < eh->e_phnum; i++) {
-        if (ph[i].p_type == PT_LOAD) memcpy(img.data() + ph[i].p_vaddr, file.data() + ph[i].p_offset, ph[i].p_filesz);
-        if (ph[i].p_type == PT_DYNAMIC) dyn = ph[i].p_vaddr;
-    }
     module_t m;
-    CHECK(module_map(&m, "nvn_draw", img.data(), img.size(), 0x1000, dyn) == 0);
+    if (const char *bss = getenv("NX_IMG_BSS")) {
+        // A memory image made by tools/nso.py from the ExeFS main of a (synthetic) title, bss as a sparse tail of NX_IMG_BSS bytes: the loader's own path, MOD0 and all
+        size_t nbss = strtoull(bss, 0, 0);
+        CHECK(file.size() > nbss);
+        size_t len = file.size() - nbss;
+        int64_t dyn = module_dyn_from_mod0(file.data(), len);
+        CHECK(dyn > 0);
+        CHECK(module_map(&m, "main", file.data(), len, nbss, (uint64_t)dyn) == 0);
+    } else {
+        auto *eh = (Elf64_Ehdr *)file.data(); auto *ph = (Elf64_Phdr *)(file.data() + eh->e_phoff);
+        uint64_t end = 0, dyn = 0;
+        for (int i = 0; i < eh->e_phnum; i++) if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr + ph[i].p_memsz > end) end = ph[i].p_vaddr + ph[i].p_memsz;
+        std::vector<uint8_t> img(end);
+        for (int i = 0; i < eh->e_phnum; i++) {
+            if (ph[i].p_type == PT_LOAD) memcpy(img.data() + ph[i].p_vaddr, file.data() + ph[i].p_offset, ph[i].p_filesz);
+            if (ph[i].p_type == PT_DYNAMIC) dyn = ph[i].p_vaddr;
+        }
+        CHECK(module_map(&m, "nvn_draw", img.data(), img.size(), 0x1000, dyn) == 0);
+    }
     module_register(&m);
     module_t *loaded[] = {&m};
     CHECK(module_relocate(&m, loaded, 0) == 0);

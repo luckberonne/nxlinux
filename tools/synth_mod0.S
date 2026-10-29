@@ -8,7 +8,7 @@
 .global mod0_start
 mod0_start:
   .word 0                        /* image+0: free (the pointer word sits at +4) */
-  .word 0x2000                   /* image+4: the block's address (the script pins .data there) */
+  .word mod0_blk - mod0_start    /* image+4: the block's address; the linker resolves the difference (a text of any size fits) */
 .section .text
 
 .section .module.mod0blk, "aw"   /* the block: the script makes it first in .data */

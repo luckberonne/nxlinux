@@ -39,9 +39,9 @@ SECTIONS
   .gnu.version_r  : { *(.gnu.version_r) } :ro
 
   . = ALIGN(0x1000);
-  .module.mod0blk 0x2000 :
+  .module.mod0blk :
   {
-    KEEP(*(.module.mod0blk))     /* the MOD0 block, at 0x2000 (tools/synth_mod0.S spells it out) */
+    KEEP(*(.module.mod0blk))     /* the MOD0 block, at the data segment's page-aligned start (tools/synth_mod0.S points at it with a link-time difference) */
   } :data
   .dynamic :
   {
