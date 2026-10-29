@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define MAX_STUBS 8192
-typedef struct { char *name; void *fn; } hle_entry_t;
+typedef struct { char *name; void *fn; int forced; } hle_entry_t;
 static hle_entry_t g_reg[MAX_STUBS];    // registered functions, by name
 static int g_nreg;
 static hle_entry_t g_stub[MAX_STUBS];   // stub i: name and function (fn NULL = unimplemented)
@@ -21,6 +21,17 @@ void hle_register(const char *name, void *fn) {
     if (g_nreg == MAX_STUBS) { fprintf(stderr, "[RED] hle_register: table full\n"); abort(); }
     g_reg[g_nreg].name = strdup(name); g_reg[g_nreg].fn = fn; g_nreg++;
     pthread_mutex_unlock(&g_mu);
+}
+
+void hle_register_force(const char *name, void *fn) {
+    hle_register(name, fn);
+    pthread_mutex_lock(&g_mu); g_reg[g_nreg - 1].forced = 1; pthread_mutex_unlock(&g_mu);
+}
+int hle_is_forced(const char *name) {
+    pthread_mutex_lock(&g_mu);
+    int r = 0; for (int i = 0; i < g_nreg && !r; i++) r = g_reg[i].forced && !strcmp(g_reg[i].name, name);
+    pthread_mutex_unlock(&g_mu);
+    return r;
 }
 
 static void *lookup(const char *name) {

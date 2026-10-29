@@ -102,6 +102,13 @@ add_custom_target(game_profile DEPENDS ${NX_GEN_DIR}/game_profile.h)
 add_custom_command(OUTPUT ${NX_GEN_DIR}/nvn_names.c
     COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/gen_nvn_names.py ${CMAKE_SOURCE_DIR}/src/gfx/nvn/names.txt ${NX_GEN_DIR}/nvn_names.c
     DEPENDS tools/gen_nvn_names.py src/gfx/nvn/names.txt)
+# Horizon services answered by the host (nxnative's hle_*.c, ported): the SDK's nn:: client functions taken over by name
+file(GLOB NXSVC_SRC CONFIGURE_DEPENDS src/host/svc/*.c)
+add_library(nxsvc STATIC ${NXSVC_SRC})
+target_include_directories(nxsvc PRIVATE src/host ${NX_GEN_DIR})
+target_compile_definitions(nxsvc PRIVATE _GNU_SOURCE)
+target_compile_options(nxsvc PRIVATE -Wno-unused-function)
+add_dependencies(nxsvc game_profile)
 add_library(nxnvn STATIC src/gfx/nvn/hle_nvn.c src/gfx/nvn/nvn_dirty.c src/gfx/nvn/nvn_capture.c src/gfx/nvn/nvn_tex.c src/gfx/nvn/nvn_null.c src/gfx/nvn/nvn_vk.c src/gfx/nvn/nvn_replay.c src/gfx/nvn/nvn_tex_vk.c src/gfx/nvn/nvn_desc_vk.c src/gfx/nvn/nvn_present_vk.c src/gfx/nvn/nvn_draw_vk.c src/gfx/nvn/nvn_shader_vk.c
     src/gfx/tex/nvn_deswizzle.c src/host/sha256.c src/host/faults.c src/host/hostsvc.c ${NX_GEN_DIR}/nvn_names.c)
 target_link_libraries(nxnvn PUBLIC nxhost nxvk nxfmt m)
@@ -116,6 +123,15 @@ if(SDL3_FOUND)
 else()
     message(STATUS "SDL3 not found: NX_PRESENT=sdl will fall back to memory")
 endif()
+set(GUEST_SERVICES ${CMAKE_BINARY_DIR}/services.so)
+add_custom_command(OUTPUT ${GUEST_SERVICES}
+    COMMAND clang --target=aarch64-linux-gnu -ffreestanding -O1 -fPIC -fsemantic-interposition -nostdlib -shared -fuse-ld=lld -o ${GUEST_SERVICES} ${CMAKE_SOURCE_DIR}/tests/guest/services.c
+    DEPENDS tests/guest/services.c)
+add_custom_target(services_so DEPENDS ${GUEST_SERVICES})
+add_executable(test_services tests/test_services.cpp)
+target_link_libraries(test_services PRIVATE -Wl,--whole-archive nxsvc nxnvn -Wl,--no-whole-archive nxhost nxcpu nxvk dynarmic pthread m)
+add_dependencies(test_services services_so)
+add_test(NAME services COMMAND test_services ${GUEST_SERVICES})
 add_executable(nvn_link_check tests/nvn_link_check.c)
 target_link_libraries(nvn_link_check PRIVATE -Wl,--whole-archive nxnvn -Wl,--no-whole-archive nxhost nxcpu dynarmic pthread m)
 set(GUEST_NVN ${CMAKE_BINARY_DIR}/nvn_smoke.so)

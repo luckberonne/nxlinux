@@ -14,15 +14,12 @@
 #include <sys/uio.h>
 #include <sys/resource.h>
 #include <pthread.h>
+#include "../../host/compat.h"      // clock_gettime_nsec_np, mach_absolute_time, mach_timebase_info
 #include "../../host/module.h"
 
 #define DM_MEM_CAP_DEFAULT_GB 0
 
 // ---- Clocks. Mach time units are nanoseconds here (numer == denom == 1)
-typedef struct { uint32_t numer, denom; } mach_timebase_info_data_t;
-static inline int mach_timebase_info(mach_timebase_info_data_t *t) { t->numer = t->denom = 1; return 0; }
-static inline uint64_t clock_gettime_nsec_np(clockid_t id) { struct timespec ts; clock_gettime(id, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
-static inline uint64_t mach_absolute_time(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC); }
 static inline int mach_wait_until(uint64_t abs_ns) {
     struct timespec ts = {(time_t)(abs_ns / 1000000000ull), (long)(abs_ns % 1000000000ull)};
     return clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);

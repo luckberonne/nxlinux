@@ -8,6 +8,7 @@
 //  - HLE_FORCE_BIG is HLE_FORCE: guest threads run guest code in the emulator and the host function runs on the thread's own big host stack.
 #pragma once
 #include "dm.h"
+#include "compat.h"
 typedef struct { const char *name; void *fn; } hle_ent;
 #define HLE(mangled, ret, cname, ...)                                                             \
     static ret cname(__VA_ARGS__);                                                                \
@@ -37,12 +38,18 @@ void guest_clock_read_wait(void);     // A guest read of the system counter: wai
 // Forced takeover: even if the SDK module has a definition, all references to that symbol at load time (JUMP_SLOT/GLOB_DAT/ABS64) are resolved to the host implementation.
 // Used only for the service-layer nn:: (service clients of fs/oe/aoc/pctl...); the SDK's libc++ and nn::os internals do not go into this table.
 // Every entry must state the reason for the takeover; an entry in the table that no module references makes loading report a failure and abort (a wrong list must fail loudly).
-typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
+// 32 bytes: the compiler aligns a static record of 24 to 16 in its own section and leaves holes between entries, which the walk over the section would trip on
+typedef struct { const char *name; void *fn; const char *why; const void *pad; } hle_force_ent;
 #define HLE_FORCE(mangled, why, ret, cname, ...)                                                   \
     static ret cname(__VA_ARGS__);                                                                \
-    __attribute__((used, section("swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why}; \
+    __attribute__((used, section("swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why, 0}; \
     static ret cname(__VA_ARGS__)
 #define HLE_FORCE_BIG HLE_FORCE
+
+// Service-layer SystemEvents (svc/events_stub.c): bind a guest SystemEventType to a kernel event, signal it, clear it
+void hle_bind_system_event(void *ev, int autoclear);
+void hle_signal_system_event(void *ev);
+void hle_clear_system_event(void *ev);
 
 // Registers every HLE and HLE_FORCE entry of the program with hle_register (hle_stub.h). Call once at startup, before relocating modules.
 void hle_collect_sections(void);

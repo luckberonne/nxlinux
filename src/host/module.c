@@ -54,6 +54,7 @@ static unsigned relr_apply(const module_t *m, uint64_t relr, uint64_t relrsz) {
 
 static uint64_t bind(const module_t *m, const Elf64_Sym *s, module_t **loaded, int nloaded, int *unimpl) {
     const char *nm = m->strtab + s->st_name;
+    if (hle_is_forced(nm)) return hle_stub_for(nm);                // a forced takeover wins over any definition
     for (int i = 0; i < nloaded; i++) { uint64_t a = module_sym(loaded[i], nm); if (a) return a; }
     if (s->st_shndx) return m->base + s->st_value;            // defined here, nothing earlier overrides it
     if (!hle_implements(nm) && ELF64_ST_BIND(s->st_info) == STB_WEAK) return 0;   // an undefined weak symbol is 0
