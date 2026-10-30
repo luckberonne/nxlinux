@@ -340,6 +340,25 @@ void nvn_vk_debug_texstats(void) {
     for (unsigned i = 0; i < ns; i++) {
         vktex_t *e = find(sers[i]); if (!e || e->d.width * e->d.height > 4096u * 4096u || e->d.target == NVN_TEXTURE_TARGET_3D) continue;
         size_t tot = 0; long lit = nvn_vk_debug_lit(sers[i], &tot, NULL); total++;
+        if (e->d.target == NVN_TEXTURE_TARGET_2D_ARRAY && getenv("NX_TEX_ARRAYS"))   // NX_TEX_ARRAYS=1: every 2D array texture (font sheets are)
+            fprintf(stderr, "[dm] [nvn] array texture serial %llu %ux%ux%u levels %u fmt %#x flags %#x layer size %#llx state %u\n", (unsigned long long)sers[i], e->d.width, e->d.height, e->d.depth,
+                    e->levels, e->d.format, e->d.flags, (unsigned long long)e->L.layer_size, __atomic_load_n(&e->st[0], __ATOMIC_ACQUIRE));
+        if (e->d.target == NVN_TEXTURE_TARGET_2D_ARRAY && e->d.format == 0x49 && getenv("NX_TEX_ARRAYS") && getenv("NX_FRAME_DUMP") && e->mem) {   // a BC4 sheet's layer 0, de-swizzled, raw blocks
+            uint32_t bw4 = (e->d.width + 3) / 4, bh4 = (e->d.height + 3) / 4; uint8_t *lin = malloc((size_t)bw4 * bh4 * 8);
+            if (!nvn_deswizzle(&e->d, 0, 0, e->mem, lin, (size_t)bw4 * 8)) { char fn[600]; snprintf(fn, sizeof fn, "%s.bc4_%llu.raw", getenv("NX_FRAME_DUMP"), (unsigned long long)sers[i]);
+                FILE *o = fopen(fn, "wb"); if (o) { fwrite(lin, 1, (size_t)bw4 * bh4 * 8, o); fclose(o); } }
+            free(lin);
+        }
+        if (e->d.flags & NVN_TEXTURE_FLAGS_LINEAR) {   // a linear texture (a glyph cache): its whole storage as the CPU sees it, and who owns level 0
+            size_t nzb = 0; for (size_t q = 0; e->mem && q < e->L.size; q++) nzb += e->mem[q] != 0;
+            fprintf(stderr, "[dm] [nvn] linear texture serial %llu %ux%u fmt %#x stride %u: %zu of %llu storage bytes not zero, level 0 state %u, mem %p\n", (unsigned long long)sers[i], e->d.width, e->d.height,
+                    e->d.format, e->d.stride, nzb, (unsigned long long)e->L.size, __atomic_load_n(&e->st[0], __ATOMIC_ACQUIRE), (const void *)e->mem);
+            const char *pre = getenv("NX_FRAME_DUMP");
+            if (pre && e->mem && e->d.format == NVN_FORMAT_R8 && e->d.stride) {   // the glyph cache as a PGM
+                char fn[600]; snprintf(fn, sizeof fn, "%s.linear%llu.pgm", pre, (unsigned long long)sers[i]);
+                FILE *o = fopen(fn, "wb"); if (o) { fprintf(o, "P5\n%u %u\n255\n", e->d.width, e->d.height); for (uint32_t y = 0; y < e->d.height; y++) fwrite(e->mem + (size_t)y * e->d.stride, 1, e->d.width, o); fclose(o); }
+            }
+        }
         if (lit == 0) { empty++; if (shown < 12) { shown++; fprintf(stderr, "[dm] [nvn] empty texture serial %llu %ux%u fmt %#x flags %#x\n", (unsigned long long)sers[i], e->d.width, e->d.height, e->d.format, e->d.flags); } }
         else big++;
     }

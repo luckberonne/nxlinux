@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 enum { NVN_STAGE_VERTEX = 0, NVN_STAGE_FRAGMENT = 1, NVN_STAGE_GEOMETRY = 2, NVN_STAGE_TESS_CONTROL = 3, NVN_STAGE_TESS_EVAL = 4, NVN_STAGE_COMPUTE = 5 };   // NVNshaderStage
-enum { NVN_SB_CBUF = 1, NVN_SB_TEX = 2, NVN_SB_SUPPORT = 3, NVN_SB_DRV0 = 4, NVN_SB_DRV2 = 5, NVN_SB_SBUF = 6 };   // SBUF: reg = the slot of the stage's storage buffer table in c[0], aux = the translator's flags (bit 0: written)    // binding kinds (dmsh_abi.h DMSH_KIND_*); more as the draw path grows: storage buffers, the driver segments
+enum { NVN_SB_CBUF = 1, NVN_SB_TEX = 2, NVN_SB_SUPPORT = 3, NVN_SB_DRV0 = 4, NVN_SB_DRV2 = 5, NVN_SB_SBUF = 6, NVN_SB_C1 = 7 };   // C1: the shader's own constant segment c[1], from the library   // SBUF: reg = the slot of the stage's storage buffer table in c[0], aux = the translator's flags (bit 0: written)    // binding kinds (dmsh_abi.h DMSH_KIND_*); more as the draw path grows: storage buffers, the driver segments
 
 // Vulkan binding in descriptor set 0, what it is, and its slot (a cbuf's uniform slot; a combined texture's c2 slot). aux: for a texture, the translator's SamplerType (3 = 2D)
 typedef struct { uint32_t binding; uint32_t kind; uint32_t reg; uint32_t aux; } nvn_shbind;
@@ -18,6 +18,7 @@ typedef struct {
     uint32_t needs;               // NVN_NEED_* bits
     const uint32_t *spirv; size_t bytes;
     const nvn_shbind *binds; int nbinds;
+    const uint8_t *c1; size_t c1_bytes;   // the constant segment c[1] the game's shader package carries (NVN_SB_C1 bindings read it); may be empty
 } nvn_shader_desc;
 
 void nvn_vk_shader_register(const uint8_t key[8], const nvn_shader_desc *d);   // copies everything; registering a key again replaces it

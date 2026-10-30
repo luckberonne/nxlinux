@@ -12,6 +12,7 @@ typedef struct nvn_shader {
     int stage; uint32_t needs;
     uint32_t *spirv; size_t bytes;
     nvn_shbind *binds; int nbinds;
+    uint8_t *c1; size_t c1_bytes; vkbuf_t c1buf; int c1made;   // c[1] and the uniform buffer holding it, made on first use
     VkShaderModule module;                 // made on first use
     struct nvn_shader *next;
 } nvn_shader;
@@ -25,6 +26,7 @@ void nvn_vk_shader_register(const uint8_t key[8], const nvn_shader_desc *d) {
     nvn_shader *s = calloc(1, sizeof *s);
     memcpy(s->key, key, 8); s->stage = d->stage; s->needs = d->needs;
     s->spirv = malloc(d->bytes); memcpy(s->spirv, d->spirv, d->bytes); s->bytes = d->bytes;
+    if (d->c1_bytes) { s->c1 = malloc(d->c1_bytes); memcpy(s->c1, d->c1, d->c1_bytes); s->c1_bytes = d->c1_bytes; }
     s->binds = malloc((d->nbinds ? d->nbinds : 1) * sizeof *s->binds); if (d->nbinds) memcpy(s->binds, d->binds, d->nbinds * sizeof *s->binds); s->nbinds = d->nbinds;
     pthread_mutex_lock(&g_mu);
     for (nvn_shader **p = &g_head; *p; p = &(*p)->next)
@@ -43,6 +45,19 @@ const nvn_shader *nvn_shader_find(const uint8_t key[8]) {
 int nvn_shader_stage(const nvn_shader *s) { return s->stage; }
 uint32_t nvn_shader_needs(const nvn_shader *s) { return s->needs; }
 const nvn_shbind *nvn_shader_binds(const nvn_shader *s, int *n) { *n = s->nbinds; return s->binds; }
+enum { C1_SIZE = 4096 };                   // the buffer covers what a uniform block of the translator may declare beyond the 0x100 captured bytes (zeros)
+VkDescriptorBufferInfo nvn_shader_c1(const nvn_shader *cs) {
+    nvn_shader *s = (nvn_shader *)cs;
+    pthread_mutex_lock(&g_mu);
+    if (!s->c1made) {
+        vkctx_t *c = nvn_vk_ctx(); s->c1made = 1;
+        if (c && !vkbuf_create(c, &s->c1buf, C1_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 1)) { memset(s->c1buf.map, 0, C1_SIZE); memcpy(s->c1buf.map, s->c1, s->c1_bytes < C1_SIZE ? s->c1_bytes : C1_SIZE); }
+        else s->c1buf.buf = VK_NULL_HANDLE;
+    }
+    VkDescriptorBufferInfo r = {s->c1buf.buf, 0, C1_SIZE};
+    pthread_mutex_unlock(&g_mu);
+    return r;
+}
 VkShaderModule nvn_shader_module(nvn_shader *s) {
     pthread_mutex_lock(&g_mu);
     if (!s->module) {
@@ -67,7 +82,7 @@ int nvn_vk_shader_load_library(const char *path) {
     uint32_t ver, cnt;
     if (n < 12 || memcmp(d, "NXSL", 4)) { fprintf(stderr, "[dm] [RED] [nvn] %s is not a shader library\n", path); goto done; }
     memcpy(&ver, d + 4, 4); memcpy(&cnt, d + 8, 4);
-    if (ver != 2) { fprintf(stderr, "[dm] [RED] [nvn] shader library %s has version %u, expected 2\n", path, ver); goto done; }
+    if (ver != 2 && ver != 3) { fprintf(stderr, "[dm] [RED] [nvn] shader library %s has version %u, expected 2 or 3\n", path, ver); goto done; }
     size_t off = 12; count = 0;
     for (uint32_t i = 0; i < cnt; i++) {
         uint32_t h[4];
@@ -78,8 +93,15 @@ int nvn_vk_shader_load_library(const char *path) {
         nvn_shbind *binds = malloc((nb ? nb : 1) * sizeof *binds);
         for (uint32_t b = 0; b < nb; b++) memcpy(&binds[b], d + off + 16 * b, 16);
         off += (size_t)nb * 16;
+        const uint8_t *c1 = NULL; uint32_t n1 = 0;
+        if (ver == 3) {                                                  // the constant segment c[1]
+            if (off + 4 > (size_t)n) { free(binds); fprintf(stderr, "[dm] [RED] [nvn] shader library %s: entry %u is damaged\n", path, i); count = -1; goto done; }
+            memcpy(&n1, d + off, 4); off += 4;
+            if (n1 > (size_t)n - off || nbytes > (size_t)n - off - n1) { free(binds); fprintf(stderr, "[dm] [RED] [nvn] shader library %s: entry %u is damaged\n", path, i); count = -1; goto done; }
+            c1 = d + off; off += n1;
+        }
         uint32_t *code = malloc(nbytes); memcpy(code, d + off, nbytes); off += nbytes;
-        nvn_shader_desc desc = {(int)stage, needs, code, nbytes, binds, (int)nb};
+        nvn_shader_desc desc = {(int)stage, needs, code, nbytes, binds, (int)nb, c1, n1};
         nvn_vk_shader_register(key, &desc);
         free(binds); free(code); count++;
     }

@@ -23,6 +23,7 @@ const nvn_shader *nvn_shader_find(const uint8_t key[8]);
 int nvn_shader_stage(const nvn_shader *s);
 uint32_t nvn_shader_needs(const nvn_shader *s);
 const nvn_shbind *nvn_shader_binds(const nvn_shader *s, int *n);
+VkDescriptorBufferInfo nvn_shader_c1(const nvn_shader *s);       // the shader's constant segment c[1] as a uniform buffer (nvn_shader_vk.c)
 VkShaderModule nvn_shader_module(nvn_shader *s);
 
 nvn_rt_t g_rt;
@@ -320,7 +321,9 @@ static VkBuffer zero_storage(vkctx_t *c) {                        // what an unb
     return z.buf;
 }
 static void skip(const char *why, int *flag) {
-    atomic_fetch_add(&g_nskip, 1);
+    unsigned k = atomic_fetch_add(&g_nskip, 1);
+    { static int lg = -1; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;   // NX_SKIP_LOG=1: every skipped draw with its reason, 1 in 64 after the first 400
+      if (lg && (k < 400 || k % 64 == 0)) fprintf(stderr, "[dm] [nvn] skip #%u: %s\n", k, why); }
     if (!__atomic_exchange_n(flag, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [RED] [nvn] draw skipped: %s\n", why);
 }
 
@@ -349,7 +352,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     if (!c || !cb) return 0;
     if (!c->has_push_descriptor) { skip("the device lacks VK_KHR_push_descriptor", &f_off); return 0; }
     if (!S.prog || !S.nkeys) { skip("no program is bound", &f_noprog); return 0; }
-    const nvn_shader *vs = NULL, *fs = NULL;
+    const nvn_shader *vs = NULL, *fs = NULL; int focus = 0;
     for (int i = 0; i < S.nkeys; i++) {
         const nvn_shader *s = nvn_shader_find(S.keys[i]);
         if (!s) continue;
@@ -378,6 +381,9 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
                   if (dd && cnt < 24) { cnt++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); uint64_t sr = nvn_vk_desc_serial(S.tex[si][b[i].reg]); size_t tot = 0; char pn[300]; snprintf(pn, sizeof pn, "/tmp/claude-1000/-home-lucas-Proyectos-nxlinux/4e412c71-58e2-49fb-bfd2-dd41fc221dfa/scratchpad/tex_%llu.ppm", (unsigned long long)sr); long lit = sr ? nvn_vk_debug_lit(sr, &tot, pn) : -2;
                     fprintf(stderr, "[dm] [nvn] draw samples handle %#x (texture id %u, sampler %u) serial %llu: %ld of %zu bytes not zero\n", S.tex[si][b[i].reg], S.tex[si][b[i].reg] & 0xfffff, S.tex[si][b[i].reg] >> 20, (unsigned long long)sr, lit, tot); } }
                 int r = nvn_vk_desc_sampled(S.tex[si][b[i].reg], (int)b[i].aux, &ti[nt]);
+                { static long fs = -2; if (fs == -2) fs = getenv("NX_DRAW_SERIAL") ? atol(getenv("NX_DRAW_SERIAL")) : -1;   // NX_DRAW_SERIAL=<texture serial>: details of the draws that sample it
+                  extern uint64_t nvn_vk_desc_serial(uint32_t); if (fs >= 0 && nvn_vk_desc_serial(S.tex[si][b[i].reg]) == (uint64_t)fs) { focus = 1;
+                    fprintf(stderr, "[dm] [nvn] focus draw: stage %d slot %u handle %#x sampler type %#x result %d, prim %u, vs %p fs %p\n", si, b[i].reg, S.tex[si][b[i].reg], b[i].aux, r, prim, (const void *)vs, (const void *)fs); } }
                 { static int dd2 = -1; static unsigned cnt2; if (dd2 < 0) dd2 = getenv("NX_DRAW_DETAIL") != NULL;       // the same texture read again once the draw path has made it ready (the GPU copy)
                   if (dd2 && cnt2 < 12) { cnt2++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); extern int mtl_tex_gpu_owned(uint64_t); uint64_t sr = nvn_vk_desc_serial(S.tex[si][b[i].reg]); size_t tot = 0; long lit = sr ? nvn_vk_debug_lit(sr, &tot, NULL) : -2;
                     fprintf(stderr, "[dm] [nvn] after sampling: serial %llu result %d gpu-owned %d: %ld of %zu bytes not zero\n", (unsigned long long)sr, r, sr ? mtl_tex_gpu_owned(sr) : -1, lit, tot); } }
@@ -466,6 +472,16 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.st_ref[0]); vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.st_ref[1]);
 
     // vertex buffers
+    static _Atomic unsigned nfocus;
+    if (focus && atomic_fetch_add(&nfocus, 1) < 6) {
+        fprintf(stderr, "[dm] [nvn] focus: viewport %g %g %g x %g, %d streams, %d attributes:", v.x, v.y, v.width, v.height, S.nstream, S.nattr);
+        for (int a = 0; a < S.nattr; a++) { va_st va; memcpy(&va, &S.attr[a], sizeof va); fprintf(stderr, " [loc %d fmt %#x off %u stream %u]", a, va.fmt, (unsigned)va.offset, (unsigned)va.stream); }
+        fprintf(stderr, "\n");
+        for (int i = 0; i < S.nstream; i++) if (S.vbuf[i].address) { const uint32_t *w = (const uint32_t *)(uintptr_t)S.vbuf[i].address;
+            fprintf(stderr, "[dm] [nvn] focus stream %d stride %u size %llu:", i, S.stream[i].stride, (unsigned long long)S.vbuf[i].size); for (int q = 0; q < 24; q++) fprintf(stderr, " %08x", w[q]); fprintf(stderr, "\n"); }
+        for (int si = 0; si < 2; si++) for (int r = 0; r < 4; r++) if (S.ubo[si][r].addr) { const uint32_t *w = (const uint32_t *)(uintptr_t)S.ubo[si][r].addr;
+            fprintf(stderr, "[dm] [nvn] focus ubo stage %d slot %d size %llu:", si, r, (unsigned long long)S.ubo[si][r].size); for (int q = 0; q < 24 && q * 4 < (int)S.ubo[si][r].size; q++) fprintf(stderr, " %08x", w[q]); fprintf(stderr, "\n"); }
+    }
     for (int i = 0; i < S.nstream; i++) {
         VkBuffer b; VkDeviceSize off;
         { static int dd3 = -1; static unsigned cnt3; if (dd3 < 0) dd3 = getenv("NX_DRAW_DETAIL") != NULL;
@@ -484,6 +500,12 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
             for (int i = 0; i < n && nw < 32; i++) {
                 if (b[i].kind == NVN_SB_SUPPORT || b[i].kind == NVN_SB_DRV0 || b[i].kind == NVN_SB_DRV2) {
                     bi[nw] = driver_buffer(c, (int)b[i].kind, si, vw, vh);
+                    wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nw]};
+                    nw++; continue;
+                }
+                if (b[i].kind == NVN_SB_C1) {
+                    bi[nw] = nvn_shader_c1(sh[si]);
+                    if (!bi[nw].buffer) bi[nw] = (VkDescriptorBufferInfo){zero_buffer(c), 0, 4096};
                     wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nw]};
                     nw++; continue;
                 }

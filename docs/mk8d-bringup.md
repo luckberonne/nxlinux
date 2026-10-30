@@ -2,7 +2,8 @@
 
 State on 2026-10-30: the 4.0.1 build (a 64-bit process) boots, runs its preload, renders with the translated shader library and shows its title
 splash (the key art with the logo) in the SDL window at 60 Hz. Pressing A passes the title and reaches the player-select menu (input is done, see
-[Controls](#controls)). Not done: audio, text in the menus (the labels are blank), races (never reached), the movie decoder (`nvdrv` command 13: its thread faults,
+[Controls](#controls)). Since the shaders' constant segment c[1] is bound, the menu text and the intro screens are drawn; the glyphs come out as
+horizontal slices (the font sheets themselves de-swizzle correctly; the text draw's per-character data is next to look at) and the menu background is black. Not done: audio, races (never reached), the movie decoder (`nvdrv` command 13: its thread faults,
 the rest goes on), texture writes by the CPU after a texture's first use. The 1.0.0 base alone is a 32-bit process and
 boots too, but it has not been taken as far (see [The 32-bit base](#the-32-bit-base-1-0-0)).
 
@@ -112,6 +113,10 @@ All are environment variables; nothing costs anything when unset.
 | `NX_FRAME_DUMP=<prefix>` | write presented frames 100, 400, 1000, 2500 and every 1500th to `<prefix>.<n>.ppm`, with the count of non-black pixels and statistics of the offscreen target |
 | `NX_DRAW_LOG=1` | first draws, per-target draw counts every 4000 draws, the first render-target sets |
 | `NX_DRAW_DETAIL=1` | for a few draws: pipeline state, vertex stream and uniform contents, sampled texture (and a PPM of it), texture uploads, viewport |
+| `NX_SKIP_LOG=1` | every skipped draw with its reason (1 in 64 after the first 400) |
+| `NX_DRAW_SERIAL=<serial>` | details of the draws that sample that texture: attributes, the first vertex words, the bound uniform buffers |
+| `NX_TEX_ARRAYS=1` | with `NX_FRAME_DUMP`: list the 2D array textures at frame 1000 and write layer 0 of the BC4 ones (font sheets) as raw blocks |
+| `NX_TEX_NO_RECHECK=1` | do not hash texture storage to catch CPU rewrites after the first upload |
 | `NX_HID_TAP=<bit>[:<s>]` | press that `NpadButton` bit (0 = A) for 150 ms every `<s>` seconds (default 4), for runs nobody sits at |
 | `NX_NO_CULL=1`, `NX_TEX_CLEAN=1`, `NX_NVN_ITEMS=1` | test switches: no culling, textures start clean, log each device-info item queried |
 | `NX_TRACE_SVC` | 32-bit: every SVC and hook. 64-bit: `1` = the first 3000 SVCs, `<name part>` = only the hooks whose name contains it, without limit |

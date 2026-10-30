@@ -109,7 +109,7 @@ Esta máquina es un Ryzen 5 7535HS (x86_64) con una RTX 2050 y una Radeon 680M, 
 | 1. CPU, loader, SVC | **Hecha con sintéticos.** Un `Jit` por hilo, cargador de NSO/ELF con relocaciones, HLE por `svc`, planificador de hilos Horizon, SVC de memoria, hilos, sincronización, eventos. Falta probarla con un NSO retail. |
 | 2. Servicios y plataforma | **No empezada** (salvo lo que NVN necesita). ~760 hooks `nn::*`, SDL3, audio, entrada, ffmpeg. |
 | 3. Vulkan | **Avanzada.** Pools importados con host-pointer, colas y fences, repetición de ~45 operaciones, texturas (subida por subrecurso), limpiezas, dibujos (estado, pipelines, blending, profundidad, índices, UBO) y muestreo de texturas 2D. Validación de Vulkan limpia. |
-| 4. Shaders | **Cadena montada.** Maxwell → SPIR-V (traductor Ryujinx vendido) → biblioteca NXSL v2 → registro por clave → dibujo. Probada con shaders ensamblados a mano (`tools/maxwell_asm.py`). |
+| 4. Shaders | **Cadena montada.** Maxwell → SPIR-V (traductor Ryujinx vendido) → biblioteca NXSL v3 (con el segmento de constantes c[1] de cada shader) → registro por clave → dibujo. Probada con shaders ensamblados a mano (`tools/maxwell_asm.py`). |
 | 5. Pulido | No empezada. |
 
 17 etapas de dibujo, 16 tests en CTest. Los controles negativos con `NX_NULL_GPU=1` fallan como deben.

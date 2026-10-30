@@ -39,6 +39,8 @@ def main(argv=None):
     print(f'{len(jobs)} shaders ({other} without a graphics program header, translated as compute)')
     p = subprocess.run(['dotnet', a.xlate, str(work / 'jobs.json'), str(work / 'out')], capture_output=True, text=True)
     print(p.stdout.strip().splitlines()[-1] if p.stdout.strip() else p.stderr.strip()[-300:])
+    for job in jobs:                 # the constant segment c[1] goes into the library beside each shader (shader_pack.py reads <key>.c1)
+        if 'c1' in job and (work / 'out').is_dir(): (work / 'out' / (job['key'] + '.c1')).write_bytes(bytes.fromhex(job['c1']))
     r = subprocess.run([sys.executable, str(REPO / 'tools' / 'shader_pack.py'), a.out, str(work / 'out')], capture_output=True, text=True)
     print((r.stdout or r.stderr).strip()[-400:])
     return r.returncode

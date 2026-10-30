@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Packs the translator's output (<key>.spv + <key>.res.json, see tools/dmsh_xlate) into one shader library the host loads with nvn_vk_shader_load_library.
 
-Usage: shader_pack.py out.nxsl <translator output dir>          (every <key>.spv with a <key>.res.json beside it; <key> is the 16 hex digits of the 8-byte shader key)
+Usage: shader_pack.py out.nxsl <translator output dir>          (every <key>.spv with a <key>.res.json beside it; <key> is the 16 hex digits of the 8-byte shader key;
+                                                                 a <key>.c1 beside them is the shader's constant segment c[1])
 
-Library (little endian): "NXSL", u32 version (2), u32 count; per shader: key[8], u32 stage (NVN_STAGE_*), u32 needs, u32 nbinds, u32 spirv bytes, then nbinds x
-{u32 binding, u32 kind, u32 reg, u32 aux}, then the SPIR-V. `needs` marks what the shader reads that the draw path cannot supply yet, so the host can say so and skip the draw
+Library (little endian): "NXSL", u32 version (3), u32 count; per shader: key[8], u32 stage (NVN_STAGE_*), u32 needs, u32 nbinds, u32 spirv bytes, then nbinds x
+{u32 binding, u32 kind, u32 reg, u32 aux}, then u32 c1 bytes and the c[1] contents (version 3 only), then the SPIR-V. `needs` marks what the shader reads that the draw path cannot supply yet, so the host can say so and skip the draw
 instead of running it wrong:
-  2 the shader's own constant segment c[1]   8 storage buffers   16 textures   32 images   64 a geometry shader's helper buffers
+  2 the shader's own constant segment c[1] when its contents were not captured (otherwise it is a kind 7 binding)   8 storage buffers   16 textures   32 images   64 a geometry shader's helper buffers
   (1 and 4, the driver segments c[0] and c[2], are bindings now: kinds 4 and 5, filled by the host per draw; so is the translator's support buffer, kind 3, when the module reads it)
 Uniform buffers c[3 + reg] are plain bindings (kind 1 = cbuf, reg = the NVN uniform slot); a plain 2D texture read through a combined handle is kind 2 (reg = its c[2] slot,
 aux = the SamplerType).
@@ -15,7 +16,7 @@ import json, struct, sys
 from pathlib import Path
 
 STAGE = {'vs': 0, 'ps': 1, 'cs': 5}          # NVN_STAGE_VERTEX, FRAGMENT, COMPUTE
-KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF = 1, 2, 3, 4, 5, 6
+KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF, KIND_C1 = 1, 2, 3, 4, 5, 6, 7
 C0_SSBO = {'vs': 0x110, 'cs': 0x310, 'gs': 0x410, 'ps': 0x510}      # the stage's storage buffer table in driver segment c[0] (src/gfx/nvn/dmsh_abi.h): 16 slots of 0x10 bytes
 C0_SSBO_SLOTS = 16
 SAMPLER_TYPES = {1, 3, 4, 5}                 # the translator's SamplerType 1D, 2D, 3D and cube; Array (256) and Shadow (1024) may be added, Multisample (512) and buffers (2) may not
@@ -78,22 +79,26 @@ def support_binding(spirv):
     return None
 
 
-def entry(key_hex, spirv, res):
-    """One library entry from a translated shader"""
+def entry(key_hex, spirv, res, c1=b''):
+    """One library entry from a translated shader; c1: the constant segment c[1] as the game's shader package has it (empty: not captured)"""
     key = bytes.fromhex(key_hex)
     if len(key) != 8: raise ValueError(f'a shader key is 8 bytes, got {key_hex!r}')
     if len(spirv) % 4: raise ValueError('SPIR-V is a whole number of words')
     needs, binds = 0, []
     for binding, slot in sorted(uniform_blocks(spirv).items()):
         if slot == 0: binds.append((binding, KIND_DRV0, 0, 0))
-        elif slot == 1: needs |= NEEDS_C1
+        elif slot == 1:
+            if c1: binds.append((binding, KIND_C1, 0, 0))
+            else: needs |= NEEDS_C1
         elif slot == 2: binds.append((binding, KIND_DRV2, 0, 0))
         else: binds.append((binding, KIND_CBUF, slot - 3, 0))
     for cb in res.get('cbufs', []):
         if cb['binding'] not in (b[0] for b in binds):                 # a block the module does not name the usual way
             slot = cb['slot']
             if slot == 0: binds.append((cb['binding'], KIND_DRV0, 0, 0))
-            elif slot == 1: needs |= NEEDS_C1
+            elif slot == 1:
+                if c1: binds.append((cb['binding'], KIND_C1, 0, 0))
+                else: needs |= NEEDS_C1
             elif slot == 2: binds.append((cb['binding'], KIND_DRV2, 0, 0))
             else: binds.append((cb['binding'], KIND_CBUF, slot - 3, 0))
     for sb in res.get('sbufs', []):
@@ -110,23 +115,26 @@ def entry(key_hex, spirv, res):
     sb = support_binding(spirv)
     if sb is not None: binds.append((sb, KIND_SUPPORT, 0, 0))
     stage = STAGE[res['stage']]
-    return key + struct.pack('<4I', stage, needs, len(binds), len(spirv)) + b''.join(struct.pack('<4I', *b) for b in binds) + spirv
+    c1 = bytes(c1) + b'\0' * (-len(c1) % 4)
+    return key + struct.pack('<4I', stage, needs, len(binds), len(spirv)) + b''.join(struct.pack('<4I', *b) for b in binds) + struct.pack('<I', len(c1)) + c1 + spirv
 
 
 def pack(entries):
-    return b'NXSL' + struct.pack('<II', 2, len(entries)) + b''.join(entries)
+    return b'NXSL' + struct.pack('<II', 3, len(entries)) + b''.join(entries)
 
 
 def unpack(data):
-    """The inverse, for tests: [{key, stage, needs, binds, spirv}]"""
+    """The inverse, for tests: [{key, stage, needs, binds, c1, spirv}]"""
     if data[:4] != b'NXSL': raise ValueError('not a shader library')
     ver, n = struct.unpack_from('<II', data, 4)
-    if ver != 2: raise ValueError(f'library version {ver}')
+    if ver not in (2, 3): raise ValueError(f'library version {ver}')
     off, out = 12, []
     for _ in range(n):
         key = data[off:off + 8]; stage, needs, nb, nbytes = struct.unpack_from('<4I', data, off + 8); off += 24
         binds = [struct.unpack_from('<4I', data, off + 16 * i) for i in range(nb)]; off += 16 * nb
-        out.append({'key': key.hex(), 'stage': stage, 'needs': needs, 'binds': binds, 'spirv': data[off:off + nbytes]}); off += nbytes
+        c1 = b''
+        if ver == 3: n1, = struct.unpack_from('<I', data, off); c1 = data[off + 4:off + 4 + n1]; off += 4 + n1
+        out.append({'key': key.hex(), 'stage': stage, 'needs': needs, 'binds': binds, 'c1': c1, 'spirv': data[off:off + nbytes]}); off += nbytes
     return out
 
 
@@ -138,7 +146,8 @@ def main(argv):
         if spv.name.endswith('.reader.spv'): continue
         res = spv.with_suffix('.res.json')
         if not res.exists(): sys.exit(f'{spv}: no {res.name} beside it')
-        entries.append(entry(spv.stem, spv.read_bytes(), json.loads(res.read_text())))
+        c1 = spv.with_suffix('.c1')
+        entries.append(entry(spv.stem, spv.read_bytes(), json.loads(res.read_text()), c1.read_bytes() if c1.is_file() else b''))
     out.write_bytes(pack(entries))
     print(f'{out}: {len(entries)} shader(s)')
 
