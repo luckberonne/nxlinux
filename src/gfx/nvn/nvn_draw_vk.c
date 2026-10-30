@@ -269,6 +269,7 @@ void nvn_draw_pass_end(void) {
     P.active = 0;
     nvn_vk_barrier_mark();                 // deferred: what the draws wrote is visible to whatever reads it next
 }
+int nvn_draw_pass_active(void) { return P.active; }
 void nvn_draw_new_submission(void) { P.active = 0; P.bound = VK_NULL_HANDLE; }
 
 static int rt_same(const nvn_rt_t *a, const nvn_rt_t *b) { return !memcmp(a, b, sizeof *a); }
@@ -280,6 +281,7 @@ static int pass_begin(vkctx_t *c, VkCommandBuffer cb) {
     VkRenderingAttachmentInfo ca[8], da, sa;
     uint32_t w = 0, h = 0, layers = 1;
     nvn_draw_pass_end();                                          // the targets may differ from the open pass's
+    nvn_vk_barrier_flush(cb);                                     // the barrier the closed pass left pending goes before the new pass begins: a barrier cannot be recorded inside one
     for (int i = 0; i < g_rt.n; i++) {
         memset(&col[i], 0, sizeof col[i]);
         ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -374,7 +376,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     state_init();
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd_raw();
     if (!c || !cb) return 0;
-    nvn_vk_barrier_flush(cb);
+    if (!P.active) nvn_vk_barrier_flush(cb);                      // never inside an open pass
     if (!c->has_push_descriptor) { skip("the device lacks VK_KHR_push_descriptor", &f_off); return 0; }
     if (!S.prog || !S.nkeys) { skip("no program is bound", &f_noprog); return 0; }
     const nvn_shader *vs = NULL, *fs = NULL; int focus = 0;

@@ -107,7 +107,7 @@ void mtl_exec(const uint8_t *p) {
         case OP_CLEAR_BUF: { const p_clear_buf *cb = (const p_clear_buf *)a; mtl_sub_fill(cb->addr, cb->size, cb->value); break; }
         case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s_, d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); update_ub(d, n, a + 16); break; }
-        case OP_BARRIER: { VkCommandBuffer cb = nvn_vk_cmd_raw(); if (cb) { nvn_vk_barrier_flush(cb); nvn_vk_barrier_all(cb); } break; }   // a full barrier covers every combination of the game's bits; it does not end the pass
+        case OP_BARRIER: { VkCommandBuffer cb = nvn_vk_cmd_raw(); if (!cb) break; if (nvn_draw_pass_active()) nvn_vk_barrier_mark(); else { nvn_vk_barrier_flush(cb); nvn_vk_barrier_all(cb); } break; }   // a full barrier covers every combination of the game's bits; inside a pass it cannot be recorded, so it waits for the pass to end
         case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) g_copy_img = (uint64_t)cs->stride; else g_copy_row = (uint64_t)cs->stride; break; }
         case OP_COPY_B2T: nvn_vk_copy_b2t((const p_copy_b2t *)a, g_copy_row, g_copy_img); break;
         case OP_COPY_T2B: nvn_vk_copy_t2b((const p_copy_b2t *)a, g_copy_row, g_copy_img); break;   // the record is a p_copy_b2t whose src is the destination buffer

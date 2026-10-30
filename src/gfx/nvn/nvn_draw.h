@@ -8,6 +8,7 @@ extern nvn_rt_t g_rt;
 extern struct nvn_scissor_state { int has; int r[4]; } g_sc;       // x, y, w, h once the game set a scissor
 
 void nvn_draw_pass_end(void);                    // closes the render pass, if one is open (everything but a draw needs it closed)
+int nvn_draw_pass_active(void);                 // 1 while a render pass is open: no barrier can be recorded then
 void nvn_draw_new_submission(void);              // a new command buffer: nothing is bound in it yet
 int nvn_draw_state_op(uint32_t op, const void *payload);    // state records the draw reads; 1 if consumed
 void nvn_draw(const p_draw *d);
