@@ -99,6 +99,8 @@ failed to allocate and created textures in a NULL pool. The game then needs `Par
   A disabled vertex attribute (format NONE) keeps its location, trailing ones are dropped, and streams no enabled attribute reads need no buffer.
 - A title may pass a NULL memory pool to texture and buffer creation when its allocator record is empty. Those objects get a slice of a private
   pool (`fallback_pool`) so the title does not crash; the real cause was always upstream (see the Mii note above).
+- Memory pools: a course load creates well over a thousand. `nvn_vk.c` holds up to 16384 (`MAX_POOLS`), sorted by base so `pool_find` is a
+  binary search; the old 1024-entry table filled up (`pool table full`) while a course loaded.
 - Device info: the API version comes from `NX_NVN_API`; items 0x2E..0x31 report the GPU-code range the translator supports.
 - Textures of 1920x1080 RGB10A2 are the title's offscreen scene target; the window textures are the swap chain (serials 2, 3, 4).
 
