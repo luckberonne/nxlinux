@@ -273,6 +273,7 @@ static uint32_t nvdrv(int session, const ipc_in_t *in, ipc_out_t *out) {
     case 3: OUT32(0); return 0;                                    // Initialize(transfer memory size, process and transfer memory handles) → error
     case 4: out->copy[out->ncopy++] = kernel_event_new(0); OUT32(0); return 0;   // QueryEvent(fd, event id) → event, error
     case 8: return 0;                                              // SetClientPID
+    case 13: return 0;                                             // SetGraphicsFirmwareMemoryMarginEnabled(bool)
     default: return unimpl("nvdrv", in);
     }
 }
