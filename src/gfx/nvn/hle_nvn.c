@@ -720,6 +720,20 @@ static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     sha256_final(&hc, md); memcpy(out, md, 8);
     return 1;
 }
+// A second key for a stage, from its code area alone. The normal key also hashes the control section, whose bytes at +0x778 and from +0x7d8 on (pointers, what follows the
+// section) change from one run to the next, so the same shader gets another key every run and a library built from earlier runs lacks it. Libraries hold each shader under both.
+int prog_alt_key(const prog_t *p, unsigned st, uint8_t out[8]) {
+    if (st >= p->nstage) return 0;
+    const NVNshaderData *sd = &p->sd[st];
+    if (!sd->control || !sd->data || code_reserved(sd)) return 0;
+    uint32_t ncode; memcpy(&ncode, (const uint8_t *)sd->control + 0x704, 4);
+    void *mb; uint64_t mo;
+    if (!ncode || ncode >= (1u << 24) || !mtl_addr(sd->data, ncode, &mb, &mo)) return 0;
+    uint8_t md[32]; sha256_ctx hc; sha256_init(&hc);
+    sha256_update(&hc, (const void *)(uintptr_t)sd->data, ncode);
+    sha256_final(&hc, md); memcpy(out, md, 8);
+    return 1;
+}
 int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
     if (st >= p->nstage) return 0;
     prog_keys_t *k = pk_get(p, 1);

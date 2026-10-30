@@ -69,7 +69,8 @@ void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }              
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 
 static void pending(unsigned op) {                                                // an operation this replay does not execute yet
-    if (atomic_fetch_add(&g_pending[op], 1) == 0) fprintf(stderr, "[dm] [nvn] replay: %s is recorded but not executed yet\n", op_name[op] ? op_name[op] : "?");
+    uint64_t n = atomic_fetch_add(&g_pending[op], 1) + 1;
+    if (n == 1 || (n >= 1000 && !(n & (n - 1)))) fprintf(stderr, "[dm] [nvn] replay: %s is recorded but not executed yet (%llu so far)\n", op_name[op] ? op_name[op] : "?", (unsigned long long)n);   // the count: how much of the frame never ran
 }
 
 static void update_ub(uint64_t dst, uint64_t n, const uint8_t *data) {          // OP_UPDATE_UB: the data was copied into the record at record time

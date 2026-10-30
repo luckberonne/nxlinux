@@ -8,6 +8,7 @@
 //    the same coordinates, so the front face is inverted. An upper-left origin flips the viewport instead and keeps the winding.
 // A render pass stays open from the first draw until something else needs the command buffer (nvn_vk_cmd ends it) or the render targets change.
 #include "nvn_draw.h"
+int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off);   // nvn_mtl.h: 1 when the range is inside a registered memory pool
 #include "nvn_vk.h"
 #include "nvn_vk_priv.h"
 #include "nvn_shader_vk.h"
@@ -25,6 +26,7 @@ _Atomic uint64_t g_draw_prepare_ns, g_draw_pipe_ns, g_draw_buf_ns, g_draw_pass_n
 
 typedef struct nvn_shader nvn_shader;
 const nvn_shader *nvn_shader_find(const uint8_t key[8]);
+void nvn_shader_alias(const uint8_t key[8], const nvn_shader *s);   // find(key) answers s from now on (a shader found by its code alone, under the program's own key)
 int nvn_shader_stage(const nvn_shader *s);
 uint32_t nvn_shader_needs(const nvn_shader *s);
 const nvn_shbind *nvn_shader_binds(const nvn_shader *s, int *n);
@@ -382,12 +384,44 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     const nvn_shader *vs = NULL, *fs = NULL; int focus = 0;
     for (int i = 0; i < S.nkeys; i++) {
         const nvn_shader *s = nvn_shader_find(S.keys[i]);
-        if (!s) continue;
+        if (!s) {
+            static int lg = -1; static uint64_t seen[256]; static unsigned nseen; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;
+            uint64_t k; memcpy(&k, S.keys[i], 8);
+            if (lg && nseen < 256) { unsigned j = 0; while (j < nseen && seen[j] != k) j++; if (j == nseen) { seen[nseen++] = k;   // NX_SKIP_LOG: each key the library lacks, once
+                fprintf(stderr, "[dm] [nvn] library lacks shader key "); for (int b = 0; b < 8; b++) fprintf(stderr, "%02x", S.keys[i][b]); fprintf(stderr, " (stage slot %d)\n", i); } }
+            continue;
+        }
         int st = nvn_shader_stage(s);
         if (st == NVN_STAGE_VERTEX) vs = s; else if (st == NVN_STAGE_FRAGMENT) fs = s;
         else { skip("geometry, tessellation and compute stages are not supported in a draw yet", &f_noshader); return 0; }
     }
-    if (!vs || !fs) { skip("the program's shaders are not in the registry (the translated shader library is not loaded)", &f_noshader); return 0; }
+    if (!vs || !fs) {                       // the normal key hashes bytes that change from run to run: look the stages up by their code (cached per program: it hashes the code area)
+        static _Thread_local struct { uint64_t serial; unsigned st; const nvn_shader *s; int valid; } cache[1024];
+        for (unsigned i = 0; i < S.prog->nstage && i < 6; i++) {
+            typeof(cache[0]) *ce = &cache[(S.prog->serial * 6 + i) & 1023];
+            if (!(ce->valid && ce->serial == S.prog->serial && ce->st == i)) {
+                uint8_t ak[8]; ce->serial = S.prog->serial; ce->st = i; ce->valid = 1;
+                ce->s = prog_alt_key(S.prog, i, ak) ? nvn_shader_find(ak) : NULL;
+            }
+            if (!ce->s) continue;
+            { uint8_t pk[8]; if (prog_key(S.prog, i, pk)) nvn_shader_alias(pk, ce->s); }   // the program's own key finds it directly from now on
+            int st = nvn_shader_stage(ce->s);
+            if (st == NVN_STAGE_VERTEX && !vs) vs = ce->s; else if (st == NVN_STAGE_FRAGMENT && !fs) fs = ce->s;
+        }
+    }
+    if (!vs || !fs) {
+        static int lg = -1; static unsigned nlog; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;
+        if (lg && nlog++ < 1600 && nlog % 16 == 1) {                                     // NX_SKIP_LOG: the state of each stage of the program (the keys found, and what a stage without one holds)
+            fprintf(stderr, "[dm] [nvn] no vs/fs pair: %d stage(s), %d key(s)", S.prog->nstage, S.nkeys);
+            for (unsigned i = 0; i < S.prog->nstage && i < 6; i++) { const NVNshaderData *d = &S.prog->sd[i]; uint32_t nc = 0, c0 = 0, c30 = 0, mg = 0;
+                if (d->control) { memcpy(&nc, (const uint8_t *)d->control + 0x704, 4); memcpy(&mg, d->control, 4); }
+                void *mb; uint64_t mo; int mapped = d->data && nc && nc < (1u << 24) && mtl_addr(d->data, nc, &mb, &mo);
+                if (mapped) { const uint32_t *c = (const uint32_t *)(uintptr_t)d->data; c0 = c[0]; c30 = nc >= 0x34 ? c[0x30 / 4] : 0; }
+                uint8_t ak[8] = {0}; int hasak = prog_alt_key(S.prog, i, ak);
+                fprintf(stderr, " | stage %u: ncode %#x magic %#x mapped %d c0 %#x sph0 %#x altkey ", i, nc, mg, mapped, c0, c30);
+                if (hasak) for (int b = 0; b < 8; b++) fprintf(stderr, "%02x", ak[b]); else fprintf(stderr, "none"); }
+            fprintf(stderr, "\n"); }
+        skip("the program's shaders are not in the registry (the translated shader library is not loaded)", &f_noshader); return 0; }
     if (nvn_shader_needs(vs) | nvn_shader_needs(fs)) {
         // not an error of the game's: the shader reads something this draw path cannot supply yet (see NVN_NEED_*)
         char why[160]; uint32_t n = nvn_shader_needs(vs) | nvn_shader_needs(fs);
@@ -416,7 +450,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
                     fprintf(stderr, "[dm] [nvn] after sampling: serial %llu result %d gpu-owned %d: %ld of %zu bytes not zero\n", (unsigned long long)sr, r, sr ? mtl_tex_gpu_owned(sr) : -1, lit, tot); } }
                 if (r != 1) {
                     char why[160]; uint32_t h = S.tex[si][b[i].reg];
-                    snprintf(why, sizeof why, r == 3 ? "texture slot %u (id %u) is not the type the shader samples" : "texture slot %u (id %u) has no image the shader can sample and no stand-in for its type", b[i].reg, h & 0xfffff);
+                    snprintf(why, sizeof why, r == 3 ? "texture slot %u (id %u) is not the type the shader samples (type %#x)" : "texture slot %u (id %u) has no image the shader can sample and no stand-in for its type %#x", b[i].reg, h & 0xfffff, (unsigned)b[i].aux);
                     skip(why, &f_tex); return 0;
                 }
                 tbind[nt++] = b[i].binding;

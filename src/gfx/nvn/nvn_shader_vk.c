@@ -21,10 +21,21 @@ static nvn_shader *g_head;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 // Every draw resolves two shaders by key, and a course's library holds thousands: the registry is a hash table on the key, with a one-entry cache per
 // thread because consecutive draws usually use the same program. A linear walk here cost about 100 us per draw with 2,839 shaders (each hop a cache miss).
-enum { SHADER_BUCKETS = 8192 };
+enum { SHADER_BUCKETS = 32768 };
 static nvn_shader *g_shash[SHADER_BUCKETS];
-static unsigned shader_bucket(uint64_t v) { v *= 0x9E3779B97F4A7C15ull; return (unsigned)(v >> 51); }   // 8192 = 2^13: the key's high bits after mixing
+static unsigned shader_bucket(uint64_t v) { v *= 0x9E3779B97F4A7C15ull; return (unsigned)(v >> 49); }   // 32768 = 2^15: the key's high bits after mixing
 
+// A shader found by the hash of its code alone (hle_nvn.c prog_alt_key) is also registered under the program's own key, so the next draw of that program finds it by one lookup
+typedef struct alias { uint64_t key; nvn_shader *s; struct alias *next; } alias_t;
+static alias_t *g_ahash[SHADER_BUCKETS];
+void nvn_shader_alias(const uint8_t key[8], const nvn_shader *s) {
+    uint64_t kv; memcpy(&kv, key, 8); unsigned b = shader_bucket(kv);
+    pthread_mutex_lock(&g_mu);
+    alias_t *a = g_ahash[b]; while (a && a->key != kv) a = a->next;
+    if (!a) { a = malloc(sizeof *a); if (a) { a->key = kv; a->next = g_ahash[b]; g_ahash[b] = a; } }
+    if (a) a->s = (nvn_shader *)s;
+    pthread_mutex_unlock(&g_mu);
+}
 uint64_t nvn_vk_shader_key(const uint8_t key[8]) { uint64_t v; memcpy(&v, key, 8); return v; }
 
 void nvn_vk_shader_register(const uint8_t key[8], const nvn_shader_desc *d) {
@@ -49,6 +60,7 @@ const nvn_shader *nvn_shader_find(const uint8_t key[8]) {
     pthread_mutex_lock(&g_mu);
     nvn_shader *s = g_shash[b];
     while (s && memcmp(s->key, key, 8)) s = s->hnext;
+    if (!s) { alias_t *a = g_ahash[b]; while (a && a->key != kv) a = a->next; if (a) s = a->s; }
     pthread_mutex_unlock(&g_mu);
     if (s) { last = s; lastv = kv; }
     return s;
