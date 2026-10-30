@@ -59,13 +59,35 @@ static uint32_t apm(int session, const ipc_in_t *in, ipc_out_t *out) {
     }
 }
 
-// ---- aoc:u: add-on content. None is installed.
+// ---- aoc:u: add-on content. What --aoc gave (an id and its RomFS image, held in memory: the DLC of a title is often only a licence file); index = id - base id.
+typedef struct { const uint8_t *img; uint64_t size; } mem_storage_t;
+static struct { uint64_t id; mem_storage_t st; } g_aoc[32]; static int g_naoc;
+static uint64_t aoc_base(void) { return mem_default_profile().program_id + 0x1000; }
+int aoc_add(const char *arg) {
+    char *end; uint64_t id = strtoull(arg, &end, 16);
+    if (*end != ':' || g_naoc == 32) { fprintf(stderr, "[RED] aoc: --aoc wants <id>:<RomFS image>, got %s\n", arg); return -1; }
+    FILE *f = fopen(end + 1, "rb");
+    if (!f) { fprintf(stderr, "[RED] aoc: cannot open %s\n", end + 1); return -1; }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t *img = malloc(n > 0 ? (size_t)n : 1);
+    if (n <= 0 || fread(img, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(img); fprintf(stderr, "[RED] aoc: cannot read %s\n", end + 1); return -1; }
+    fclose(f);
+    g_aoc[g_naoc].id = id; g_aoc[g_naoc].st = (mem_storage_t){img, (uint64_t)n}; g_naoc++;
+    fprintf(stderr, "[dm] aoc: add-on content %016llx installed (%ld bytes of RomFS)\n", (unsigned long long)id, n);
+    return 0;
+}
+static const mem_storage_t *aoc_storage(uint64_t id) { for (int i = 0; i < g_naoc; i++) if (g_aoc[i].id == id) return &g_aoc[i].st; return NULL; }
 static uint32_t aoc(int session, const ipc_in_t *in, ipc_out_t *out) {
     (void)session;
     switch (in->cmd) {
-    case 2: OUT32(0); return 0;                                    // CountAddOnContent(pid) → 0
-    case 3: OUT32(0); return 0;                                    // ListAddOnContent(pid, offset, count) → count written to the buffer: 0
-    case 5: OUT64(mem_default_profile().program_id + 0x1000); return 0;   // GetAddOnContentBaseId(pid): the title id + 0x1000
+    case 2: OUT32((uint32_t)g_naoc); return 0;                     // CountAddOnContent(pid)
+    case 3: {                                                      // ListAddOnContent(offset, count, pid) → count, the indices into the output buffer
+        uint32_t off = in->args[0], cnt = in->args[1], k = 0;
+        uint32_t cap = in->nrecv ? in->recv[0].size / 4 : 0;
+        for (uint32_t i = off; i < (uint32_t)g_naoc && k < cnt && k < cap; i++, k++) ((uint32_t *)(uintptr_t)in->recv[0].addr)[k] = (uint32_t)(g_aoc[i].id - aoc_base());
+        OUT32(k); return 0;
+    }
+    case 5: OUT64(aoc_base()); return 0;                           // GetAddOnContentBaseId(pid): the title id + 0x1000
     case 6: return 0;                                              // PrepareAddOnContent(index, pid)
     case 7: case 8: out->copy[out->ncopy++] = kernel_event_new(0); return 0;   // GetAddOnContentListChangedEvent → event (command 7 in the 1.0.0 SDK, 8 in the 4.x one)
     default: return unimpl("aoc:u", in);
@@ -183,11 +205,13 @@ static uint32_t applet_oe(int session, const ipc_in_t *in, ipc_out_t *out) {
 
 // ---- fsp-srv: the file system. The title's data storage (RomFS) is read from an image on the host; the rest of the file systems are not served yet.
 static int g_romfs_fd = -1;
+static char g_romfs_path[4096];
+const char *fsp_romfs_path(void) { return g_romfs_path; }
 void fsp_set_romfs(const char *path) {
+    snprintf(g_romfs_path, sizeof g_romfs_path, "%s", path);
     g_romfs_fd = open(path, O_RDONLY);
     if (g_romfs_fd < 0) fprintf(stderr, "[RED] fsp: cannot open the RomFS image %s\n", path);
 }
-typedef struct { const uint8_t *img; uint64_t size; } mem_storage_t;
 // A RomFS with a root directory and nothing in it, for system data the host has no files of (firmware archives): mounting succeeds and every file is not found, as the title can handle.
 static mem_storage_t *empty_romfs(void) {
     static mem_storage_t st; static uint8_t img[0x400];
@@ -249,7 +273,8 @@ static uint32_t fsp(int session, const ipc_in_t *in, ipc_out_t *out) {
         extern const uint8_t *mii_standin_romfs(size_t *);
         static mem_storage_t mii;
         if (id == 0x0100000000000802ull && !mii.img) mii.img = mii_standin_romfs((size_t *)&mii.size);       // MiiModel: stand-in files with every part absent
-        out->move[out->nmove++] = ipc_new_session_data("IStorage", storage, id == 0x0100000000000802ull ? (void *)&mii : (void *)empty_romfs());
+        const mem_storage_t *aocst = aoc_storage(id);                // add-on content: its RomFS
+        out->move[out->nmove++] = ipc_new_session_data("IStorage", storage, aocst ? (void *)aocst : id == 0x0100000000000802ull ? (void *)&mii : (void *)empty_romfs());
         return 0;
     }   // OpenDataStorageByDataId: system data (fonts, Mii resources) is firmware, which the host does not have: an empty RomFS
     case 203: return 0x7d402u;                                     // OpenPatchDataStorageByCurrentProcess: no update patch is installed (fs ResultTargetNotFound)

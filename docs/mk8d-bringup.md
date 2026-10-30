@@ -10,6 +10,13 @@ boots too, but it has not been taken as far (see [The 32-bit base](#the-32-bit-b
 Keys, dumps and firmware never go in the repo: `work/` and `*.keys`, `*.nsp`, `*.nsz` are git-ignored. The reference implementation this
 ports is `seedds/nxnative`; its Mario Kart profile (`dm/games/0100152000022000/`) is the best description of what the game needs.
 
+## Add-on content and version
+
+`--aoc <id>:<RomFS image>` installs an add-on content: `aoc:u` counts and lists it (index = id - (program id + 0x1000)) and `fsp-srv` command 202 serves its RomFS
+from memory. The Booster Course Pass (0100152000023001) is a 4 KiB licence (`contents.dat`, `version.txt` "10002"): the courses are in the update. Extract it with
+`work/nx_extract/nx_extract work/keys/prod.keys --aoc DLC.nsp work/run/mk8d_dlc/aoc.romfs --romfs-image`; `tools/run_mk8d.sh` passes it when the file is there.
+`nn::oe::GetDisplayVersion` answers the `control.nacp` beside the RomFS image (4.0.1 with the update; `NX_DISPLAY_VERSION` overrides), not a fixed 1.0.0.
+
 ## The race
 
 With the movie decoder replaced, A goes through single player, Grand Prix, 50cc, Mario, the default kart and the Mushroom Cup into Mario Kart Stadium, and the race runs:

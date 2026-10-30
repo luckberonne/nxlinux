@@ -37,8 +37,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--shaders") && i + 1 < argc) shaders = argv[++i];
         else if (!strcmp(argv[i], "--arch32")) arch32 = 1;
         else if (!strcmp(argv[i], "--romfs") && i + 1 < argc) fsp_set_romfs(argv[++i]);
+        else if (!strcmp(argv[i], "--aoc") && i + 1 < argc) { if (aoc_add(argv[++i])) return 2; }
         else if (!strcmp(argv[i], "--mem-mb") && i + 1 < argc) mem_mb = (unsigned)atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s --manifest FILE [--entry SYMBOL] [--shaders LIB.nxsl] [--mem-mb N] [--arch32] [--romfs IMAGE]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s --manifest FILE [--entry SYMBOL] [--shaders LIB.nxsl] [--mem-mb N] [--arch32] [--romfs IMAGE] [--aoc ID:IMAGE]...\n", argv[0]); return 2; }
     }
     if (!manifest) { fprintf(stderr, "nxlinux: --manifest is required\n"); return 2; }
     if (!getenv("NX_PRESENT")) setenv("NX_PRESENT", "sdl", 1);
