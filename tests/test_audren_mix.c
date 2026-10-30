@@ -1,5 +1,5 @@
 // The audio renderer's mixer (src/host/svc/audren_mix.c) on hand-built RequestUpdate blocks: a PCM16 stereo voice through a submix into the final mix,
-// a DSP-ADPCM voice, play counts, stopping.
+// a DSP-ADPCM voice, play counts, stopping; a delay and an auxiliary send on the final mix.
 #include "audren_mix.h"
 #include <math.h>
 #include <stdio.h>
@@ -28,6 +28,45 @@ static void wavebuf(uint8_t *v, int slot, const void *addr, uint64_t size, uint3
 }
 
 static uint32_t update(ar_mixer_t *m) { return ar_mixer_update(m, in, sizeof in, out, sizeof out); }
+
+
+// One PCM16 voice into final mix buffers 0, 1 and 2; a 10 ms delay (wet only) from buffer 2 to itself, an aux send/return on buffer 1; the sink takes 0 and 2.
+static int effects(void) {
+    enum { NE = 2, EFFECT = 0xc0 };
+    static uint8_t b[HDR + BEH + POOL + CHAN + VOICE + NE * EFFECT + MIX + SINK];
+    static uint8_t ring_send[0x80 + 4 * 1440], ring_ret[0x80 + 4 * 1440];
+    static int16_t pcm[480];
+    const uint32_t params[13] = { 48000, 240, 6, 0, 1, 1, NE };
+    ar_mixer_t *m = ar_mixer_new(params);
+    uint32_t *h = (uint32_t *)b;
+    h[1] = BEH; h[2] = POOL; h[3] = VOICE; h[4] = CHAN; h[5] = NE * EFFECT; h[6] = MIX; h[7] = SINK; h[15] = sizeof b;
+    uint8_t *c = b + HDR + BEH + POOL, *v = c + CHAN, *e = v + VOICE, *x = e + NE * EFFECT, *k = x + MIX;
+    w32(c, 0); wf(c + 4, 1.0f); wf(c + 8, 1.0f); wf(c + 12, 1.0f); c[0x64] = 1;
+    for (int i = 0; i < 480; i++) pcm[i] = 16384;
+    v[8] = 1; v[9] = 1; v[11] = 2; w32(v + 0xc, 48000); w32(v + 0x18, 1); wf(v + 0x1c, 1.0f); wf(v + 0x20, 1.0f); w32(v + 0x58, 0); w32(v + 0x140, 0);
+    wavebuf(v, 0, pcm, sizeof pcm, 480, 0);
+    e[0] = 3; e[1] = 1; e[2] = 1; w32(e + 0x18, 0);                       // delay: buffer 2, one channel, 10 ms at 48 kHz, in 1, feedback 0, out 1, dry 0
+    e[0x20] = 2; e[0x26] = 2; e[0x2c] = 1; e[0x2e] = 1; w32(e + 0x30, 10); w32(e + 0x34, 10); w32(e + 0x38, 48000u << 14);
+    w32(e + 0x3c, 0x4000); w32(e + 0x44, 0x4000);
+    uint8_t *a = e + EFFECT;                                             // aux: buffer 1, one channel, rings of 1440 samples
+    a[0] = 2; a[1] = 1; a[2] = 1; w32(a + 4, 0); w32(a + 0x18, 1);
+    a[0x20] = 1; a[0x38] = 1; w32(a + 0x50, 1); w32(a + 0x54, 48000); w32(a + 0x58, 1440);
+    w64(a + 0x60, (uintptr_t)ring_send); w64(a + 0x68, (uintptr_t)ring_send + 0x80); w64(a + 0x70, (uintptr_t)ring_ret); w64(a + 0x78, (uintptr_t)ring_ret + 0x80);
+    for (int i = 0; i < 1440; i++) w32(ring_ret + 0x80 + 4 * i, 1000);
+    wf(x, 1.0f); w32(x + 8, 6); x[0xc] = 1; w32(x + 0x924, 0x7fffffff);
+    k[0] = 1; k[1] = 1; w32(k + 0x120, 2); k[0x124] = 0; k[0x125] = 2;
+    CHECK(ar_mixer_update(m, b, sizeof b, out, sizeof out) == 0);
+    float f[3][480];
+    for (int i = 0; i < 3; i++) ar_mixer_render(m, f[i]);
+    CHECK(fabsf(f[0][2 * 10] - 0.5f) < 1e-3f && fabsf(f[0][2 * 10 + 1]) < 1e-6f);   // dry now, nothing from the delay yet
+    CHECK(fabsf(f[1][2 * 10 + 1]) < 1e-6f);
+    CHECK(fabsf(f[2][2 * 1 + 1]) < 1e-6f && fabsf(f[2][2 * 10 + 1] - 0.5f) < 1e-3f);   // 480 samples later (the resampler's 2 included)
+    int32_t sent; memcpy(&sent, ring_send + 0x80 + 4 * (240 + 10), 4);
+    uint32_t woff, roff; memcpy(&woff, ring_send + 0x44, 4); memcpy(&roff, ring_ret + 0x40, 4);
+    CHECK(sent == 16384 && woff == 720 && roff == 720);                   // three frames sent and returned
+    ar_mixer_free(m);
+    return 0;
+}
 
 int main(void) {
     const uint32_t params[13] = { 48000, 240, 30, 1, NV, 1, 0 };
@@ -81,6 +120,7 @@ int main(void) {
     CHECK(fabsf(f[2 * 3] * 32768.0f - 2) < 0.01f);
     CHECK(fabsf(f[2 * 4] * 32768.0f - 2 * (1 + 2.0f / 3.0f)) < 0.01f);
     ar_mixer_free(m);
+    effects();
     if (fails) return 1;
     printf("audren_mix: ok\n");
     return 0;

@@ -29,8 +29,11 @@ A gamepad SDL knows works too, with its physical layout (the east button is A). 
 `audren:u` renders on the host (`src/host/svc/audren_mix.c`, IPC in `ipc_audren.c`). Each RequestUpdate (revision 4: 96 voices, the final mix of 6 buffers and one
 submix of 24, a 5.1 device sink) updates a server copy of every voice; a clock thread renders 240 samples every 5 ms (PCM8/PCM16/float and DSP-ADPCM wave
 buffers, linear resampling, channel resource volumes, submix matrices, 5.1 downmixed to stereo), queues them on the SDL3 audio device and fires the frame event.
-The play counts in the answer pace the title's streaming: the menu music is two mono ADPCM voices at 32 kHz. Effects (aux, delay, reverb) are not rendered:
-their sends are dropped, so only the dry signal is heard. `NX_AUDIO=0` keeps the device closed, `NX_AUDIO_WAV=file.wav` also records the output (headless checks).
+The play counts in the answer pace the title's streaming: the menu music is mono ADPCM voices at 32 kHz, one per side. Effects run on their mix in processing
+order: the auxiliary send (submix buffers 6 to 11: int32 frames into the title's send ring, the channel replaced by its return ring, which the title's own
+effect code fills) and the delay (buffers 12 to 15, 800 ms, wet only) are rendered; a reverb is not, its input is cleared. Unused channel resource entries
+are zeros with id 0 and must not overwrite resource 0 (that silenced the intro's left side). `NX_AUDIO=0` keeps the device closed, `NX_AUDIO_WAV=file.wav`
+also records the output (headless checks), `NX_AUDREN_TRACE=1` prints each new voice: format, rate, mix and the mix buffers its channels feed.
 
 ## Running it
 

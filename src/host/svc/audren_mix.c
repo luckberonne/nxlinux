@@ -2,9 +2,10 @@
 // Mario Kart 8 Deluxe sends it): header, behaviour, memory pools, voice channel resources, voices, effects, mixes, sinks, performance. The mixer keeps a
 // server copy of every voice (its wave buffer queue, play position and ADPCM history), renders PCM8/PCM16/float/DSP-ADPCM wave buffers with linear
 // resampling into the mix buffers its channel resources point at, routes submixes into their destinations through their volume matrices, and maps the
-// final mix through the device sink to 5.1, downmixed to stereo. Effects are not rendered: their input buffers are cleared, so only the dry signal is heard.
-// The answer tells the title how many samples and wave buffers each voice has played, which is what paces its streaming.
+// final mix through the device sink to 5.1, downmixed to stereo. Effects run on their mix before it is routed on, in processing order: auxiliary sends
+// (the title's own effect code reads its send ring and fills the return ring), delays; a reverb is not rendered, its input buffers are cleared. The answer tells the title how many samples and wave buffers each voice has played, which is what paces its streaming.
 #include "audren_mix.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,12 +33,19 @@ typedef struct {
 } voice_t;
 
 typedef struct { int used, id, dest, nbuf; float volume, mat[NBUF][NBUF]; } mix_t;
-typedef struct { int used, type, mix, n; uint8_t in[NBUF]; } effect_t;
+typedef struct {
+    int used, type, mix, n, order;
+    uint8_t in[NBUF], out[NBUF];
+    uint64_t send, ret; uint32_t ring;        // aux: the send and return rings, each a 0x80-byte header (the DSP's half at +0x40: read, write offset) and ring int32 samples
+    float in_gain, feedback, out_gain, dry_gain, spread, lp_fb, lp_base, lp[6];   // delay
+    uint32_t len, cap, at; float *line;       // delay line: len samples per channel, cap allocated
+} effect_t;
+enum { FX_AUX = 2, FX_DELAY = 3, FX_REVERB = 4, FX_REVERB3D = 5 };
 
 struct ar_mixer {
     uint32_t rate, count, nvoice, nchan, nmix, neffect;
     voice_t voice[MAX_VOICES];
-    float chanvol[MAX_CHANS][NBUF]; uint8_t chanused[MAX_CHANS];
+    float chanvol[MAX_CHANS][NBUF];
     mix_t mix[MAX_MIXES];
     effect_t effect[MAX_EFFECTS];
     uint8_t sink_in[6]; int sink_n;
@@ -59,7 +67,40 @@ ar_mixer_t *ar_mixer_new(const uint32_t p[13]) {
     return m;
 }
 
-void ar_mixer_free(ar_mixer_t *m) { free(m); }
+void ar_mixer_free(ar_mixer_t *m) {
+    if (!m) return;
+    for (int i = 0; i < MAX_EFFECTS; i++) free(m->effect[i].line);
+    free(m);
+}
+
+static float q14(const uint8_t *p) { return (float)(int32_t)rd32(p) / 16384.0f; }
+
+static void effect_update(effect_t *ef, const uint8_t *e) {
+    int is_new = e[1];
+    ef->type = e[0]; ef->used = e[2] && e[0]; ef->mix = (int)rd32(e + 4); ef->order = (int)rd32(e + 0x18);
+    if (ef->type == FX_AUX) {                     // Input[24], Output[24], channel count, sample rate, ring size, send info and storage, return info and storage
+        ef->n = (int)rd32(e + 0x50); if (ef->n > NBUF) ef->n = NBUF;
+        memcpy(ef->in, e + 0x20, NBUF); memcpy(ef->out, e + 0x38, NBUF);
+        ef->ring = rd32(e + 0x58); ef->send = rd64(e + 0x60); ef->ret = rd64(e + 0x70);
+        if (rd64(e + 0x68) != ef->send + 0x80 || rd64(e + 0x78) != ef->ret + 0x80) ef->ring = 0;   // not the layout this knows: left alone
+    } else if (ef->type >= FX_DELAY && ef->type <= FX_REVERB3D) {   // Input[6], Output[6], channel count max, channel count, then the effect's own fields
+        ef->n = *(const uint16_t *)(e + 0x2e); if (ef->n > 6) ef->n = 6;
+        memcpy(ef->in, e + 0x20, 6); memcpy(ef->out, e + 0x26, 6);
+    } else ef->n = 0;
+    if (ef->type != FX_DELAY) return;
+    // delay: max and current time (ms), sample rate, then in, feedback, out, dry gains, channel spread and low-pass amount, all Q14
+    uint32_t rate = rd32(e + 0x38) >> 14, max_ms = rd32(e + 0x30), ms = rd32(e + 0x34);
+    if (!rate) rate = 48000;
+    if (ms > max_ms) max_ms = ms;
+    ef->in_gain = q14(e + 0x3c); ef->feedback = q14(e + 0x40) * 0.98f; ef->out_gain = q14(e + 0x44); ef->dry_gain = q14(e + 0x48);
+    ef->spread = q14(e + 0x4c); ef->lp_fb = 0.95f * q14(e + 0x50); ef->lp_base = 1.0f - ef->lp_fb;
+    uint32_t len = (uint32_t)((uint64_t)ms * rate / 1000), cap = (uint32_t)((uint64_t)max_ms * rate / 1000);
+    if (len < 1) len = 1; if (cap < len) cap = len;
+    if (cap > ef->cap) { free(ef->line); ef->line = calloc((size_t)cap * 6, sizeof(float)); ef->cap = ef->line ? cap : 0; is_new = 1; }
+    if (len > ef->cap) len = ef->cap;
+    if (len != ef->len) { ef->len = len; is_new = 1; }
+    if (is_new && ef->line) { memset(ef->line, 0, (size_t)ef->cap * 6 * sizeof(float)); memset(ef->lp, 0, sizeof ef->lp); ef->at = 0; }
+}
 
 static void voice_reset(voice_t *v) {
     memset(v->valid, 0, sizeof v->valid);
@@ -160,22 +201,27 @@ uint32_t ar_mixer_update(ar_mixer_t *m, const uint8_t *in, uint32_t in_size, uin
     // Memory pools: a pool the title asks to attach is attached, one it asks to detach is detached
     for (uint32_t i = 0; i < npool; i++) { uint32_t st = rd32(p + i * MEMPOOL_IN + 0x10); oh[(HDR + i * MEMPOOL_OUT) / 4] = st == 4 ? 5 : st == 2 ? 3 : 0; }
     p += pools;
-    for (uint32_t i = 0; i < nchan; i++) {      // channel resources: id, 24 mix volumes, in use
+    for (uint32_t i = 0; i < nchan; i++) {      // channel resources: id, 24 mix volumes, in use; the unused entries are zeros, id 0 included, and change nothing
         const uint8_t *c = p + i * CHAN_IN;
-        uint32_t id = rd32(c); if (id >= MAX_CHANS) continue;
-        m->chanused[id] = c[0x64];
+        uint32_t id = rd32(c); if (id >= MAX_CHANS || !c[0x64]) continue;
         for (int b = 0; b < NBUF; b++) m->chanvol[id][b] = rdf(c + 4 + 4 * b);
     }
     p += chans;
-    for (uint32_t i = 0; i < nvoice; i++) voice_update(&m->voice[i], p + i * VOICE_IN);
-    p += voices;
-    for (uint32_t i = 0; i < neffect && i < MAX_EFFECTS; i++) {   // the buffers each effect reads, to be cleared
-        const uint8_t *e = p + i * EFFECT_IN; effect_t *ef = &m->effect[i];
-        ef->type = e[0]; ef->used = e[2] && e[0]; ef->mix = (int)rd32(e + 4);
-        ef->n = ef->type == 2 ? (int)rd32(e + 0x50) : (ef->type >= 3 && ef->type <= 5) ? *(const uint16_t *)(e + 0x2e) : 0;
-        if (ef->n > (ef->type == 2 ? NBUF : 6)) ef->n = ef->type == 2 ? NBUF : 6;
-        memcpy(ef->in, e + 0x20, NBUF);
+    static int trace = -1; if (trace < 0) trace = getenv("NX_AUDREN_TRACE") != NULL;
+    for (uint32_t i = 0; i < nvoice; i++) {
+        const uint8_t *in = p + i * VOICE_IN; voice_t *v = &m->voice[i];
+        voice_update(v, in);
+        if (!trace || !in[8] || !in[9]) continue;    // a new voice: what it plays and where it goes
+        fprintf(stderr, "[audren] voice %u: format %d, %u Hz, %d channels, pitch %.3f, volume %.3f, state %d, mix %d:", rd32(in), v->fmt, v->rate, v->nch, v->pitch, v->volume, in[10], v->mix);
+        for (int c = 0; c < v->nch; c++) {
+            fprintf(stderr, " [ch%d res %u", c, v->chan[c]);
+            if (v->chan[c] < MAX_CHANS) for (int b = 0; b < NBUF; b++) if (m->chanvol[v->chan[c]][b] != 0.0f) fprintf(stderr, " b%d=%.3f", b, m->chanvol[v->chan[c]][b]);
+            fprintf(stderr, "]");
+        }
+        fprintf(stderr, "\n");
     }
+    p += voices;
+    for (uint32_t i = 0; i < neffect && i < MAX_EFFECTS; i++) effect_update(&m->effect[i], p + i * EFFECT_IN);
     m->neffect = neffect < MAX_EFFECTS ? neffect : MAX_EFFECTS;
     p += effects;
     uint32_t nmix = mixes / MIX_IN; const uint8_t *mp = p + (mixes - nmix * MIX_IN);   // splitter data, when there is any, comes first
@@ -198,6 +244,65 @@ uint32_t ar_mixer_update(ar_mixer_t *m, const uint8_t *in, uint32_t in_size, uin
     uint8_t *ov = out + HDR + o_pool;
     for (uint32_t i = 0; i < nvoice; i++) { memcpy(ov + i * VOICE_OUT, &m->voice[i].played, 8); memcpy(ov + i * VOICE_OUT + 8, &m->voice[i].consumed, 4); }
     return 0;
+}
+
+// Auxiliary: each channel's frame goes into the send ring as int32 (PCM16 scale) and the channel is replaced by the same span of the return ring, which the
+// title fills; channel i sits i frames past the shared offset, and after the last channel both offsets move on by channels * frame.
+static void aux_run(effect_t *ef, float (*b)[MAX_FRAME], uint32_t n) {
+    if (!ef->ring || !ef->send || !ef->ret) return;
+    uint32_t *sd = (uint32_t *)(uintptr_t)(ef->send + 0x40), *rd = (uint32_t *)(uintptr_t)(ef->ret + 0x40);
+    int32_t *ss = (int32_t *)(uintptr_t)(ef->send + 0x80), *rs = (int32_t *)(uintptr_t)(ef->ret + 0x80);
+    for (int c = 0; c < ef->n; c++) {
+        if (ef->in[c] >= NBUF || ef->out[c] >= NBUF) continue;
+        uint32_t w = (sd[1] + (uint32_t)c * n) % ef->ring, r = (rd[0] + (uint32_t)c * n) % ef->ring;
+        const float *src = b[ef->in[c]];
+        for (uint32_t k = 0; k < n; k++) { float v = src[k] * 32768.0f; ss[(w + k) % ef->ring] = v > 2147483520.0f ? INT32_MAX : v < -2147483520.0f ? INT32_MIN : (int32_t)v; }
+        float *dst = b[ef->out[c]];
+        for (uint32_t k = 0; k < n; k++) dst[k] = (float)rs[(r + k) % ef->ring] / 32768.0f;
+    }
+    sd[1] = (sd[1] + (uint32_t)ef->n * n) % ef->ring;
+    rd[0] = (rd[0] + (uint32_t)ef->n * n) % ef->ring;
+}
+
+// Delay: per channel a line of the delay time; what goes in is the input times its gain plus the low-passed feedback (its own channel, and with channel
+// spread the neighbouring ones); what comes out is the dry input plus the line's output, each with its gain.
+static void delay_run(effect_t *ef, float (*b)[MAX_FRAME], uint32_t n) {
+    if (!ef->line || !ef->len) return;
+    static const int nb[6][2] = { {1, 2}, {0, 3}, {0, 3}, {1, 2}, {-1, -1}, {-1, -1} };   // 4 channels: front left/right with their rear neighbours
+    int nc = ef->n;
+    float direct = ef->feedback * (1.0f - ef->spread), cross = ef->feedback * ef->spread * 0.5f;
+    for (int c = 0; c < nc; c++) if (ef->in[c] >= NBUF || ef->out[c] >= NBUF) return;
+    for (uint32_t k = 0; k < n; k++) {
+        float x[6], d[6];
+        for (int c = 0; c < nc; c++) { x[c] = b[ef->in[c]][k]; d[c] = ef->line[(size_t)c * ef->cap + ef->at]; }
+        for (int c = 0; c < nc; c++) {
+            float fb = direct * d[c];
+            if (nc == 2) fb += cross * d[c ^ 1];
+            else if (nc == 4) fb += cross * (d[nb[c][0]] + d[nb[c][1]]);
+            float t = x[c] * ef->in_gain + fb;
+            ef->lp[c] = t * ef->lp_base + ef->lp[c] * ef->lp_fb;
+            ef->line[(size_t)c * ef->cap + ef->at] = ef->lp[c];
+            b[ef->out[c]][k] = x[c] * ef->dry_gain + d[c] * ef->out_gain;
+        }
+        if (++ef->at >= ef->len) ef->at = 0;
+    }
+}
+
+static void run_effects(ar_mixer_t *m, int mi, uint32_t n) {   // the effects on one mix, by processing order (ties in table order)
+    float (*b)[MAX_FRAME] = m->buf[mi];
+    int idx[MAX_EFFECTS], cnt = 0;
+    for (uint32_t e = 0; e < m->neffect; e++) {
+        if (!m->effect[e].used || m->effect[e].mix != m->mix[mi].id) continue;
+        int j = cnt++;
+        while (j > 0 && m->effect[idx[j - 1]].order > m->effect[e].order) { idx[j] = idx[j - 1]; j--; }
+        idx[j] = (int)e;
+    }
+    for (int i = 0; i < cnt; i++) {
+        effect_t *f = &m->effect[idx[i]];
+        if (f->type == FX_AUX) aux_run(f, b, n);
+        else if (f->type == FX_DELAY) delay_run(f, b, n);
+        else if (f->type == FX_REVERB || f->type == FX_REVERB3D) for (int c = 0; c < f->n; c++) { if (f->in[c] < NBUF) memset(b[f->in[c]], 0, n * sizeof(float)); }
+    }
 }
 
 static int depth(ar_mixer_t *m, const mix_t *x) {   // hops to the final mix
@@ -240,17 +345,12 @@ void ar_mixer_render(ar_mixer_t *m, float *stereo) {
         }
         v->prev_volume = v->volume;
     }
-    // Effects are not rendered: what they would read is dropped
-    for (uint32_t e = 0; e < m->neffect; e++) {
-        effect_t *ef = &m->effect[e]; mix_t *x;
-        if (!ef->used || !(x = mix_by_id(m, ef->mix))) continue;
-        for (int k = 0; k < ef->n; k++) if (ef->in[k] < NBUF) memset(m->buf[x - m->mix][ef->in[k]], 0, n * sizeof(float));
-    }
     // Submixes into their destinations, deepest first
     for (int d = MAX_MIXES; d > 0; d--) {
         for (uint32_t i = 0; i < m->nmix; i++) {
             mix_t *x = &m->mix[i];
             if (!x->used || x->id == 0 || depth(m, x) != d) continue;
+            run_effects(m, (int)i, n);
             mix_t *to = mix_by_id(m, x->dest);
             if (!to) continue;
             float (*sb)[MAX_FRAME] = m->buf[i], (*tb)[MAX_FRAME] = m->buf[to - m->mix];
@@ -263,6 +363,7 @@ void ar_mixer_render(ar_mixer_t *m, float *stereo) {
     // The final mix through the sink: 5.1 (front left, front right, centre, LFE, rear left, rear right) or stereo, to stereo
     mix_t *fin = mix_by_id(m, 0);
     if (!fin) { memset(stereo, 0, n * 2 * sizeof(float)); return; }
+    run_effects(m, (int)(fin - m->mix), n);
     float (*fb)[MAX_FRAME] = m->buf[fin - m->mix];
     float vol = fin->volume;
     for (uint32_t k = 0; k < n; k++) {
