@@ -22,6 +22,8 @@ def main(argv=None):
     ap.add_argument('--nx-extract', default=str(REPO / 'work' / 'nx_extract' / 'nx_extract'))
     ap.add_argument('--exe', default=str(REPO / 'build' / 'nxlinux'))
     ap.add_argument('--no-run', action='store_true')
+    ap.add_argument('--nvn-api', help='the NVN API version nvnDeviceGetInteger reports, major.minor (a game checks it against the SDK it was built with)')
+    ap.add_argument('--romfs-image', action='store_true', help='build the RomFS as one image the host serves through its file system service, instead of leaving a directory of files')
     a = ap.parse_args(argv)
     for what, p in (('keys', a.keys), ('NSP', a.nsp), ('nx_extract', a.nx_extract)):
         if not Path(p).is_file(): sys.exit(f'[RED] {what} not found: {p}')
@@ -32,6 +34,11 @@ def main(argv=None):
     p = subprocess.run([a.nx_extract, a.keys, a.nsp, a.update or '-', str(out)], capture_output=True, text=True)
     if p.returncode:
         sys.exit('[RED] nx_extract failed (are the keys the ones for this dump?):\n' + p.stdout + p.stderr)
+    if a.romfs_image:       # one standard RomFS image for the host's file system service; the extracted files are not needed once it is built
+        import romfs_build
+        nd, nf = romfs_build.build(str(out / 'RomFS'), str(out / 'RomFS.img'))
+        print(f'RomFS.img: {nd} directories, {nf} files')
+        shutil.rmtree(out / 'RomFS')
     exefs = out / 'ExeFS'
     names = [n for n in ORDER if (exefs / n).is_file()]
     if not names: sys.exit(f'[RED] no code modules in {exefs}')
@@ -41,17 +48,25 @@ def main(argv=None):
         img = work / f'{n}.img'
         img.write_bytes(bytes(m.image))
         with open(img, 'r+b') as f: f.truncate(len(m.image) + m.bss)       # bss as a sparse zero tail: the host reads (file size - bss) bytes of image
-        lines.append(f'{n} {img} {m.bss:x}')
+        lines.append(f'{n} {img} {m.bss:x} {m.segments[1][0]:x} {m.segments[2][0]:x}')   # name, image, bss, then where the read-only and data segments start
         print(f'{n}: image {len(m.image):#x}, bss {m.bss:#x}, build id {m.build_id[:8].hex()}')
+    # main.npdm's first flags byte: bit 0 set = 64-bit instructions; clear = an AArch32 process (Mario Kart 8 Deluxe 1.0.0 is one)
+    npdm = exefs / 'main.npdm'
+    d = npdm.read_bytes() if npdm.is_file() else b''
+    arch32 = len(d) > 0xC and d[:4] == b'META' and not d[0xC] & 1
+    if arch32: print('main.npdm: 32-bit process (AArch32)')
     manifest = work / 'modules.txt'
     manifest.write_text('\n'.join(lines) + '\n')
     cmd = [a.exe, '--manifest', str(manifest)]
+    if arch32: cmd += ['--arch32']
+    if (out / 'RomFS.img').is_file(): cmd += ['--romfs', str(out / 'RomFS.img')]
     if a.entry: cmd += ['--entry', a.entry]
     if a.shaders: cmd += ['--shaders', a.shaders]
     if a.mem_mb: cmd += ['--mem-mb', str(a.mem_mb)]
     print('run:', ' '.join(cmd))
     if a.no_run: return 0
-    return subprocess.run(cmd).returncode
+    env = dict(os.environ, **({'NX_NVN_API': a.nvn_api} if a.nvn_api else {}))
+    return subprocess.run(cmd, env=env).returncode
 
 
 if __name__ == '__main__':
