@@ -101,8 +101,11 @@ static void *nvn_lookup(const char *name) {
     nvn_init_slots();
     for (unsigned i = 0; i < NVN_NFUNC; i++)
         if (!strcmp(nvn_names[i], name)) return nvn_thunk_for(i);
-    LOG("[RED] NVN address lookup of an unknown name: %s", name ? name : "(null)");
-    return NULL;
+    // A name outside the table (a function newer than this host's nvn.h): hand out a stub that reports when it is called, rather than NULL, which a game may call without checking
+    LOG("[RED] NVN address lookup of an unknown name: %s (a stub that reports a call is returned)", name ? name : "(null)");
+    if (!name) return NULL;
+    char nm[200]; snprintf(nm, sizeof nm, "nvn:unknown:%s", name);
+    return (void *)(uintptr_t)hle_stub_for(nm);
 }
 
 // nvnBootstrapLoader is imported by main (defined in sdk); after it is forcibly taken over, the NVN driver in sdk is no longer referenced
@@ -154,6 +157,9 @@ static const int g_devinfo[] = {
 __attribute__((weak)) int dm_sdk_major(void) { return 0; }   // loader.c; graphics unit tests have no loader
 __attribute__((weak)) int dm_glslc_gpu_code(int *major, int *minor) { *major = *minor = 0; return 0; }   // hle_glslc.c: the game's own GLSLC's GPU code version
 static void nvn_api(int api[2]) {
+    // NX_NVN_API=<major>.<minor>: what the game's driver would report, for a title whose SDK differs from the game profile's (Mario Kart 8 Deluxe 1.0.0 needs 52.32+ and gives up on 55.15)
+    const char *ov = getenv("NX_NVN_API");
+    if (ov && sscanf(ov, "%d.%d", &api[0], &api[1]) == 2) { LOG("[nvn] device API %d.%d (NX_NVN_API)", api[0], api[1]); return; }
 #ifdef DM_GAME_NVN_API_MAJOR
     api[0] = DM_GAME_NVN_API_MAJOR; api[1] = DM_GAME_NVN_API_MINOR; LOG("[nvn] device API %d.%d (game profile device_api)", api[0], api[1]);
 #else
@@ -178,6 +184,7 @@ NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out)
         *out = w == 0x2E ? cur[0] : cur[1];
     }
     if (w <= 1) { static int api[2] = {-1, -1}; if (api[0] < 0) { nvn_api(api); const char *e = getenv("DM_NVN_API"); if (e) sscanf(e, "%d.%d", &api[0], &api[1]); } *out = api[w]; }
+    { static uint32_t seen[128]; if (w < 128 && !seen[w]++ && getenv("NX_NVN_ITEMS")) LOG("[nvn] DeviceGetInteger %#x -> %d", w, *out); }
     OLOG("DeviceGetInteger %#x -> %d", w, *out);
 }
 NVN(nvnDeviceGetImageHandle, NVNimageHandle, const NVNdevice *d, int id) { (void)d; return (NVNimageHandle)id; }
@@ -199,6 +206,26 @@ NVN(nvnMemoryPoolBuilderSetDefaults, void, NVNmemoryPoolBuilder *b) { memset(b, 
 NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) { ((pool_builder_t *)b)->dev = d; }
 NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) { ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
+// A title that hands NVN a NULL memory pool for a texture or buffer (Mario Kart 8 Deluxe's Mii head targets: the allocation record the title reads the pool from is all zeros) still expects the object to work.
+// Such objects get a slice of one private pool taken from the guest window (a 32-bit title can only address memory inside it); the slices are never freed.
+extern uint64_t guest_alloc(size_t size, size_t align) __attribute__((weak));
+static const pool_t *fallback_pool(void) {
+    static pool_t P; static int tried;
+    if (!tried++) {
+        for (uint64_t sz = 0x4000000; sz >= 0x400000 && !P.mem; sz >>= 1) if (guest_alloc) { uint64_t a = guest_alloc(sz, 0x1000); if (a) { P.mem = (uint8_t *)(uintptr_t)a; P.size = sz; } }
+        if (!P.mem) { P.size = 0x1000000; P.mem = calloc(1, P.size); }
+        P.magic = MAGIC('P', 'O', 'O', 'L'); P.flags = 0;
+        if (P.mem) { mtl_pool_add(P.mem, P.size); nvn_dirty_add_range(P.mem, P.size); }
+        LOG("[nvn] a title object without a memory pool: %#llx bytes of private storage at %p serve them", (unsigned long long)P.size, (void *)P.mem);
+    }
+    return P.mem ? &P : NULL;
+}
+static int64_t fallback_alloc(uint64_t n) {            // offset of a fresh slice in the fallback pool, or -1
+    static uint64_t next; const pool_t *P = fallback_pool();
+    uint64_t at = (next + 0xFFF) & ~0xFFFull;
+    if (!P || at + n > P->size) return -1;
+    next = at + n; return (int64_t)at;
+}
 static uint8_t *vpool_reserve(pool_t *o); static void vpool_release(pool_t *o);   // sparse virtual pools, see MapVirtual
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
@@ -217,11 +244,11 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { if (((pool_t *)p)->flags & 
 static void ft_flush(const uint8_t *a, uint64_t n);
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {   // see ft_add and nvn_flushed
     const pool_t *o = (const pool_t *)p;
-    if (!o->mem) return;
+    if (!o || !o->mem) return;      // a NULL pool: the title never got one (see MemoryPoolGetFlags)
     if (!(o->flags & 0x200)) fl_add(o->mem + off, n);
     ft_flush(o->mem + off, n);
 }
-NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
+NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return p ? (NVNbufferAddress)((const pool_t *)p)->mem : 0; }
 
 // ---------- Descriptor pools ----------
 // One ID space per pool. In NVN a texture or sampler ID indexes the pool the command buffer has bound (SetTexturePool / SetSamplerPool), and two pools may use the same IDs. The replay keeps
@@ -459,7 +486,9 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8); o->set_swz = s->set_swz; o->stencil = s->stencil; o->swz = s->swz;
     nvn_tex_layout(&o->d, &o->L);
-    o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
+    int no_pool = !o->pool;            // its packaged data pointer (MemoryPoolMap(NULL) + offset) means nothing either
+    if (!o->pool) { int64_t at = fallback_alloc(o->L.size); if (at >= 0) { static int once; if (!once++) LOG("[RED] TextureInitialize: NULL pool (%ux%u): private storage serves it", o->d.width, o->d.height); o->pool = fallback_pool(); o->off = at; } }   // see fallback_pool
+    o->mem = o->pool && o->pool->mem ? o->pool->mem + o->off : NULL;
     o->serial = nvn_new_serial(); mtl_tex_init(o);
     {   // DM_NVN_TEXINFO=WxH also logs every texture of that size as it is initialized (render targets included): which ones share storage, and how their descriptions differ
         static int ti = -1; static uint32_t tw, th;
@@ -469,7 +498,10 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
             (unsigned long long)o->off, o->d.target, o->d.format, o->d.flags, o->d.samples, o->d.width, o->d.height, o->d.depth, o->d.levels, o->d.stride, (unsigned long long)o->L.size); }
     }
     // See SetPackagedTextureData. Linear textures are not re-uploaded as packaged: they are created on the pool buffer (tex_linear), whatever the pool's CPU access, and read what was copied in
-    if (s->pkg_data && o->mem) {
+    { static unsigned cnt; static int dd = -1; if (dd < 0) dd = getenv("NX_DRAW_DETAIL") != NULL;
+      if (dd && (cnt < 12 || cnt % 400 == 0)) fprintf(stderr, "[dm] [nvn] TextureInitialize #%u: serial %llu %ux%u fmt %#x flags %#x size %#llx pkg_data %p mem %p pool %p\n", cnt, (unsigned long long)o->serial, o->d.width, o->d.height, o->d.format, o->d.flags, (unsigned long long)o->L.size, s->pkg_data, (void *)o->mem, (const void *)o->pool);
+      cnt++; }
+    if (s->pkg_data && o->mem && !no_pool) {
         memcpy(o->mem, s->pkg_data, o->L.size);
         if (!(o->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) mtl_tex_cpu_written(o);
     }
@@ -587,7 +619,7 @@ NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
 static void pk_drop(const void *p);
 NVN(nvnProgramFinalize, void, NVNprogram *p) { mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; pk_drop(p); }
 // a program's per-stage keys (side table: guest NVNprogram address → host object; bit i of ok = stage i computed)
-typedef struct { uint8_t key[6][8]; uint8_t ok; } prog_keys_t;
+typedef struct { uint8_t key[6][8]; uint8_t ok, ph; } prog_keys_t;       // ph: stages whose code area was a reserved (empty) one when the program was set
 static pthread_mutex_t g_pk_mu = PTHREAD_MUTEX_INITIALIZER;   // a dedicated table (keys not shared with other side tables)
 static struct { const void *k; prog_keys_t *v; } *g_pk; static size_t g_pk_cap, g_pk_n;   // open addressing, linear probing, tombstone = v NULL with k set
 static size_t pk_slot(const void *p, size_t cap) { return (size_t)(((uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull >> 20) & (cap - 1); }
@@ -619,14 +651,57 @@ static void pk_drop(const void *p) {
 }
 // The keys of a program's shader stages as SetShaders computed them (the replay layer finds the shaders by them): n keys in the order of SetShaders; keys with no
 // valid code area are left out. Returns how many were written to out (at most 6).
+static void shader_dump(const NVNshaderData *sd, const uint8_t key[8]);
+static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]);
+static int code_reserved(const NVNshaderData *sd) {            // a graphics code area the title has not filled yet: the 0x12345678 magic and an empty SPH (see shader_dump)
+    uint32_t ncode = 0; if (!sd->control || !sd->data) return 0;
+    memcpy(&ncode, (const uint8_t *)sd->control + 0x704, 4);
+    const uint32_t *c = (const uint32_t *)(uintptr_t)sd->data;
+    return ncode >= 0x34 && ncode < (1u << 24) && c[0] == 0x12345678u && c[0x30 / 4] == 0;
+}
 int nvn_prog_keys(const prog_t *p, uint8_t out[6][8]) {
     prog_keys_t *k = pk_get(p, 0);
     if (!k) return 0;
     int n = 0;
-    for (unsigned i = 0; i < p->nstage && i < 6; i++) if (k->ok >> i & 1) memcpy(out[n++], k->key[i], 8);
+    // A title sets a program (ProgramSetShaders) before the code is there and fills the code area later, without setting it again: the key of such a stage is taken from what the area holds now
+    for (unsigned i = 0; i < p->nstage && i < 6; i++) {
+        if (k->ph >> i & 1) { if (code_reserved(&p->sd[i])) continue; if (keys_hash(&p->sd[i], 1, k->key[i])) { k->ph &= (uint8_t)~(1u << i); k->ok |= (uint8_t)(1u << i); shader_dump(&p->sd[i], k->key[i]); } else continue; }
+        if (k->ok >> i & 1) memcpy(out[n++], k->key[i], 8);
+    }
     return n;
 }
 // mapped = 1: computed only when the code area is in a registered memory pool (at SetShaders: Mario sets some programs with an unmapped address first and fills it in before the first draw)
+// NX_SHADER_DUMP=<dir>: every shader a title sets (once per key), for the translator (tools/shader_capture_build.py): <key>.code (the code area: the 0x50-byte program header and the
+// instructions), <key>.c1 (the 0x100 bytes before the control section, where the constant segment c[1] and its jump tables are) and <key>.stage (the header's shader type: vs or ps).
+static void shader_dump(const NVNshaderData *sd, const uint8_t key[8]) {
+    static const char *dir; static int init;
+    if (!init) { dir = getenv("NX_SHADER_DUMP"); init = 1; if (dir) LOG("[nvn] NX_SHADER_DUMP: shaders are written to %s", dir); }
+    if (!dir || !sd->control || !sd->data) return;
+    uint32_t ncode; memcpy(&ncode, (const uint8_t *)sd->control + 0x704, 4);
+    if (!ncode || ncode >= (1u << 24)) return;
+    char base[512], path[600]; snprintf(base, sizeof base, "%s/", dir);
+    for (int j = 0; j < 8; j++) snprintf(base + strlen(base), 3, "%02x", key[j]);
+    snprintf(path, sizeof path, "%s.code", base);
+    if (access(path, F_OK) == 0) return;
+    uint32_t sph0; memcpy(&sph0, (const void *)(uintptr_t)sd->data, 4);
+    // Graphics code starts with the magic 0x12345678 and keeps its SPH at +0x30 (word 0: the shader type in bits 10..13, version in bits 0..4; type 0 with version 1 is a vertex shader too, as
+    // Catherine: Full Body's GLSLC writes it); compute code has no magic. A graphics area whose SPH word is 0 is a reserved stage the title has not filled yet (a title makes thousands of
+    // 0x100-byte ones before its assets load): not dumped, and counted.
+    const char *stage;
+    if (sph0 == 0x12345678) {
+        uint32_t w = ncode >= 0x34 ? ((const uint32_t *)(uintptr_t)sd->data)[0x30 / 4] : 0;
+        if (!w) { static int n; if (!(n++ % 2000)) LOG("[nvn] NX_SHADER_DUMP: %d reserved (empty) graphics stage(s) seen at draw time so far", n); return; }
+        unsigned t = w >> 10 & 15; stage = t == 5 ? "ps" : (t == 1 || (t == 0 && (w & 31) == 1)) ? "vs" : "other";
+    } else {
+        unsigned t = sph0 >> 5 & 31; stage = t == 5 ? "ps" : t == 1 || t == 0 ? "vs" : "other";            // compute: SPH-less layout kept as before
+    }
+    { static int shown; if (shown++ < 6) LOG("[nvn] NX_SHADER_DUMP: a real shader (%s, key %02x%02x%02x%02x..) with its code area at %#llx, %u bytes, first words %08x %08x", stage, key[0], key[1], key[2], key[3], (unsigned long long)sd->data, ncode, ((uint32_t *)(uintptr_t)sd->data)[0], ((uint32_t *)(uintptr_t)sd->data)[1]); }
+    FILE *f = fopen(path, "wb"); if (!f) return;
+    fwrite((const void *)(uintptr_t)sd->data, 1, ncode, f); fclose(f);
+    snprintf(path, sizeof path, "%s.c1", base); if ((f = fopen(path, "wb"))) { fwrite((const uint8_t *)sd->control - 0x100, 1, 0x100, f); fclose(f); }
+    snprintf(path, sizeof path, "%s.stage", base); if ((f = fopen(path, "w"))) { fputs(stage, f); fclose(f); }
+    snprintf(path, sizeof path, "%s.ctl", base); if ((f = fopen(path, "wb"))) { fwrite(sd->control, 1, 0x880, f); fclose(f); }
+}
 static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     uint32_t ncode = 0; void *mb; uint64_t mo;
     if (!sd->control) return 0;
@@ -647,20 +722,31 @@ int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
     prog_keys_t *k = pk_get(p, 1);
     if (!(k->ok >> st & 1)) { keys_hash(&p->sd[st], 0, k->key[st]); k->ok |= (uint8_t)(1u << st); }
     memcpy(key, k->key[st], 8);
+    shader_dump(&p->sd[st], key);          // NX_SHADER_DUMP: the code is in place by the first draw
     return 1;
 }
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("[RED] ProgramSetShaders stage count %d", n); return 0; }
+    NVNshaderData sdl[6];
+    if (cpu_is_aarch32()) {         // {u64 data; 32-bit control pointer; 4 bytes of padding}: the pointer is half the host's
+        const uint32_t *w = (const uint32_t *)sd;
+        for (int i = 0; i < n; i++) { sdl[i].data = w[4 * i] | (uint64_t)w[4 * i + 1] << 32; sdl[i].control = (const void *)(uintptr_t)w[4 * i + 2]; }
+        sd = sdl;
+    }
+    { static int nreal, ndummy; for (int i = 0; i < n; i++) { uint32_t m = sd[i].control ? *(const uint32_t *)sd[i].control : 0;
+        if (m == 0x98761234u) { if (!(ndummy++ % 500)) LOG("[nvn] ProgramSetShaders: %d stage(s) with the title's dummy control section (magic 0x98761234) so far", ndummy); }
+        else if (nreal++ < 8) LOG("[nvn] ProgramSetShaders: stage %d with a real-looking control section (magic %#x, code %#llx)", i, m, (unsigned long long)sd[i].data); } }
     mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
     // The keys are computed here (see prog_key in nvn_obj.h): the control section is only guaranteed valid during this call; the code area lives in a memory pool and stays valid while the program is in use
     static int dump = -1; if (dump < 0) dump = getenv("DM_NVN_SHDUMP") != NULL;
     static const char *trace; static int trace_init;
     if (!trace_init) { trace = getenv("DM_NVN_PROGTRACE"); trace_init = 1; }
     prog_keys_t *k = pk_get(p, 1);
-    k->ok = 0;
+    k->ok = 0; k->ph = 0;
     for (int i = 0; i < n; i++) {
-        if (keys_hash(&sd[i], 1, k->key[i])) k->ok |= (uint8_t)(1u << i);
+        if (code_reserved(&sd[i])) { k->ph |= (uint8_t)(1u << i); continue; }            // its key is taken when the code is there (nvn_prog_keys)
+        if (keys_hash(&sd[i], 1, k->key[i])) { k->ok |= (uint8_t)(1u << i); shader_dump(&sd[i], k->key[i]); }
         // Diagnostic: trace the loader of selected shader keys (comma-separated hex).
         if (trace && (k->ok & (1u << i))) {
             char key[17]; for (int j = 0; j < 8; j++) snprintf(key + j * 2, 3, "%02x", k->key[i][j]);
@@ -670,7 +756,7 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
             }
         }
         // DM_NVN_SHDUMP (debugging): keep a copy of the control section so the replay layer can save shaders missing from the map (never freed)
-        if (dump && sd[i].control) { void *c = malloc(0x880); memcpy(c, sd[i].control, 0x880); o->sd[i].control = c; }
+        if ((dump || getenv("NX_SHADER_DUMP")) && sd[i].control) { uint8_t *c = malloc(0x980); memcpy(c, (const uint8_t *)sd[i].control - 0x100, 0x980); o->sd[i].control = c + 0x100; }   // c[1] before the control section stays beside it
     }
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
@@ -952,9 +1038,29 @@ static const tex_t *tex_snap(void *rec_, size_t off, int k, const NVNtexture *t,
     }
     return s;
 }
+// An AArch32 process's arrays: pointer arrays have 4-byte entries, and an NVNbufferRange is {u64 address; u32 size; u32 padding}, the same 16 bytes as the host's {u64; size_t} but with
+// garbage in the upper half of the size. Converted copies for the host functions below (counts clamp to the arrays' capacity).
+#define NVN_MAXARR 32
+static const NVNbufferRange *nvn_ranges32(const NVNbufferRange *rg, int *n, NVNbufferRange *tmp) {
+    if (!cpu_is_aarch32() || !rg) return rg;
+    if (*n > NVN_MAXARR) { LOG("[RED] NVN: %d buffer ranges, only %d are converted", *n, NVN_MAXARR); *n = NVN_MAXARR; }
+    const uint32_t *w = (const uint32_t *)rg;
+    for (int i = 0; i < *n; i++) tmp[i] = (NVNbufferRange){w[4 * i] | (uint64_t)w[4 * i + 1] << 32, w[4 * i + 2]};
+    return tmp;
+}
+static const void *const *nvn_ptrs32(const void *const *a, int n, const void **tmp) {
+    if (!cpu_is_aarch32() || !a) return a;
+    const uint32_t *w = (const uint32_t *)a;
+    for (int i = 0; i < n && i < NVN_MAXARR; i++) tmp[i] = (const void *)(uintptr_t)w[i];
+    return tmp;
+}
 NVN(nvnCommandBufferSetRenderTargets, void, NVNcommandBuffer *c, int n, const NVNtexture *const *ct, const NVNtextureView *const *cv,
     const NVNtexture *dt, const NVNtextureView *dv) {
     if (n < 0 || n > 8) { LOG("[RED] SetRenderTargets count %d", n); n = n < 0 ? 0 : 8; }
+    const void *ctl[NVN_MAXARR], *cvl[NVN_MAXARR];
+    ct = (const NVNtexture *const *)nvn_ptrs32((const void *const *)ct, n, ctl); cv = (const NVNtextureView *const *)nvn_ptrs32((const void *const *)cv, n, cvl);
+    { static int on = -1, shown; if (on < 0) on = getenv("NX_DRAW_LOG") != NULL;       // NX_DRAW_LOG=1: the first 40 render target sets
+      if (on && shown < 40) { shown++; fprintf(stderr, "[dm] [nvn] SetRenderTargets n=%d:", n); for (int i = 0; i < n && ct && ct[i]; i++) { const tex_t *t = (const tex_t *)ct[i]; fprintf(stderr, " [serial %llu %ux%u fmt %#x flags %#x]", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.flags); } if (dt) fprintf(stderr, " depth %ux%u", ((const tex_t *)dt)->d.width, ((const tex_t *)dt)->d.height); fprintf(stderr, "\n"); } }
     p_set_rt *r = REC_SNAP(c, OP_SET_RT, p_set_rt, n + 1); r->n = n;
     for (int i = 0; i < n; i++) { r->color[i] = ct ? tex_snap(r, SNAP_OFF(p_set_rt), i, ct[i], (uint64_t)__builtin_return_address(0)) : NULL; copy_view(&r->cview[i], &r->has_cview[i], cv ? cv[i] : NULL); }
     r->depth = tex_snap(r, SNAP_OFF(p_set_rt), n, dt, (uint64_t)__builtin_return_address(0)); copy_view(&r->dview, &r->has_dview, dv);
@@ -999,6 +1105,7 @@ NVN(nvnCommandBufferBindVertexStreamState, void, NVNcommandBuffer *c, int n, con
     p_bind_vstream *r = RECN(c, OP_BIND_VSTREAM, p_bind_vstream, st, n); r->first = 0; r->n = n; memcpy(r->st, st, 8 * n);
 }
 NVN(nvnCommandBufferBindVertexBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *rg) {
+    NVNbufferRange rtmp[NVN_MAXARR]; rg = nvn_ranges32(rg, &n, rtmp);
     if (n < 0 || first + n > 16) { LOG("[RED] BindVertexBuffers first=%d n=%d", first, n); return; }
     if (n == 1 && (unsigned)first < 16 && rg[0].size <= UINT32_MAX) {
         *REC(c, OP_BIND_VBUF1, p_bind_vbuf1) = (p_bind_vbuf1){(uint32_t)first, (uint32_t)rg[0].size, rg[0].address}; return;
@@ -1012,12 +1119,14 @@ NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage
     *REC(c, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindUniformBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
+    NVNbufferRange rtmp[NVN_MAXARR]; rg = nvn_ranges32(rg, &n, rtmp);
     for (int i = 0; i < n; i++) h_nvnCommandBufferBindUniformBuffer(c, st, first + i, rg[i].address, rg[i].size);
 }
 NVN(nvnCommandBufferBindStorageBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
     *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindStorageBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
+    NVNbufferRange rtmp[NVN_MAXARR]; rg = nvn_ranges32(rg, &n, rtmp);
     for (int i = 0; i < n; i++) *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
 }
 static p_bind_handles *bind_handles(NVNcommandBuffer *c, int op, int st, int first, int n, const uint64_t *h) {
@@ -1280,7 +1389,8 @@ NVN(nvnWindowBuilderSetDevice, void, NVNwindowBuilder *b, NVNdevice *d) { WB(b)-
 NVN(nvnWindowBuilderSetNativeWindow, void, NVNwindowBuilder *b, NVNnativeWindow w) { WB(b)->native = w; }
 NVN(nvnWindowBuilderSetTextures, void, NVNwindowBuilder *b, int n, NVNtexture *const *t) {
     if (n < 0 || n > 4) { LOG("[RED] WindowBuilderSetTextures count %d", n); n = n < 0 ? 0 : 4; }
-    WB(b)->ntex = n; for (int i = 0; i < n; i++) WB(b)->tex[i] = t[i];
+    // An array of pointers in the guest's memory: 4-byte entries in an AArch32 process
+    WB(b)->ntex = n; for (int i = 0; i < n; i++) WB(b)->tex[i] = cpu_is_aarch32() ? (NVNtexture *)(uintptr_t)((const uint32_t *)t)[i] : t[i];
 }
 NVN(nvnWindowBuilderSetPresentInterval, void, NVNwindowBuilder *b, int v) { WB(b)->interval = v; }
 NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
@@ -1957,6 +2067,13 @@ NVN(nvnBufferBuilderSetDevice, void, NVNbufferBuilder *b, NVNdevice *d) { BB(b)-
 NVN(nvnBufferBuilderSetStorage, void, NVNbufferBuilder *b, NVNmemoryPool *p, ptrdiff_t off, size_t n) { BB(b)->pool = (const pool_t *)p; BB(b)->off = off; BB(b)->size = n; }
 NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b) {
     const buf_builder_t *bb = (const buf_builder_t *)b;
+    if (!bb->pool) {            // see fallback_pool
+        uint64_t want = (uint64_t)bb->off + bb->size;
+        if (want > 0x1000000) want = 0x10000;            // a size that cannot be real (the title's record is half built): a small slice keeps the thread that maps it alive
+        int64_t at = fallback_alloc(want);
+        if (at >= 0) { static int once; if (!once++) LOG("[RED] BufferInitialize: NULL pool (offset %#llx size %#llx): private storage serves it", (unsigned long long)bb->off, (unsigned long long)bb->size);
+            *(buf_t *)buf = (buf_t){MAGIC('B', 'U', 'F', 0), fallback_pool(), at + (bb->off > 0x10000 ? 0 : bb->off), bb->size > want ? want : bb->size}; return 1; }
+    }
     if (!bb->pool || !bb->pool->mem) { LOG("[RED] BufferInitialize: pool has no storage (pool %p flags %#x offset %#llx size %#llx)", (const void *)bb->pool, bb->pool ? bb->pool->flags : 0, (unsigned long long)bb->off, (unsigned long long)bb->size); return 0; }
     // The NVN driver does not check a buffer's range against its pool, and the host's own GPU access never goes by the buffer: it takes an address and a length from the command (mtl_addr resolves it
     // in the pool's memory and reports a range that leaves the pool as its own red line). Breath of the Wild creates a 256 KB buffer over a 144 KB pool for a screen readback that feeds a
@@ -1968,8 +2085,8 @@ NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b) 
 }
 NVN(nvnBufferFinalize, void, NVNbuffer *buf) { ((buf_t *)buf)->magic = 0; }
 NVN(nvnBufferSetDebugLabel, void, NVNbuffer *buf, const char *s) { (void)buf; (void)s; }
-NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { return (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off); }
-NVN(nvnBufferMap, void *, const NVNbuffer *buf) { return BF(buf)->pool->mem + BF(buf)->off; }
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { return BF(buf)->pool && BF(buf)->pool->mem ? (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off) : 0; }   // a buffer whose Initialize failed (no pool) has no address
+NVN(nvnBufferMap, void *, const NVNbuffer *buf) { return BF(buf)->magic == MAGIC('B', 'U', 'F', 0) && BF(buf)->pool && BF(buf)->pool->mem ? BF(buf)->pool->mem + BF(buf)->off : NULL; }
 NVN(nvnBufferGetSize, size_t, const NVNbuffer *buf) { return (size_t)BF(buf)->size; }
 NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *buf) { return (NVNmemoryPool *)BF(buf)->pool; }
 NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *buf) { return (ptrdiff_t)BF(buf)->off; }
@@ -1977,9 +2094,12 @@ NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *buf, ptrdiff_t off, size_t
 NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *buf, ptrdiff_t off, size_t n) { (void)buf; (void)off; (void)n; }
 
 // Memory pool queries
-NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p) { return (NVNmemoryPoolFlags)((const pool_t *)p)->flags; }
-NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) { return ((const pool_t *)p)->mem; }
-NVN(nvnMemoryPoolGetSize, size_t, const NVNmemoryPool *p) { return (size_t)((const pool_t *)p)->size; }
+NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p) { if (!p) { static int once; if (!once++) LOG("[RED] MemoryPoolGetFlags(NULL): the title has no pool here"); return 0; } return (NVNmemoryPoolFlags)((const pool_t *)p)->flags; }
+NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) {
+    if (p && !((const pool_t *)p)->mem) { static int n; if (n++ < 5) { const pool_t *o = (const pool_t *)p; LOG("[RED] MemoryPoolMap: pool %p has no storage (magic %#x flags %#x size %#llx vmode %d)", (const void *)p, o->magic, o->flags, (unsigned long long)o->size, o->vmode); } }
+    return p ? ((const pool_t *)p)->mem : NULL;
+}
+NVN(nvnMemoryPoolGetSize, size_t, const NVNmemoryPool *p) { return p ? (size_t)((const pool_t *)p)->size : 0; }
 NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
 NVN(nvnMemoryPoolSetDebugLabel, void, NVNmemoryPool *p, const char *s) { (void)p; (void)s; }
 // Debug labels: only for NVN debugging tools, unused by the host
@@ -2106,6 +2226,14 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
 }
 NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappingRequest *rq) {
     pool_t *o = (pool_t *)p; const map_req *r = (const map_req *)rq;
+    map_req conv[64];
+    if (cpu_is_aarch32()) {         // 0x28 bytes still, but the pool pointer is 4 bytes and 4 of padding; the offsets, size and storage class keep their 64-bit and 32-bit widths
+        if (n > 64) { LOG("[RED] MapVirtual: %d requests, only 64 are converted", n); n = 64; }
+        const uint32_t *w = (const uint32_t *)rq;
+        for (int i = 0; i < n; i++, w += 10)
+            conv[i] = (map_req){(NVNmemoryPool *)(uintptr_t)w[0], (int64_t)(w[2] | (uint64_t)w[3] << 32), (int64_t)(w[4] | (uint64_t)w[5] << 32), w[6] | (uint64_t)w[7] << 32, (int32_t)w[8], 0};
+        r = conv;
+    }
     pthread_mutex_lock(&g_vp_mu);
     if (o->vp && o->vmode == 0 && n > 0) {   // the first mapping decides (see the sparse pools above)
         if (r[0].phys && r[0].voff == 0 && r[0].size == o->size) { vpool_drop(o); o->mem = NULL; o->vmode = 1; }
@@ -2259,6 +2387,7 @@ NVN_NOPROTO(nvnSetExternalDebuggerEnabledNVX, void, NVNboolean enable) { (void)e
 // captured outputs into the bound buffers (dmsh_build.py vs_tf, the layout from the program's control section; nvn_mtl.m tf_* for the replay)
 NVN(nvnCommandBufferBindTransformFeedbackBuffer, void, NVNcommandBuffer *c, int i, NVNbufferAddress a, size_t n) { *REC(c, OP_TF_BIND, p_tf_bind) = (p_tf_bind){i, 0, a, n}; }
 NVN(nvnCommandBufferBindTransformFeedbackBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *r) {
+    NVNbufferRange rtmp[NVN_MAXARR]; r = nvn_ranges32(r, &n, rtmp);
     for (int i = 0; i < n; i++) *REC(c, OP_TF_BIND, p_tf_bind) = (p_tf_bind){first + i, 0, r[i].address, r[i].size};
 }
 NVN(nvnCommandBufferBeginTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){0, 0, a}; }

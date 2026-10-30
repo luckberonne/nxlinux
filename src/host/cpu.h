@@ -14,6 +14,17 @@ typedef struct {
     void (*fault)(cpu_t *c, uint64_t pc, int kind, void *user);   // unmapped code, undefined instruction, etc.
 } cpu_ops_t;
 
+// An AArch32 process (main.npdm's 64-bit flag clear) runs every cpu_t on the A32 Jits in cpu32.cpp. Call cpu_set_aarch32(1) before the first cpu_create; the API below then reads
+// and writes the 32-bit registers, see cpu32.h.
+void cpu_set_aarch32(int on);
+// Runs a guest function from inside an SVC handler (a host function the guest called): fn(args[0..nargs-1], up to 8) on this thread's cpu, then returns its r0. Nests: the guest function
+// may itself make SVCs and call hooked functions. AArch32 only (returns 0 otherwise).
+uint32_t cpu_call32(cpu_t *c, uint32_t fn, const uint32_t *args, int nargs);
+uint64_t cpu_call64(cpu_t *c, uint64_t fn, const uint64_t *args, int nargs);   // the AArch64 equivalent: x0..x7 = args, returns x0 (kernel_init sets the return pad)
+void cpu_set_return_pad64(uint64_t addr);
+void cpu_set_trap64(uint64_t addr);   // NX_TRAP on a 64-bit title: replace the `mov xd, xm` at addr by a register-logging trap
+int cpu_is_aarch32(void);
+
 enum { CPU_HALT_NONE = 0, CPU_HALT_REQUESTED = 1, CPU_HALT_FAULT = 2 };
 
 // core: 0..cpu_max_cores-1, the exclusive-monitor slot of this thread (one per concurrently running guest thread).

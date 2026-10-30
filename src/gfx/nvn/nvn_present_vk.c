@@ -104,6 +104,19 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     NVNcopyRegion r = {x, y, 0, w, h, 1};
     mtl_read_texels(t, 0, 0, &r, px, (size_t)w * 4, (size_t)w * h * 4);
     if (swap) for (size_t i = 0; i < (size_t)w * h; i++) { uint8_t b = px[i * 4]; px[i * 4] = px[i * 4 + 2]; px[i * 4 + 2] = b; }
+    {   // NX_FRAME_DUMP=<prefix>: frames 100, 400, 1000 and 2500 go to <prefix>.<n>.ppm, with a count of the pixels that are not black
+        static int dump = -1; static unsigned nth; if (dump < 0) dump = getenv("NX_FRAME_DUMP") != NULL;
+        nth++;
+        if (dump && nth == 1000) { extern void nvn_vk_debug_texstats(void); nvn_vk_debug_texstats(); }
+        if (dump && (nth == 100 || nth == 400 || nth == 1000 || nth == 2500 || (nth > 2500 && nth % 1500 == 0))) {
+            size_t lit = 0; for (size_t i = 0; i < (size_t)w * h; i++) if (px[i * 4] | px[i * 4 + 1] | px[i * 4 + 2]) lit++;
+            char fn[600]; snprintf(fn, sizeof fn, "%s.%u.ppm", getenv("NX_FRAME_DUMP"), nth);
+            FILE *o = fopen(fn, "wb"); if (o) { fprintf(o, "P6\n%d %d\n255\n", w, h); for (size_t i = 0; i < (size_t)w * h; i++) fwrite(px + i * 4, 1, 3, o); fclose(o); }
+            { extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); extern uint64_t nvn_draw_main_target(void); size_t tot = 0; uint64_t ms = nvn_draw_main_target(); char pn[640]; snprintf(pn, sizeof pn, "%s.%u.offscreen.ppm", getenv("NX_FRAME_DUMP"), nth); long l = ms ? nvn_vk_debug_lit(ms, &tot, pn) : -1;
+              fprintf(stderr, "[dm] [nvn] offscreen target serial %llu: %ld of %zu bytes are not zero\n", (unsigned long long)ms, l, tot); }
+            fprintf(stderr, "[dm] [nvn] frame %u written to %s: %zu of %zu pixels are not black (texture serial %llu)\n", nth, fn, lit, (size_t)w * h, (unsigned long long)t->serial);
+        }
+    }
     pthread_mutex_lock(&g_mu);
     sink_init();
     if ((size_t)w * h * 4 > g_fcap) { free(g_frame); g_frame = malloc((size_t)w * h * 4); g_fcap = (size_t)w * h * 4; }

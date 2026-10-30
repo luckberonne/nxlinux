@@ -1,5 +1,6 @@
 // Host services hle_nvn.c expects from the rest of the host. Clocks and the frame tick are real; the rest report "not available" until
 // the services they belong to exist (a window, a crash reporter).
+#include "kernel.h"
 #include "dm.h"
 #include "hle.h"
 #include "front.h"
@@ -63,5 +64,5 @@ void *objmap_del(const void *k) {
 // ---------- Host hooks the services call that have no owner yet ----------
 void dm_guest_sleep_ns(int64_t ns) { if (ns > 0) { struct timespec ts = {ns / 1000000000ll, ns % 1000000000ll}; nanosleep(&ts, NULL); } }
 void guest_clock_freeze_for(int reason, int on) { (void)reason; (void)on; }      // the guest clock is the wall clock; freezing it is for the test driver
-void dm_thread_native_wait(int entering) { (void)entering; }                      // a host function here runs on the guest thread's own host thread, outside the kernel's lock
+void dm_thread_native_wait(int entering) { if (entering) kernel_core_release(); else kernel_core_acquire(); }                      // a host function here runs on the guest thread's own host thread, outside the kernel's lock
 void dm_audio_suspend(int on) { (void)on; }                                       // there is no audio output yet

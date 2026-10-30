@@ -28,6 +28,8 @@ VkShaderModule nvn_shader_module(nvn_shader *s);
 nvn_rt_t g_rt;
 struct nvn_scissor_state g_sc;
 static _Atomic uint64_t g_ndraw, g_nskip, g_npipe;
+uint64_t nvn_draw_main_target(void);
+static _Atomic uint64_t g_main_target; uint64_t nvn_draw_main_target(void) { return atomic_load(&g_main_target); }
 uint64_t nvn_draw_count(void) { return atomic_load(&g_ndraw); }
 uint64_t nvn_draw_skipped(void) { return atomic_load(&g_nskip); }
 uint64_t nvn_pipeline_count(void) { return atomic_load(&g_npipe); }
@@ -322,6 +324,16 @@ static void skip(const char *why, int *flag) {
     if (!__atomic_exchange_n(flag, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [RED] [nvn] draw skipped: %s\n", why);
 }
 
+// A vertex attribute's format: the texture table (nvn_fmt_to_vk) leaves the three-component formats out because sampling them is not universal, but Vulkan takes them as vertex input
+static int vertex_fmt(int f, VkFormat *vf) {
+    static const VkFormat rgb[] = {   // NVN_FORMAT_RGB8 .. RGB32I = 0x19 .. 0x24
+        VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8_SNORM, VK_FORMAT_R8G8B8_UINT, VK_FORMAT_R8G8B8_SINT,
+        VK_FORMAT_R16G16B16_SFLOAT, VK_FORMAT_R16G16B16_UNORM, VK_FORMAT_R16G16B16_SNORM, VK_FORMAT_R16G16B16_UINT, VK_FORMAT_R16G16B16_SINT,
+        VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32_UINT, VK_FORMAT_R32G32B32_SINT};
+    if (f >= 0x19 && f <= 0x24) { *vf = rgb[f - 0x19]; return 1; }
+    return nvn_fmt_to_vk(f, vf, NULL) && *vf != VK_FORMAT_UNDEFINED;
+}
+
 // Everything shared by the plain and the indexed draw: the pipeline, the pass, the dynamic state, the vertex buffers and the uniforms. 0 when the draw cannot be made.
 static int prepare(unsigned prim, pipe_entry **pe_out) {
     static int f_ntex, f_tex, f_needs, f_noprog, f_noshader, f_prim, f_vbuf, f_vattr, f_nort, f_pipe, f_fmt, f_off;
@@ -355,7 +367,13 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
             for (int i = 0; i < n; i++) {
                 if (b[i].kind != NVN_SB_TEX) continue;
                 if (b[i].reg >= NTEXSLOT || nt == 16) { skip("a shader samples more textures than the draw path binds", &f_ntex); return 0; }
+                { static int dd = -1; static unsigned cnt; if (dd < 0) dd = getenv("NX_DRAW_DETAIL") != NULL;
+                  if (dd && cnt < 24) { cnt++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); uint64_t sr = nvn_vk_desc_serial(S.tex[si][b[i].reg]); size_t tot = 0; char pn[300]; snprintf(pn, sizeof pn, "/tmp/claude-1000/-home-lucas-Proyectos-nxlinux/4e412c71-58e2-49fb-bfd2-dd41fc221dfa/scratchpad/tex_%llu.ppm", (unsigned long long)sr); long lit = sr ? nvn_vk_debug_lit(sr, &tot, pn) : -2;
+                    fprintf(stderr, "[dm] [nvn] draw samples handle %#x (texture id %u, sampler %u) serial %llu: %ld of %zu bytes not zero\n", S.tex[si][b[i].reg], S.tex[si][b[i].reg] & 0xfffff, S.tex[si][b[i].reg] >> 20, (unsigned long long)sr, lit, tot); } }
                 int r = nvn_vk_desc_sampled(S.tex[si][b[i].reg], (int)b[i].aux, &ti[nt]);
+                { static int dd2 = -1; static unsigned cnt2; if (dd2 < 0) dd2 = getenv("NX_DRAW_DETAIL") != NULL;       // the same texture read again once the draw path has made it ready (the GPU copy)
+                  if (dd2 && cnt2 < 12) { cnt2++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); extern int mtl_tex_gpu_owned(uint64_t); uint64_t sr = nvn_vk_desc_serial(S.tex[si][b[i].reg]); size_t tot = 0; long lit = sr ? nvn_vk_debug_lit(sr, &tot, NULL) : -2;
+                    fprintf(stderr, "[dm] [nvn] after sampling: serial %llu result %d gpu-owned %d: %ld of %zu bytes not zero\n", (unsigned long long)sr, r, sr ? mtl_tex_gpu_owned(sr) : -1, lit, tot); } }
                 if (r != 1) {
                     char why[160]; uint32_t h = S.tex[si][b[i].reg];
                     snprintf(why, sizeof why, r == 3 ? "texture slot %u (id %u) is not the type the shader samples" : "texture slot %u (id %u) has no image the shader can sample and no stand-in for its type", b[i].reg, h & 0xfffff);
@@ -381,6 +399,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     }
     int ll = atomic_load(&g_origin_ll);
     k.cull = S.poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : S.poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : S.poly.cull == NVN_FACE_FRONT_AND_BACK ? VK_CULL_MODE_FRONT_AND_BACK : 0;
+    if (getenv("NX_NO_CULL")) k.cull = 0;       // a test: draw both faces
     k.front_ccw = (S.poly.front == NVN_FRONT_FACE_CCW) ^ (ll != 0);       // see the conventions at the top
     k.polymode = S.poly.mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : S.poly.mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     if (k.polymode != VK_POLYGON_MODE_FILL && !c->enabled.fillModeNonSolid) k.polymode = VK_POLYGON_MODE_FILL;
@@ -402,9 +421,18 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     // Vertex input: attribute i is location i; its stream is the binding
     k.nbind = (uint8_t)S.nstream; k.nattr = (uint8_t)S.nattr;
     for (int i = 0; i < S.nstream; i++) { k.bd[i].stride = S.stream[i].stride; k.bd[i].inst = S.stream[i].divisor != 0; }
-    for (int i = 0; i < S.nattr; i++) {
+    // A disabled attribute (format NONE) that comes before an enabled one keeps its location as a one-float read of the first enabled attribute's stream (no shader reads it); trailing ones are dropped,
+    // so a draw whose attributes are all off (positions made in the vertex shader) needs no vertex buffer
+    int nat = S.nattr, first_stream = -1;
+    while (nat > 0) { va_st t; memcpy(&t, &S.attr[nat - 1], sizeof t); if (t.fmt) break; nat--; }
+    for (int i = 0; i < nat; i++) { va_st t; memcpy(&t, &S.attr[i], sizeof t); if (t.fmt) { first_stream = t.stream; break; } }
+    k.nattr = (uint8_t)nat;
+    uint32_t used_streams = 0;
+    for (int i = 0; i < nat; i++) {
         va_st a; memcpy(&a, &S.attr[i], sizeof a); VkFormat vf;
-        if (!nvn_fmt_to_vk(a.fmt, &vf, NULL) || vf == VK_FORMAT_UNDEFINED) { skip("a vertex attribute has a format with no Vulkan counterpart", &f_fmt); return 0; }
+        if (a.fmt == 0) { a.fmt = NVN_FORMAT_R32F; a.stream = (uint32_t)first_stream; a.offset = 0; }
+        else used_streams |= 1u << a.stream;
+        if (!vertex_fmt(a.fmt, &vf)) { { char why[120]; snprintf(why, sizeof why, "a vertex attribute has a format with no Vulkan counterpart (NVN format %#x)", (unsigned)a.fmt); skip(why, &f_fmt); return 0; } }
         if (a.stream >= S.nstream) { skip("a vertex attribute names a stream that is not bound", &f_vattr); return 0; }
         k.at[i].fmt = vf; k.at[i].off = a.offset; k.at[i].binding = (uint8_t)a.stream;
     }
@@ -421,6 +449,8 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     VkRect2D sc = {{0, 0}, {P.w, P.h}};
     if (g_sc.has) { int x0 = g_sc.r[0] > 0 ? g_sc.r[0] : 0, y0 = g_sc.r[1] > 0 ? g_sc.r[1] : 0; int x1 = g_sc.r[0] + g_sc.r[2], y1 = g_sc.r[1] + g_sc.r[3];
                     if (x1 > (int)P.w) x1 = (int)P.w; if (y1 > (int)P.h) y1 = (int)P.h; sc = (VkRect2D){{x0, y0}, {x1 > x0 ? (uint32_t)(x1 - x0) : 0, y1 > y0 ? (uint32_t)(y1 - y0) : 0}}; }
+    { static int dd4 = -1; static unsigned cnt4; if (dd4 < 0) dd4 = getenv("NX_DRAW_DETAIL") != NULL;
+      if (dd4 && cnt4 < 16) { cnt4++; fprintf(stderr, "[dm] [nvn] viewport %g %g %g x %g depth %g..%g scissor %d,%d %ux%u (pass %ux%u, has_vp %d, has scissor %d)\n", v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth, sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height, P.w, P.h, S.has_vp, g_sc.has); } }
     vkCmdSetViewport(cb, 0, 1, &v); vkCmdSetScissor(cb, 0, 1, &sc);
     vkCmdSetDepthBias(cb, S.po.units, 0.0f, S.po.factor);
     vkCmdSetBlendConstants(cb, S.blend_color);
@@ -431,6 +461,10 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     // vertex buffers
     for (int i = 0; i < S.nstream; i++) {
         VkBuffer b; VkDeviceSize off;
+        { static int dd3 = -1; static unsigned cnt3; if (dd3 < 0) dd3 = getenv("NX_DRAW_DETAIL") != NULL;
+          if (dd3 && cnt3 < 12 && (used_streams >> i & 1)) { cnt3++; const float *f = (const float *)(uintptr_t)S.vbuf[i].address; fprintf(stderr, "[dm] [nvn] vertex stream %d: addr %#llx size %llu stride %u: %g %g %g %g | %g %g %g %g | attrs %d:", i, (unsigned long long)S.vbuf[i].address, (unsigned long long)S.vbuf[i].size, S.stream[i].stride, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], S.nattr);
+            for (int a = 0; a < S.nattr; a++) { va_st v; memcpy(&v, &S.attr[a], sizeof v); fprintf(stderr, " [loc %d fmt %#x off %u stream %u]", a, v.fmt, (unsigned)v.offset, (unsigned)v.stream); } fprintf(stderr, "\n"); } }
+        if (!(used_streams >> i & 1)) continue;                                  // no attribute reads this stream
         if (!S.vbuf[i].address || !nvn_vk_pool_buffer(S.vbuf[i].address, S.vbuf[i].size ? S.vbuf[i].size : 1, &b, &off)) { skip("a vertex buffer is not bound or lies outside the memory pools", &f_vbuf); return 0; }
         vkCmdBindVertexBuffers(cb, (uint32_t)i, 1, &b, &off);
     }
@@ -456,6 +490,9 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
                 }
                 if (b[i].kind != NVN_SB_CBUF || b[i].reg >= 16) continue;
                 const p_bind_buf *u = &S.ubo[si][b[i].reg];
+                { static int dd = -1; static unsigned cnt; if (dd < 0) dd = getenv("NX_DRAW_DETAIL") != NULL;       // the first 30 uniform bindings: what is bound and its first four words
+                  if (dd && cnt < 30) { cnt++; const float *f = (const float *)(uintptr_t)u->addr; if (si == 0 && cnt < 3) { fprintf(stderr, "[dm] [nvn] vertex UBO floats:"); for (int q = 0; q < 36 && q * 4 < (int)u->size; q++) fprintf(stderr, "%s%g", q % 4 ? " " : " |", ((const float *)(uintptr_t)u->addr)[q]); fprintf(stderr, "\n"); }
+                  fprintf(stderr, "[dm] [nvn] UBO stage %d slot %u: addr %#llx size %llu%s %g %g %g %g\n", si, b[i].reg, (unsigned long long)u->addr, (unsigned long long)u->size, u->addr ? " data" : " (unbound)", u->addr ? f[0] : 0, u->addr ? f[1] : 0, u->addr ? f[2] : 0, u->addr ? f[3] : 0); } }
                 VkBuffer ub; VkDeviceSize uoff;
                 if (u->addr && u->size && nvn_vk_pool_buffer(u->addr, u->size, &ub, &uoff)) bi[nw] = (VkDescriptorBufferInfo){ub, uoff, u->size};
                 else bi[nw] = (VkDescriptorBufferInfo){zero_buffer(c), 0, 4096};
@@ -471,13 +508,26 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     return 1;
 }
 
+// NX_DRAW_LOG=1: the first draws made, then one line per 4000, with the totals and the render target they went to
+static void draw_note(uint32_t count) {
+    uint64_t n = atomic_fetch_add(&g_ndraw, 1) + 1;
+    if (getenv("NX_DRAW_DETAIL") && n >= 6000 && n < 6024) { const blend_st *bl = &S.blend[0]; fprintf(stderr, "[dm] [nvn] draw %llu: target %llu chmask %#x blend_en %#x src_rgb %u dst_rgb %u eq %u alpha_func %u keys %02x%02x/%02x%02x\n", (unsigned long long)n, (unsigned long long)g_rt.cser[0], S.chmask.mask & 0xf, S.color.blend_en, (unsigned)bl->src_rgb, (unsigned)bl->dst_rgb, (unsigned)bl->eq_rgb, S.color.alpha_func, S.keys[0][0], S.keys[0][1], S.keys[1][0], S.keys[1][1]); }
+    if (g_rt.n && g_rt.cser[0] > 100) atomic_store(&g_main_target, g_rt.cser[0]);       // the last offscreen colour target (the window textures have small serials)
+    { static int per = -1; if (per < 0) per = getenv("NX_DRAW_LOG") != NULL;        // draws per colour target serial, listed every 4000 draws
+      if (per) { static uint64_t ser[16]; static uint64_t cnt[16]; static int ns; int k = 0; for (; k < ns; k++) if (ser[k] == g_rt.cser[0]) break;
+        if (k == ns && ns < 16) { ser[ns] = g_rt.cser[0]; cnt[ns++] = 0; } if (k < 16) cnt[k]++;
+        if (n % 4000 == 0) { fprintf(stderr, "[dm] [nvn] draws per colour target:"); for (int i = 0; i < ns; i++) fprintf(stderr, " %llu:%llu", (unsigned long long)ser[i], (unsigned long long)cnt[i]); fprintf(stderr, "\n"); } } }
+    static int on = -1; if (on < 0) on = getenv("NX_DRAW_LOG") != NULL;
+    if (on && (n <= 5 || n % 4000 == 0)) fprintf(stderr, "[dm] [nvn] draw %llu made (%u vertices/indices), %llu skipped so far, render targets %d, depth-stencil %d, pass %ux%u, colour target serial %llu\n", (unsigned long long)n, count, (unsigned long long)atomic_load(&g_nskip), g_rt.n, g_rt.dser ? 1 : 0, P.w, P.h, (unsigned long long)g_rt.cser[0]);
+}
+
 void nvn_draw(const p_draw *d) {
     pipe_entry *pe;
     if (d->ind) { static int f; skip("indirect draws are not supported yet", &f); return; }
     g_base_instance = d->base_instance;
     if (!prepare(d->prim, &pe)) return;
     vkCmdDraw(nvn_vk_cmd_raw(), (uint32_t)d->count, d->instances ? (uint32_t)d->instances : 1, (uint32_t)d->first, (uint32_t)d->base_instance);
-    atomic_fetch_add(&g_ndraw, 1);
+    draw_note(d->count);
 }
 
 void nvn_draw_idx(const p_draw_idx *d) {
@@ -492,5 +542,5 @@ void nvn_draw_idx(const p_draw_idx *d) {
     if (!nvn_vk_pool_buffer(d->ibuf, isz * (uint64_t)d->count, &ib, &ioff)) { static int f; skip("the index buffer lies outside the memory pools", &f); return; }
     vkCmdBindIndexBuffer(cb, ib, ioff, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(cb, (uint32_t)d->count, d->instances ? (uint32_t)d->instances : 1, 0, d->base_vertex, (uint32_t)d->base_instance);
-    atomic_fetch_add(&g_ndraw, 1);
+    draw_note(d->count);
 }

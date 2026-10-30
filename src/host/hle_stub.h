@@ -11,6 +11,7 @@ void hle_register_force(const char *name, void *fn);  // as hle_register, and th
 int hle_is_forced(const char *name);        // fn: C function with an AAPCS64-compatible signature (see hle_call.h)
 uint64_t hle_stub_for(const char *name);              // guest address of the stub for name; an unregistered name gets a logging stub
 int hle_implements(const char *name);
+const char *hle_stub_name(uint32_t swi);              // the name a stub svc number stands for, NULL if none
 // Returns 1 if swi was an HLE stub call and has been handled.
 int hle_dispatch(cpu_t *c, uint32_t swi);
 extern unsigned long hle_unimplemented_calls;

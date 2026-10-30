@@ -15,8 +15,10 @@
 #include "nvn_vk_priv.h"
 #include "../tex/nvn_deswizzle.h"
 #include "../tex/nvn_fmt_vk.h"
+#include "../tex/astc.h"
 #include <pthread.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,6 +32,7 @@ typedef struct vktex {
     VkImage img; VkDeviceMemory vmem;
     uint32_t layers, levels;
     int ok;                                                    // an image exists and the format maps
+    int astc;                                                  // an ASTC texture on a device without ASTC: the image is RGBA8 and upload decodes the blocks (tex/astc.c)
     int inited;                                                // moved out of UNDEFINED into GENERAL in a recorded submission
     uint32_t nsub;                                             // subresources per level: the layers, or 1 for a 3D texture
     uint8_t *st;                                               // levels * nsub bytes of F_DIRTY | F_GPU, accessed atomically
@@ -54,6 +57,11 @@ static vktex_t *find(uint64_t serial) {
     return e;
 }
 
+// A view of an ASTC texture the device cannot hold as ASTC names the RGBA8 format the image has (sRGB or not as the requested ASTC format is)
+static VkFormat vf_fix(const vktex_t *e, VkFormat f) {
+    if (e->astc && f >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) return ((f - VK_FORMAT_ASTC_4x4_UNORM_BLOCK) & 1) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    return f;
+}
 static VkFormatFeatureFlags features(vkctx_t *c, VkFormat f) { VkFormatProperties p; vkGetPhysicalDeviceFormatProperties(c->pd, f, &p); return p.optimalTilingFeatures; }
 
 void mtl_tex_init(const tex_t *t) {
@@ -71,10 +79,14 @@ void mtl_tex_init(const tex_t *t) {
     e->levels = t->d.levels ? (t->d.levels < maxl ? t->d.levels : maxl) : 1;
     e->nsub = e->is3d ? 1 : e->layers;
     e->st = calloc((size_t)e->levels * e->nsub, 1);
+    if (e->mem && !getenv("NX_TEX_CLEAN")) memset(e->st, F_DIRTY, (size_t)e->levels * e->nsub);       // the storage is the truth until the GPU writes the texture: a title that fills it from the CPU after creating it (no packaged data, no flush) gets it uploaded at first use, as nxnative does
     int kind = nvn_fmt_to_vk(t->d.format, &e->fmt, NULL);
+    if (kind && t->d.format >= 0x79 && t->d.format <= 0x94 && !nvn_fmt_vk_supported(c->pd, e->fmt)) {    // ASTC, which this GPU lacks: RGBA8, decoded on upload
+        e->astc = 1; e->fmt = t->d.format < 0x87 ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8G8B8A8_SRGB;
+    }
     if (t->d.target == NVN_TEXTURE_TARGET_BUFFER) goto keep;                                           // buffer textures are views of pool memory, not images
     if (t->d.samples > 1) { red_once(&bad_ms, "multisampled textures are not supported yet", t->d.format); goto keep; }
-    if (!kind || !nvn_fmt_vk_supported(c->pd, e->fmt)) { red_once(&bad_fmt, kind ? "the format has no Vulkan support on this device (ASTC and similar need a decoder)" : "the format has no Vulkan counterpart (3-component formats need expanding)", t->d.format); goto keep; }
+    if (!kind || (!e->astc && !nvn_fmt_vk_supported(c->pd, e->fmt))) { red_once(&bad_fmt, kind ? "the format has no Vulkan support on this device (ASTC and similar need a decoder)" : "the format has no Vulkan counterpart (3-component formats need expanding)", t->d.format); goto keep; }
     e->aspect = e->fmt == VK_FORMAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : e->fmt == VK_FORMAT_D32_SFLOAT_S8_UINT ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
               : (e->fmt == VK_FORMAT_D16_UNORM || e->fmt == VK_FORMAT_D32_SFLOAT) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     {
@@ -170,7 +182,7 @@ static void upload(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
         for (unsigned ly = 0; ly < e->nsub; ly++) {
             if (!(__atomic_fetch_and(&SUB(e, lv, ly), (uint8_t)~F_DIRTY, __ATOMIC_ACQ_REL) & F_DIRTY)) continue;     // clean: the image is current
             total = (total + 15) & ~(size_t)15;
-            off[n] = total; pitch[n] = wb; slv[n] = lv; sly[n] = ly; total += wb * hb * z;
+            off[n] = total; pitch[n] = wb; slv[n] = lv; sly[n] = ly; total += e->astc ? (size_t)w * h * z * 4 : wb * hb * z;     // an ASTC level is stored decoded
             rg[n] = (VkBufferImageCopy){.bufferOffset = off[n], .imageSubresource = {e->aspect, lv, ly, 1}, .imageExtent = {w, h, z}};
             n++;
         }
@@ -183,9 +195,21 @@ static void upload(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
         for (size_t y = 0; y < hb; y++) memcpy((uint8_t *)st.map + off[0] + y * wb, e->mem + y * stride, wb);
         n = 1;
     } else {
-        for (size_t i = 0; i < n; i++)
-            if (nvn_deswizzle(&e->d, slv[i], sly[i], e->mem, (uint8_t *)st.map + off[i], pitch[i])) memset((uint8_t *)st.map + off[i], 0, pitch[i]);
+        for (size_t i = 0; i < n; i++) {
+            if (e->astc) {                      // de-swizzle the blocks, then decode them into the RGBA8 staging
+                uint32_t w, h, z; level_dims(e, slv[i], &w, &h, &z);
+                size_t hb = (h + e->bh - 1) / e->bh, bytes = pitch[i] * hb * z;
+                uint8_t *tmp = calloc(bytes ? bytes : 1, 1);
+                if (nvn_deswizzle(&e->d, slv[i], sly[i], e->mem, tmp, pitch[i])) memset(tmp, 0, bytes);
+                for (uint32_t zz = 0; zz < z; zz++) astc_decode_image(tmp + zz * pitch[i] * hb, (int)w, (int)h, e->bw, e->bh, (uint8_t *)st.map + off[i] + (size_t)zz * w * h * 4);
+                free(tmp);
+            } else if (nvn_deswizzle(&e->d, slv[i], sly[i], e->mem, (uint8_t *)st.map + off[i], pitch[i])) {
+                static _Atomic int nfail; if (atomic_fetch_add(&nfail, 1) < 8) fprintf(stderr, "[dm] [RED] [nvn] texture upload: de-swizzle of level %u layer %u failed (%ux%ux%u, NVN format %#x, target %d, flags %#x, stride %u): the level stays zero\n", slv[i], sly[i], e->d.width, e->d.height, e->d.depth, e->d.format, e->d.target, e->d.flags, e->d.stride);
+                memset((uint8_t *)st.map + off[i], 0, pitch[i]);
+            }
+        }
     }
+    { static _Atomic unsigned nup; unsigned k = atomic_fetch_add(&nup, 1); if (getenv("NX_DRAW_DETAIL") && (k < 10 || k % 500 == 0)) { size_t nz = 0, ck = total < 4096 ? total : 4096; for (size_t q = 0; q < ck; q++) nz += ((uint8_t *)st.map)[q] != 0; fprintf(stderr, "[dm] [nvn] texture upload #%u: serial %llu %ux%u fmt %#x, %zu regions, %zu bytes staged (%zu of the first %zu non-zero), storage %p\n", k, (unsigned long long)e->serial, e->d.width, e->d.height, e->d.format, n, total, nz, ck, (void *)e->mem); } }
     to_general(e, cb);
     vkCmdCopyBufferToImage(cb, st.buf, e->img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)n, rg);
     nvn_vk_barrier_all(cb);
@@ -215,6 +239,7 @@ static int regions(const vktex_t *e, const p_copy_b2t *c, uint64_t row, uint64_t
                 c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, nz, level, lw, lh, lz, e->levels, e->layers);
         return 0;
     }
+    if (e->astc) { fprintf(stderr, "[dm] [RED] [nvn] %s: copying compressed data into an ASTC texture the device holds decoded is not supported\n", what); return 0; }
     size_t wb = (size_t)((c->r.width + e->bw - 1) / e->bw) * e->bpb, hb = (c->r.height + e->bh - 1) / e->bh;
     if (!row) row = wb;
     if (!img) img = row * hb;
@@ -266,6 +291,43 @@ static void read_storage(const tex_t *t, unsigned level, unsigned layer, int z0,
         for (size_t y = 0; y < hb; y++) memcpy(dst + (size_t)(zbase + z) * img + y * row, src + (y0 + y) * lp + x0, wb);
     }
     free(lin);
+}
+// Debugging: how many registered textures hold any non-zero byte in their level 0 (read as the title wrote them); prints a summary by format
+long nvn_vk_debug_lit(uint64_t serial, size_t *total, const char *ppm);
+void nvn_vk_debug_texstats(void) {
+    unsigned total = 0, empty = 0, big = 0, shown = 0; uint64_t sers[4096]; unsigned ns = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int b = 0; b < NB; b++) for (vktex_t *e = g_bucket[b]; e && ns < 4096; e = e->next) sers[ns++] = e->serial;
+    pthread_mutex_unlock(&g_mu);
+    for (unsigned i = 0; i < ns; i++) {
+        vktex_t *e = find(sers[i]); if (!e || e->d.width * e->d.height > 4096u * 4096u || e->d.target == NVN_TEXTURE_TARGET_3D) continue;
+        size_t tot = 0; long lit = nvn_vk_debug_lit(sers[i], &tot, NULL); total++;
+        if (lit == 0) { empty++; if (shown < 12) { shown++; fprintf(stderr, "[dm] [nvn] empty texture serial %llu %ux%u fmt %#x flags %#x\n", (unsigned long long)sers[i], e->d.width, e->d.height, e->d.format, e->d.flags); } }
+        else big++;
+    }
+    fprintf(stderr, "[dm] [nvn] textures read: %u, all zero: %u, with content: %u\n", total, empty, big);
+}
+// Debugging: the share of a texture's bytes (first mip, one layer) that are not zero, by serial; -1 when the host has no such texture
+long nvn_vk_debug_lit(uint64_t serial, size_t *total, const char *ppm);
+long nvn_vk_debug_lit(uint64_t serial, size_t *total, const char *ppm) {
+    vktex_t *e = find(serial); if (!e) return -1;
+    tex_t t; memset(&t, 0, sizeof t); t.serial = serial; t.d = e->d; t.L = e->L; t.mem = e->mem;
+    int bw, bh, bpb = nvn_fmt_bpb(t.d.format, &bw, &bh);
+    size_t wb = (size_t)((t.d.width + bw - 1) / bw) * bpb, hb = (t.d.height + bh - 1) / bh; uint8_t *buf = malloc(wb * hb);
+    NVNcopyRegion r = {0, 0, 0, (int)t.d.width, (int)t.d.height, 1}; mtl_read_texels(&t, 0, 0, &r, buf, wb, wb * hb);
+    size_t lit = 0; for (size_t i = 0; i < wb * hb; i++) lit += buf[i] != 0;
+    if (t.d.format == NVN_FORMAT_RGB10A2) { uint32_t mx[4] = {0, 0, 0, 0}; size_t na = 0; for (size_t i = 0; i < (size_t)t.d.width * t.d.height; i++) { uint32_t px; memcpy(&px, buf + i * 4, 4); uint32_t c[4] = {px & 1023, px >> 10 & 1023, px >> 20 & 1023, px >> 30}; for (int k = 0; k < 4; k++) if (c[k] > mx[k]) mx[k] = c[k]; na += c[3] != 0; }
+        fprintf(stderr, "[dm] [nvn] offscreen RGB10A2 maxima r %u g %u b %u a %u (of 1023/1023/1023/3), %zu pixels with alpha\n", mx[0], mx[1], mx[2], mx[3], na); }
+    if (ppm && (t.d.format == NVN_FORMAT_RGBA8 || t.d.format == NVN_FORMAT_RGBA8_SRGB || t.d.format == NVN_FORMAT_BGRA8 || t.d.format == NVN_FORMAT_RGBA16F)) {            // a PPM of the common 8-bit and half-float formats
+        FILE *o = fopen(ppm, "wb"); if (o) { fprintf(o, "P6\n%u %u\n255\n", t.d.width, t.d.height);
+            for (size_t i = 0; i < (size_t)t.d.width * t.d.height; i++) { uint8_t c[3];
+                if (t.d.format == NVN_FORMAT_RGBA16F) { for (int k = 0; k < 3; k++) { uint16_t h; memcpy(&h, buf + i * 8 + 2 * k, 2); int e = h >> 10 & 31; float f = e == 0 ? 0 : e == 31 ? 1e4f : (1.0f + (h & 1023) / 1024.0f) * (e >= 15 ? (float)(1u << (e - 15)) : 1.0f / (float)(1u << (15 - e))); if (h >> 15) f = -f; f = f < 0 ? 0 : f > 1 ? 1 : f; c[k] = (uint8_t)(f * 255); } }
+                else { int bgr = t.d.format == NVN_FORMAT_BGRA8; c[0] = buf[i * 4 + (bgr ? 2 : 0)]; c[1] = buf[i * 4 + 1]; c[2] = buf[i * 4 + (bgr ? 0 : 2)]; }
+                fwrite(c, 1, 3, o); } fclose(o); } }
+    if (ppm && t.d.format == NVN_FORMAT_RGB10A2) {            // a PPM of an RGB10A2 target, to look at
+        FILE *o = fopen(ppm, "wb"); if (o) { fprintf(o, "P6\n%u %u\n255\n", t.d.width, t.d.height);
+            for (size_t i = 0; i < (size_t)t.d.width * t.d.height; i++) { uint32_t px; memcpy(&px, buf + i * 4, 4); uint8_t c[3] = {(uint8_t)((px & 1023) >> 2), (uint8_t)(((px >> 10) & 1023) >> 2), (uint8_t)(((px >> 20) & 1023) >> 2)}; fwrite(c, 1, 3, o); } fclose(o); } }
+    free(buf); if (total) *total = wb * hb; return (long)lit;
 }
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     vktex_t *e = find(t->serial);
@@ -340,7 +402,7 @@ static int clear_target(vktex_t *e, const view_t *v, int has_view, const int *re
     *layer0 = has_view && v->set_layers ? v->min_layer : 0;
     *n = has_view && v->set_layers && v->nlayers ? v->nlayers : 1;
     *fmt = e->fmt;
-    if (has_view && v->set_format) { VkFormat vf; if (nvn_fmt_to_vk(v->format, &vf, NULL) && vf != VK_FORMAT_UNDEFINED) *fmt = vf; }
+    if (has_view && v->set_format) { VkFormat vf; if (nvn_fmt_to_vk(v->format, &vf, NULL) && vf != VK_FORMAT_UNDEFINED) *fmt = vf_fix(e, vf); }
     if (e->is3d || *level >= e->levels || *layer0 + *n > e->nsub) return 0;
     uint32_t lw, lh, lz; level_dims(e, *level, &lw, &lh, &lz);
     int x0 = 0, y0 = 0, x1 = (int)lw, y1 = (int)lh;
@@ -473,6 +535,7 @@ int nvn_vk_tex_sampled(uint64_t serial, const view_t *v, int has_view, int tex_s
     VkFormat fmt = e->fmt; VkComponentSwizzle fs[4] = {0, 0, 0, 0};
     if (has_view && v->set_format) { VkFormat vf; VkComponentSwizzle s4[4] = {0, 0, 0, 0}; if (nvn_fmt_to_vk(v->format, &vf, s4) && vf != VK_FORMAT_UNDEFINED) { fmt = vf; memcpy(fs, s4, sizeof fs); } }
     else nvn_fmt_to_vk(e->d.format, &fmt, fs);
+    fmt = vf_fix(e, fmt);
     unsigned user[4] = {2, 3, 4, 5}; int set = 0;
     if (has_view && v->set_swizzle) { for (int i = 0; i < 4; i++) user[i] = v->swz[i]; set = 1; }
     else if (tex_set_swz) { for (int i = 0; i < 4; i++) user[i] = (tex_swz >> (3 * i)) & 7; set = 1; }

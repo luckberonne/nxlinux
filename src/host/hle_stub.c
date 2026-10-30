@@ -53,12 +53,14 @@ uint64_t hle_stub_for(const char *name) {
     g_stub[i].name = strdup(name);
     g_stub[i].fn = lookup(name);
     uint32_t *code = (uint32_t *)(g_page + 8 * i);
-    code[0] = 0xD4000001u | ((HLE_SVC_BASE + i) << 5);   // svc #(HLE_SVC_BASE+i)
-    code[1] = 0xD65F03C0u;                                // ret
+    if (cpu_is_aarch32()) { code[0] = 0xEF000000u | (HLE_SVC_BASE + i); code[1] = 0xE12FFF1Eu; }   // svc #(HLE_SVC_BASE+i); bx lr
+    else { code[0] = 0xD4000001u | ((HLE_SVC_BASE + i) << 5); code[1] = 0xD65F03C0u; }              // svc #(HLE_SVC_BASE+i); ret
     uint64_t a = g_page + 8 * i;
     pthread_mutex_unlock(&g_mu);
     return a;
 }
+
+const char *hle_stub_name(uint32_t swi) { return swi >= HLE_SVC_BASE && swi < HLE_SVC_BASE + (uint32_t)g_nstub ? g_stub[swi - HLE_SVC_BASE].name : NULL; }
 
 int hle_dispatch(cpu_t *c, uint32_t swi) {
     if (swi < HLE_SVC_BASE || swi >= HLE_SVC_BASE + (uint32_t)g_nstub) return 0;

@@ -176,8 +176,23 @@ static void query(uint64_t addr, uint64_t *base, uint64_t *size, uint32_t *state
             if (addr >= g_stacks[i].base && addr - g_stacks[i].base < g_stacks[i].size) {
                 *base = g_stacks[i].base; *size = g_stacks[i].size; *state = 0xB; *perm = 3; goto done;
             }
-        if (addr >= (uint64_t)g_low && addr - (uint64_t)g_low < g_low_cap) { *base = addr & ~0xFFFull; *size = 0x1000; *state = 4; *perm = 3; }   // host-made guest structures
-        else { *base = addr & ~0xFFFull; *size = 0x1000; *state = 0; *perm = 0; }   // not guest memory: free, no permissions
+        if (addr >= (uint64_t)g_low && addr - (uint64_t)g_low < g_low_cap) {   // host-made guest structures
+            *base = addr & ~0xFFFull; *size = 0x1000; *state = 4; *perm = 3;
+            // An AArch32 rtld walks every region from 0x200000 to the end of its address space: past the modules the rest of the low region is one ThreadLocal region, not CodeData
+            { *size = (uint64_t)g_low + g_low_cap - *base; *state = 0xC; }      // (an AArch64 rtld does the same walk)
+            uint64_t nb = module_next_base(addr); if (nb && nb - *base < *size) { *size = nb - *base; *state = 0; }       // free up to the next module
+        }
+        else if (cpu_is_aarch32()) {            // free space is one region up to the next mapping, or to the end of the 4 GiB address space
+            uint64_t lo = (uint64_t)g_low, hi = guest_mem_end();
+            if (addr < lo) { *base = 0; *size = lo; } else { *base = hi; *size = (1ull << 32) - hi; }
+            *state = 0; *perm = 0;
+        }
+        else if (addr < (uint64_t)g_low || addr >= guest_mem_end()) {            // outside the window: one free region up to the window, or to the end of the 39-bit address space (an AArch64 rtld walks them all)
+            uint64_t lo = (uint64_t)g_low, hi = guest_mem_end();
+            if (addr < lo) { *base = 0; *size = lo; } else { *base = hi; *size = (1ull << 39) - hi; }
+            *state = 0; *perm = 0;
+        }
+        else { *base = addr & ~0xFFFull; *size = guest_mem_end() - *base; *state = 0; *perm = 0; }   // in the window but in no region the host manages: free to the end of the window, no permissions
     }
 done:
     map_source_query(addr, base, size, attr, perm);
@@ -313,7 +328,9 @@ int mem_svc(cpu_t *c, uint32_t num) {
         case I_CoreMask: v = 7; break;
         case I_AliasAddr: v = (uint64_t)g_alias; break;   case I_AliasSize: v = g_alias_cap; break;
         case I_HeapAddr:  v = (uint64_t)g_heap;  break;   case I_HeapSize:  v = g_heap_cap;  break;
-        case I_AslrAddr:  v = GUEST_BASE;        break;   case I_AslrSize:  v = guest_mem_size(); break;
+        // The SDK places thread stacks at random addresses inside the ASLR region and MapMemory only accepts the stack region. A 32-bit process's stack region is its whole ASLR region on a console;
+        // here the stack region is a piece of the window, so an AArch32 title is told the ASLR region is exactly that piece (otherwise most of its random picks are refused and thread creation fails)
+        case I_AslrAddr:  v = cpu_is_aarch32() ? (uint64_t)g_stack : GUEST_BASE;        break;   case I_AslrSize:  v = cpu_is_aarch32() ? g_stack_cap : guest_mem_size(); break;
         case I_StackAddr: v = (uint64_t)g_stack; break;   case I_StackSize: v = g_stack_cap; break;
         case I_TotalMem: case I_TotalNonSys: v = g_p.app_pool; break;
         case I_UsedMem: case I_UsedNonSys: pthread_mutex_lock(&g_map_lock); v = used_memory(); pthread_mutex_unlock(&g_map_lock); break;

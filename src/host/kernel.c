@@ -1,10 +1,14 @@
+#define _GNU_SOURCE
 #include "kernel.h"
 #include "guest_mem.h"
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <sys/uio.h>
 #include <string.h>
 #include <time.h>
 
@@ -27,6 +31,7 @@ typedef struct thr {
     const uint32_t *whs; int whn;
     struct thr *next;   // wait chain
     struct thr *all;    // all-threads chain
+    int want; uint64_t ticket, since_ns;   // scheduler: asking for its core; when it asked; when it got the core
 } thr_t;
 
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
@@ -40,6 +45,7 @@ static uint64_t g_tlr_free[1024]; static int g_ntlr_free;
 
 static void die(const char *m) { fprintf(stderr, "[RED] kernel: %s\n", m); abort(); }
 
+uint64_t kernel_tls(void);
 uint64_t kernel_cntpct(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -58,6 +64,8 @@ static void *h_peek(uint32_t h, int type) {
     if (i == 0 || i >= MAX_H || g_h[i].type != type) return NULL;
     return g_h[i].obj;
 }
+static thr_t *cur(void);
+uint64_t kernel_tls(void) { return cur()->tlr; }
 static thr_t *cur(void) {
     thr_t *t = pthread_getspecific(g_keythr);
     if (!t) die("thread SVC called from a non-guest thread");
@@ -81,8 +89,50 @@ static thr_t *pick(int kind, uint64_t a) {
 static void wake(thr_t *t, int64_t res) {
     wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv);
 }
-// Suspend until woken or timed out (ns < 0 infinite, 0 immediate timeout); returns the wake result or R_TIMEOUT (holding G)
+// ---------- Cores ----------
+// Horizon runs one thread per core at a time: the highest priority one (a lower number), the one that asked first among equals, until it blocks. Threads of one core therefore never run
+// at once, and a title's startup relies on it (a worker created at lower priority does not touch what its creator still sets up). A thread gives its core up when it blocks and asks for
+// it again when it wakes. At every SVC a thread yields to a waiting thread of higher priority, and to one of equal priority only after a 10 ms slice. NX_NO_SCHED=1 turns this off.
+static int g_sched = -1;
+static thr_t *g_owner[4];
+static pthread_cond_t g_core_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t g_ticket;
+static _Atomic int g_nwant;
+static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+static int sched_on(void) { if (g_sched < 0) g_sched = getenv("NX_NO_SCHED") == NULL; return g_sched; }
+static void core_release(thr_t *t) {                    // holding G
+    if (!sched_on()) return;
+    if (g_owner[t->core & 3] == t) { g_owner[t->core & 3] = NULL; pthread_cond_broadcast(&g_core_cv); }
+}
+static int core_first(thr_t *t) {                       // t is the waiter that should get the core (holding G)
+    for (thr_t *o = g_all; o; o = o->all)
+        if (o != t && o->want && (o->core & 3) == (t->core & 3) && (o->prio < t->prio || (o->prio == t->prio && o->ticket < t->ticket))) return 0;
+    return 1;
+}
+static void core_acquire(thr_t *t) {                    // holding G
+    if (!sched_on()) return;
+    int c = t->core & 3;
+    t->want = 1; t->ticket = ++g_ticket; atomic_fetch_add(&g_nwant, 1);
+    while (g_owner[c] || !core_first(t)) { pthread_cond_wait(&g_core_cv, &G); c = t->core & 3; }
+    g_owner[c] = t; t->want = 0; t->since_ns = mono_ns(); atomic_fetch_sub(&g_nwant, 1);
+}
+static void core_yield(thr_t *t) {                      // holding G
+    if (!sched_on() || !atomic_load(&g_nwant)) return;
+    uint64_t now = mono_ns();
+    for (thr_t *o = g_all; o; o = o->all)
+        if (o->want && (o->core & 3) == (t->core & 3) && (o->prio < t->prio || (o->prio == t->prio && now - t->since_ns > 10000000ull))) { core_release(t); core_acquire(t); return; }
+}
+
+static int64_t block_raw(thr_t *t, int kind, int64_t ns);
+// Suspend until woken or timed out (ns < 0 infinite, 0 immediate timeout); returns the wake result or R_TIMEOUT (holding G); the core is free while it waits
 static int64_t block(thr_t *t, int kind, int64_t ns) {
+    if (ns == 0) return block_raw(t, kind, ns);
+    core_release(t);
+    int64_t r = block_raw(t, kind, ns);
+    core_acquire(t);
+    return r;
+}
+static int64_t block_raw(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     struct timespec dl;
@@ -141,12 +191,35 @@ static void wake_sync_waiters(const void *obj) {
         w = n; }
 }
 
+cpu_t *kernel_cpu(void) { thr_t *t = pthread_getspecific(g_keythr); return t ? t->cpu : NULL; }
+uint32_t kernel_event_new_pair(uint32_t *w, uint32_t *r) {
+    event_t *e = calloc(1, sizeof *e); e->refs = 2;
+    pthread_mutex_lock(&G); *w = h_new(O_EVENT_W, e); *r = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
+    return *r;
+}
+void kernel_event_clear(uint32_t h) {
+    pthread_mutex_lock(&G); event_t *e = h_peek(h, O_EVENT_R); if (e) e->signaled = 0; pthread_mutex_unlock(&G);
+}
+uint32_t kernel_event_new(int signaled) {
+    event_t *e = calloc(1, sizeof *e); e->refs = 1; e->signaled = signaled;
+    pthread_mutex_lock(&G); uint32_t h = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
+    return h;
+}
+void kernel_event_signal(uint32_t h) {
+    pthread_mutex_lock(&G);
+    event_t *e = h_peek(h, O_EVENT_R);
+    if (e) { e->signaled = 1; wake_sync_waiters(e); }
+    pthread_mutex_unlock(&G);
+}
+
 // ---------- Threads ----------
+const char *hle_stub_name(uint32_t swi);
 static void on_svc(cpu_t *c, uint32_t swi, void *user);
 static void on_fault(cpu_t *c, uint64_t pc, int kind, void *user);
 static uint64_t cntpct_cb(void) { return kernel_cntpct(); }
 extern int hle_dispatch(cpu_t *c, uint32_t swi);      // hle_stub.c
 extern int mem_svc(cpu_t *c, uint32_t swi);           // mem.c
+extern int ipc_svc(cpu_t *c, uint32_t swi);           // ipc.c
 
 static uint64_t tlr_alloc(void) {                      // holding G
     if (g_ntlr_free) return g_tlr_free[--g_ntlr_free];
@@ -175,7 +248,7 @@ static void thread_detach_exit(thr_t *t) {              // the thread's run loop
     cpu_destroy(t->cpu); t->cpu = NULL;
     pthread_mutex_lock(&G);
     if (g_ntlr_free < 1024) g_tlr_free[g_ntlr_free++] = t->tlr;
-    t->exited = 1;
+    t->exited = 1; core_release(t);
     wake_sync_waiters(t);                               // WaitSynchronization on this thread re-checks
     pthread_cond_broadcast(&g_exit_cv);
     pthread_setspecific(g_keythr, NULL);
@@ -185,7 +258,7 @@ static void thread_detach_exit(thr_t *t) {              // the thread's run loop
 
 static void run_guest(thr_t *t) {
     cpu_set_pc(t->cpu, t->entry); cpu_set_sp(t->cpu, t->stack_top);
-    cpu_set_x(t->cpu, 0, t->arg); cpu_set_x(t->cpu, 30, g_landing);
+    cpu_set_x(t->cpu, 0, t->arg); cpu_set_x(t->cpu, 1, t->handle); cpu_set_x(t->cpu, 30, g_landing);   // x1: the main thread's handle, which Horizon gives rtld (_start(0, handle))
     cpu_run(t->cpu);
 }
 
@@ -193,15 +266,47 @@ static void *thread_main(void *p) {
     thr_t *t = p;
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
     thread_attach(t);
+    pthread_mutex_lock(&G); core_acquire(t); pthread_mutex_unlock(&G);       // wait for the core before running guest code
     run_guest(t);
     thread_detach_exit(t);
     return NULL;
 }
 
+static void *threads_dump(void *unused) {            // NX_THREADS=<seconds>: what every guest thread is doing (blocked on what), repeated
+    (void)unused; int secs = atoi(getenv("NX_THREADS")); if (secs < 1) secs = 10;
+    for (;;) {
+        sleep((unsigned)secs);
+        pthread_mutex_lock(&G);
+        fprintf(stderr, "[threads] ---\n");
+        for (thr_t *t = g_all; t; t = t->all)
+            fprintf(stderr, "[threads] id=%#llx h=%#x prio=%d core=%d %s wait=%s addr=%#llx lr=%#llx r0=%#llx\n", (unsigned long long)t->id, t->handle, t->prio, t->core, t->exited ? "EXITED" : "alive",
+                    (const char *[]){"none", "lock", "cond", "address", "sync"}[t->wkind < 5 ? t->wkind : 0], (unsigned long long)t->waddr, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 30) : 0ull, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 0) : 0ull);
+        if (getenv("NX_THREADS_STACK"))
+            for (thr_t *t = g_all; t; t = t->all) if (t->cpu && !t->exited && (t->wkind == 0 || getenv("NX_THREADS_ALL"))) {
+                uint64_t sp = cpu_get_sp(t->cpu); fprintf(stderr, "[threads]   %#llx stack:", (unsigned long long)t->id);
+                uint32_t buf[160]; struct iovec lo = {buf, sizeof buf}, re = {(void *)(uintptr_t)sp, sizeof buf};
+                ssize_t got = process_vm_readv(getpid(), &lo, 1, &re, 1, 0);       // a stack may end before 640 bytes: read what is mapped
+                if (cpu_is_aarch32()) { for (int i = 0; i < (got > 0 ? got / 4 : 0); i++) if (buf[i] >= 0x206000 && buf[i] < 0x1512000) fprintf(stderr, " %#x", buf[i]); }
+                else for (int i = 0; i + 1 < (got > 0 ? got / 4 : 0); i += 2) { uint64_t v = buf[i] | (uint64_t)buf[i + 1] << 32; if (v >= 0x2000011000ull && v < 0x2001a63000ull) fprintf(stderr, " %#llx", (unsigned long long)v - 0x2000015000ull); }       // 64-bit: main-module offsets of the return-looking words
+                fprintf(stderr, "\n");
+            }
+        pthread_mutex_unlock(&G);
+    }
+    return NULL;
+}
+
 void kernel_init(void) {
     pthread_key_create(&g_keythr, NULL);
+    if (getenv("NX_THREADS")) { pthread_t th; pthread_create(&th, NULL, threads_dump, NULL); pthread_detach(th); }
     g_landing = guest_alloc(16, 16);
-    *(uint32_t *)g_landing = 0xD4000001u | (SVC_THREAD_RETURNED << 5);   // svc #SVC_THREAD_RETURNED
+    if (cpu_is_aarch32()) {                                  // where a guest function the host calls (cpu_call32) returns to
+        uint64_t pad = guest_alloc(16, 16); *(uint32_t *)pad = 0xEF0007FEu;
+        extern void cpu32_set_return_pad(uint32_t);
+        cpu32_set_return_pad((uint32_t)pad);
+    }
+    if (!cpu_is_aarch32()) { uint64_t pad = guest_alloc(16, 16); ((uint32_t *)pad)[0] = 0xD4000001u | (0x7FEu << 5); ((uint32_t *)pad)[1] = 0xD65F03C0u; cpu_set_return_pad64(pad); }   // svc #0x7FE: where a guest function the host calls (cpu_call64) returns to
+    *(uint32_t *)g_landing = cpu_is_aarch32() ? 0xEF000000u | SVC_THREAD_RETURNED           // svc #SVC_THREAD_RETURNED
+                                              : 0xD4000001u | (SVC_THREAD_RETURNED << 5);
 }
 
 static thr_t *thr_new(uint64_t entry, uint64_t arg, uint64_t sp, int prio, int core) {
@@ -217,6 +322,7 @@ int kernel_run_main(uint64_t entry, uint64_t arg, uint64_t sp) {
     thr_t *t = thr_new(entry, arg, sp, 44, 0);
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->started = 1; t->pt = pthread_self(); t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
     thread_attach(t);
+    pthread_mutex_lock(&G); core_acquire(t); pthread_mutex_unlock(&G);
     run_guest(t);
     thread_detach_exit(t);
     return 0;
@@ -248,8 +354,16 @@ static void on_fault(cpu_t *c, uint64_t pc, int kind, void *user) {
 
 static void on_svc(cpu_t *c, uint32_t swi, void *user) {
     (void)user;
-    if (kernel_svc(c, swi)) return;
-    if (mem_svc(c, swi)) return;
+    if (!cpu_is_aarch32()) { static int tr = -1; static _Atomic int n; if (tr < 0) tr = getenv("NX_TRACE_SVC") != NULL;       // NX_TRACE_SVC for an AArch64 title: the first 3000 SVCs
+        const char *tf = getenv("NX_TRACE_SVC"); int match = tf && tf[0] && strcmp(tf, "1") && swi >= 0x1000 && hle_stub_name(swi) && strstr(hle_stub_name(swi), tf);       // NX_TRACE_SVC=<name part>: only hooks whose name has it
+        if (match || (tr && (!tf || !strcmp(tf, "1")) && n++ < 3000)) fprintf(stderr, "[svc] %#x%s%s x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx\n", swi, swi >= 0x1000 && hle_stub_name(swi) ? " " : "", swi >= 0x1000 && hle_stub_name(swi) ? hle_stub_name(swi) : "", (unsigned long long)cpu_get_x(c, 0), (unsigned long long)cpu_get_x(c, 1), (unsigned long long)cpu_get_x(c, 2), (unsigned long long)cpu_get_x(c, 3), (unsigned long long)cpu_get_x(c, 30)); }
+    { thr_t *me = pthread_getspecific(g_keythr); if (me && atomic_load(&g_nwant)) { pthread_mutex_lock(&G); core_yield(me); pthread_mutex_unlock(&G); } }   // a yield point of the core scheduler
+    static int errs = -1; if (errs < 0) errs = getenv("NX_SVC_ERRORS") != NULL;       // NX_SVC_ERRORS=1: every distinct (svc, non-zero result) once, with its arguments
+    uint64_t a0 = errs ? cpu_get_x(c, 0) : 0, a1 = errs ? cpu_get_x(c, 1) : 0, a2 = errs ? cpu_get_x(c, 2) : 0, a3 = errs ? cpu_get_x(c, 3) : 0, lr = errs ? cpu_get_x(c, 30) : 0;
+    #define SVC_DONE(call) if (call) { if (errs && swi < 0x100) { uint32_t r = (uint32_t)cpu_get_x(c, 0); if (r) { static uint64_t seen[256]; static int ns; uint64_t key = (uint64_t)swi << 32 | r; int dup = 0; for (int i = 0; i < ns; i++) if (seen[i] == key) dup = 1; if (!dup && ns < 256) { seen[ns++] = key; fprintf(stderr, "[svcerr] svc %#x -> %#x (x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx)\n", swi, r, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)lr); } } } return; }
+    SVC_DONE(ipc_svc(c, swi))             // before the kernel: CloseHandle of a session is not a kernel handle
+    SVC_DONE(kernel_svc(c, swi))
+    SVC_DONE(mem_svc(c, swi))
     if (hle_dispatch(c, swi)) return;
     fprintf(stderr, "[RED] unimplemented svc %#x (lr=%#llx)\n", swi, (unsigned long long)cpu_get_x(c, 30));
     cpu_set_x(c, 0, 0xF201u);   // Svc::ResultNotImplemented
@@ -277,6 +391,7 @@ int kernel_svc(cpu_t *c, uint32_t num) {
         regs[0] = 0; regs[1] = t->handle; break;
     }
     case 0x09: {  // StartThread(w0)
+        { static int ms = -1; if (ms < 0) { const char *e = getenv("NX_START_DELAY_MS"); ms = e ? atoi(e) : 0; } if (ms > 0) { struct timespec d = {0, ms * 1000000L}; nanosleep(&d, NULL); } }   // debugging: a title that races its own init
         pthread_mutex_lock(&G);
         thr_t *t = h_peek((uint32_t)regs[0], O_THREAD);
         if (t) { t->started = 1; pthread_cond_signal(&t->cv); }
@@ -286,8 +401,17 @@ int kernel_svc(cpu_t *c, uint32_t num) {
     case 0x0A: cpu_halt(c); break;         // ExitThread: the run loop ends and thread_detach_exit finishes the job
     case 0x0B: {  // SleepThread(x0 ns); 0 / -1 / -2 are the kinds of yield
         int64_t ns = (int64_t)regs[0];
-        if (ns > 0) { struct timespec ts = {ns / 1000000000, ns % 1000000000}; nanosleep(&ts, NULL); }
-        else sched_yield();
+        thr_t *me = cur();
+        if (ns > 0) {
+            pthread_mutex_lock(&G); core_release(me); pthread_mutex_unlock(&G);
+            struct timespec ts = {ns / 1000000000, ns % 1000000000}; nanosleep(&ts, NULL);
+            pthread_mutex_lock(&G); core_acquire(me); pthread_mutex_unlock(&G);
+        } else {                                               // a yield: to any waiter of the core, not only the higher priority ones
+            pthread_mutex_lock(&G);
+            for (thr_t *o = g_all; o && sched_on(); o = o->all) if (o->want && (o->core & 3) == (me->core & 3) && o->prio <= me->prio) { core_release(me); core_acquire(me); break; }
+            pthread_mutex_unlock(&G);
+            sched_yield();
+        }
         break;
     }
     case 0x0C: { pthread_mutex_lock(&G); thr_t *t = h_peek((uint32_t)regs[1], O_THREAD);
@@ -440,3 +564,7 @@ int kernel_svc(cpu_t *c, uint32_t num) {
     if (handled) for (int i = 0; i < 4; i++) cpu_set_x(c, i, regs[i]);
     return handled;
 }
+
+// A host function that blocks the guest thread outside the kernel (a condition wait in a hook) gives its core up for the time and takes it back
+void kernel_core_release(void) { thr_t *t = pthread_getspecific(g_keythr); if (t) { pthread_mutex_lock(&G); core_release(t); pthread_mutex_unlock(&G); } }
+void kernel_core_acquire(void) { thr_t *t = pthread_getspecific(g_keythr); if (t) { pthread_mutex_lock(&G); core_acquire(t); pthread_mutex_unlock(&G); } }

@@ -25,6 +25,7 @@ static void *grow(void *p, int *n, int need, size_t sz) {
 
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id > (1 << 20)) return;
+    if (!t) { static int once; if (!once++) fprintf(stderr, "[RED] nvn: RegisterTexture(id %d) with a NULL texture ignored\n", id); return; }
     pthread_mutex_lock(&g_mu);
     g_tex = grow(g_tex, &g_ntex, id, sizeof *g_tex);
     tdesc *d = &g_tex[id];
@@ -124,6 +125,9 @@ static int dummy_get(vkctx_t *c, int code, VkDescriptorImageInfo *out) {
 // A bound handle's texture and sampler as a descriptor; `want` is the SamplerType the shader declares for the binding (the shadow bit, 1024, is the sampler's business).
 // 1 = filled; 0 = the texture or sampler cannot be used and there is no stand-in for this type; 3 = the texture is not of the type the shader samples.
 // A texture id or sampler id that is not registered reads as an empty slot (zeros through a nearest sampler), as it does on the hardware.
+uint64_t nvn_vk_desc_serial(uint32_t handle) {          // debugging: the texture serial a combined handle names (0 if the descriptor was never registered)
+    uint32_t tid = handle & 0xfffff; pthread_mutex_lock(&g_mu); uint64_t r = (int)tid < g_ntex && g_tex[tid].used ? g_tex[tid].serial : 0; pthread_mutex_unlock(&g_mu); return r;
+}
 int nvn_vk_desc_sampled(uint32_t handle, int want, VkDescriptorImageInfo *out) {
     vkctx_t *c = nvn_vk_ctx();
     uint32_t tid = handle & 0xfffff, sid = handle >> 20;

@@ -17,6 +17,14 @@ int kernel_svc(cpu_t *c, uint32_t swi);
 // Runs entry(arg) as the main guest thread on the calling host thread; returns when it exits.
 // Returns the exit status: 0 when the thread called ExitThread.
 int kernel_run_main(uint64_t entry, uint64_t arg, uint64_t sp);
+cpu_t *kernel_cpu(void);                   // the calling guest thread's cpu, NULL on a host thread (what a host function needs to call back into the guest: cpu_call32)
+uint32_t kernel_event_new_pair(uint32_t *writable, uint32_t *readable);   // both ends of a kernel event, as svcCreateEvent makes them
+void kernel_event_clear(uint32_t readable);
+uint32_t kernel_event_new(int signaled);   // a readable event the host owns (for services that hand the guest an event): the guest waits on and closes the handle
+void kernel_event_signal(uint32_t handle);
+void kernel_core_release(void);            // for a host function that waits outside the kernel: free the calling guest thread's core while it waits, take it again after
+void kernel_core_acquire(void);
+uint64_t kernel_tls(void);             // the calling guest thread's thread-local region (its IPC message buffer is at the start)
 uint64_t kernel_cntpct(void);          // the 19.2 MHz system counter
 int kernel_live_threads(void);         // guest threads started and not yet exited, the main thread included
 void kernel_wait_all(void);            // block until every guest thread but the caller's has exited
