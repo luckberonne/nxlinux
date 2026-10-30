@@ -6,6 +6,7 @@
 #include "nvn_vk.h"
 #include "nvn_vk_priv.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -139,9 +140,19 @@ int nvn_vk_desc_sampled(uint32_t handle, int want, VkDescriptorImageInfo *out) {
     if (sd && !sd->s) sd->s = make_sampler(c, &sd->p);
     VkSampler smp = sd ? sd->s : VK_NULL_HANDLE;
     pthread_mutex_unlock(&g_mu);
-    if (!td.used) return shadow ? 0 : dummy_get(c, want, out);
+    if (!td.used && !shadow) { static _Atomic unsigned nun; unsigned k = atomic_fetch_add(&nun, 1) + 1; if (k <= 8 || !(k & (k - 1))) fprintf(stderr, "[dm] [nvn] stand-in #%u: texture id %u is not registered (the shader samples type %#x, sampler %u)\n", k, tid, want, sid); }
+    if (!td.used) { if (!shadow) { int r = dummy_get(c, want, out); if (!r) { static _Atomic int nn; if (atomic_fetch_add(&nn, 1) < 6) fprintf(stderr, "[dm] [nvn] sampled: texture id %u is not registered and there is no stand-in for sampler type %#x\n", tid, want); } return r; } return 0; }
     VkImageView iv; int code = want;
-    if (!nvn_vk_tex_sampled(td.serial, &td.v, td.has_view, td.set_swz, td.swz, &iv, &code)) return shadow ? 0 : dummy_get(c, want, out);
+    if (!nvn_vk_tex_sampled(td.serial, &td.v, td.has_view, td.set_swz, td.swz, &iv, &code)) {
+        if (shadow) return 0;
+        { static _Atomic unsigned nnv; unsigned k = atomic_fetch_add(&nnv, 1) + 1; if (k <= 8 || !(k & (k - 1))) fprintf(stderr, "[dm] [nvn] stand-in #%u: texture id %u (serial %llu) has no view the shader can sample (type %#x)\n", k, tid, (unsigned long long)td.serial, want); }
+        int r = dummy_get(c, want, out);
+        if (!r) { static _Atomic int nn; if (atomic_fetch_add(&nn, 1) < 6) fprintf(stderr, "[dm] [nvn] sampled: texture id %u (serial %llu) gave no view and there is no stand-in for sampler type %#x\n", tid, (unsigned long long)td.serial, want); }
+        return r; }
+    if (code != want && (want & 255) == 5) {      // the shader declares a cube and the texture cannot be one (a 2D texture, or a 2D array of fewer than six layers: a placeholder for an environment map): it reads the zero cube, as nxnative's tex_fit does
+        static int seen_cube; if (!__atomic_exchange_n(&seen_cube, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [nvn] cube binding fallback: texture id %u (sampler type %#x) bound as the zero cube for a shader that declares %#x\n", tid, code, want);
+        return dummy_get(c, want, out);
+    }
     if (code != want) {
         static int seen; if (!__atomic_exchange_n(&seen, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [RED] [nvn] texture id %u is sampler type %#x, the shader samples %#x\n", tid, code, want);
         return 3;

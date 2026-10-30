@@ -119,6 +119,8 @@ static void sink_init(void) {
 }
 
 // ---- the NVN layer's entry points
+static inline uint64_t present_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+static _Atomic uint64_t g_pt_read, g_pt_swap, g_pt_wait, g_pt_n;   // where a present spends its time (reported every 300 presents: NX_PRESENT_STATS=1)
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     static int bad_fmt;
     (void)period_s;
@@ -138,8 +140,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (w <= 0 || h <= 0) { pthread_mutex_lock(&g_mu); tk = ++g_ticket; if (!g_sink_sdl) g_shown = g_ticket; pthread_mutex_unlock(&g_mu); return tk; }
     uint8_t *px = malloc((size_t)w * h * 4);
     NVNcopyRegion r = {x, y, 0, w, h, 1};
+    uint64_t pt0 = present_ns();
     mtl_read_texels(t, 0, 0, &r, px, (size_t)w * 4, (size_t)w * h * 4);
+    uint64_t pt1 = present_ns();
     if (swap) for (size_t i = 0; i < (size_t)w * h; i++) { uint8_t b = px[i * 4]; px[i * 4] = px[i * 4 + 2]; px[i * 4 + 2] = b; }
+    atomic_fetch_add(&g_pt_read, pt1 - pt0); atomic_fetch_add(&g_pt_swap, present_ns() - pt1);
     {   // NX_FRAME_DUMP=<prefix>: frames 100, 400, 1000 and 2500 go to <prefix>.<n>.ppm, with a count of the pixels that are not black
         static int dump = -1; static unsigned nth; if (dump < 0) dump = getenv("NX_FRAME_DUMP") != NULL;
         nth++;
@@ -168,9 +173,15 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
 }
 
 void mtl_present_wait(uint64_t ticket) {
+    uint64_t t0 = present_ns();
     pthread_mutex_lock(&g_mu);
     while (g_shown < ticket && g_sink_sdl) pthread_cond_wait(&g_cv, &g_mu);
     pthread_mutex_unlock(&g_mu);
+    atomic_fetch_add(&g_pt_wait, present_ns() - t0);
+    static int on = -1; if (on < 0) on = getenv("NX_PRESENT_STATS") != NULL;
+    uint64_t n = atomic_fetch_add(&g_pt_n, 1) + 1;
+    if (on && n % 300 == 0) fprintf(stderr, "[dm] [nvn] present per frame over the last 300: GPU read-back %.2f ms, BGRA->RGBA %.2f ms, wait for the window %.2f ms\n",
+        (double)atomic_exchange(&g_pt_read, 0) / 300e6, (double)atomic_exchange(&g_pt_swap, 0) / 300e6, (double)atomic_exchange(&g_pt_wait, 0) / 300e6);
 }
 void mtl_present_flush(void) { pthread_mutex_lock(&g_mu); uint64_t t = g_ticket; pthread_mutex_unlock(&g_mu); mtl_present_wait(t); }
 int mtl_has_window(void) { return g_sink_sdl; }

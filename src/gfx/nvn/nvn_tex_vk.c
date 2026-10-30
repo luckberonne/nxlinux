@@ -42,6 +42,7 @@ typedef struct vktex {
     struct { VkFormat fmt; unsigned level, layer0, n; VkImageView v; } views[16]; int nviews;   // attachment views made so far; touched by the submit thread only
     struct { VkFormat fmt; uint32_t l0, nl, a0, na; int vtype; uint32_t swz; VkImageView v; } svs[8]; int nsvs;   // sampling views, the same way
     uint64_t hash, hash_ms;                                    // the storage's hash and when it was taken (recheck below)
+    int zero;                                                  // the storage was all zero when it was first read: the title may fill it later (a course's textures load after the objects exist), so it is watched
     int dead;                                                  // finalized: waits in g_dead to be freed
     uint64_t last_use;                                         // when a replay last attached or sampled it (g_use_tick)
     int used;                                                  // touched at least once since it died
@@ -56,11 +57,47 @@ static void red_once(int *flag, const char *what, int fmt) {
     if (!__atomic_exchange_n(flag, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [RED] [nvn] texture: %s (NVN format %#x)\n", what, fmt);
 }
 
+// A texture the host swept keeps a tombstone: what TextureInitialize was given (serial, description, layout, storage). A command that names the serial later
+// finds the tombstone and the texture is made again, as the hardware would have it: the object is only a description of memory the game still owns, and a
+// title may keep drawing into a target after finalizing it. Its contents are the storage's (dirty, uploaded at first use) or, for a target, whatever is drawn next.
+enum { TOMB_MAX = 131072 };
+typedef struct tomb { struct tomb *next; uint64_t serial; nvn_texdesc d; nvn_texlayout L; const uint8_t *mem; unsigned slot; } tomb_t;
+static tomb_t *g_tbucket[NB], *g_tring[TOMB_MAX]; static unsigned g_tnext; static _Atomic uint64_t g_nrevived;
+static void tomb_unlink(tomb_t *t) {                               // caller holds g_mu
+    for (tomb_t **p = &g_tbucket[t->serial & (NB - 1)]; *p; p = &(*p)->next) if (*p == t) { *p = t->next; break; }
+    g_tring[t->slot] = NULL;
+}
+static void tomb_add(const vktex_t *e) {                           // caller holds g_mu
+    unsigned slot = g_tnext++ % TOMB_MAX;
+    if (g_tring[slot]) { tomb_t *old = g_tring[slot]; tomb_unlink(old); free(old); }   // the oldest tombstone goes when the table is full
+    tomb_t *t = malloc(sizeof *t); if (!t) return;
+    t->serial = e->serial; t->d = e->d; t->L = e->L; t->mem = e->mem; t->slot = slot;
+    t->next = g_tbucket[t->serial & (NB - 1)]; g_tbucket[t->serial & (NB - 1)] = t; g_tring[slot] = t;
+}
+static tomb_t *tomb_take(uint64_t serial) {                        // removes and returns the tombstone of a serial; caller holds g_mu
+    tomb_t *t = g_tbucket[serial & (NB - 1)];
+    while (t && t->serial != serial) t = t->next;
+    if (t) tomb_unlink(t);
+    return t;
+}
+void mtl_tex_init(const tex_t *t);
+static void dead_push(vktex_t *e);
 static vktex_t *find(uint64_t serial) {
     pthread_mutex_lock(&g_mu);
     vktex_t *e = g_bucket[serial & (NB - 1)];
     while (e && e->serial != serial) e = e->next;
+    tomb_t *tb = e ? NULL : tomb_take(serial);
     pthread_mutex_unlock(&g_mu);
+    if (!tb) return e;
+    tex_t t; memset(&t, 0, sizeof t); t.serial = tb->serial; t.d = tb->d; t.L = tb->L; t.mem = (uint8_t *)tb->mem;
+    free(tb);
+    mtl_tex_init(&t);                                              // inserts the new entry
+    pthread_mutex_lock(&g_mu);
+    e = g_bucket[serial & (NB - 1)];
+    while (e && e->serial != serial) e = e->next;
+    if (e) dead_push(e);                                           // it stands for a finalized object: it may be swept again, and come back again
+    pthread_mutex_unlock(&g_mu);
+    if (atomic_fetch_add(&g_nrevived, 1) == 0) fprintf(stderr, "[dm] [nvn] a swept texture (serial %llu) was named again and was made again from its tombstone\n", (unsigned long long)serial);
     return e;
 }
 
@@ -75,7 +112,11 @@ static VkFormatFeatureFlags features(vkctx_t *c, VkFormat f) { VkFormatPropertie
 // memory) while the commands that use it keep being replayed (Mario Kart 8 Deluxe finalizes its scene targets right after making them, and makes other
 // textures over the same memory). The host frees finalized textures least recently used first, once they hold more than DEAD_BYTES or number DEAD_MAX.
 enum { DEAD_MAX = 32768 };                              // entries, not bytes: a course load finalizes thousands of textures at once, and a small cap evicted some before their first use (skipped draws)
-#define DEAD_BYTES (1536ull << 20)   // VRAM budget for dead-but-still-referenced textures; the dGPU has 4 GB, and the iGPU shares system RAM
+static uint64_t dead_budget(void) {   // VRAM budget for dead-but-still-referenced textures; the dGPU has 4 GB, and the iGPU shares system RAM. NX_DEAD_MB overrides it
+    static uint64_t b; if (!b) { const char *e = getenv("NX_DEAD_MB"); b = (e && atol(e) > 0 ? (uint64_t)atol(e) : 1536ull) << 20; }
+    return b;
+}
+#define DEAD_BYTES dead_budget()
 static struct dead { vktex_t *e; } *g_dead; static size_t g_ndead, g_cdead; static uint64_t g_dead_bytes;
 static uint64_t g_nswept;
 static _Atomic uint64_t g_use_tick;
@@ -105,6 +146,11 @@ static void free_tex(vktex_t *e) {
     if (e->has_alias) { vkctx_t *_c = nvn_vk_ctx(); if (_c) { vkDestroyImage(_c->dev, e->alias_img, NULL); vkFreeMemory(_c->dev, e->alias_vmem, NULL); } }
     free(e->st); free(e);
 }
+static void dead_push(vktex_t *e) {                                // caller holds g_mu
+    e->dead = 1;
+    if (g_ndead == g_cdead) { g_cdead = g_cdead ? g_cdead * 2 : 256; g_dead = realloc(g_dead, g_cdead * sizeof *g_dead); }
+    g_dead[g_ndead++] = (struct dead){e}; g_dead_bytes += e->L.size;
+}
 static void sweep_dead(void) {                                    // caller holds g_mu
     vktex_t *gone[64]; int ngone = 0;
     while ((g_ndead > DEAD_MAX || g_dead_bytes > DEAD_BYTES) && ngone < 64) {
@@ -116,7 +162,7 @@ static void sweep_dead(void) {                                    // caller hold
         }
         vktex_t *e = g_dead[lru].e; g_dead[lru] = g_dead[--g_ndead]; g_dead_bytes -= e->L.size;
         for (vktex_t **p = &g_bucket[e->serial & (NB - 1)]; *p; p = &(*p)->next) if (*p == e) { *p = e->next; break; }
-        gone_add(e->serial, GONE_SWEPT); g_nswept++;
+        gone_add(e->serial, GONE_SWEPT); g_nswept++; tomb_add(e);
         gone[ngone++] = e;
     }
     if (!ngone) return;
@@ -160,7 +206,7 @@ void mtl_tex_init(const tex_t *t) {
         if (f & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         int cube = t->d.target == NVN_TEXTURE_TARGET_CUBEMAP || t->d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
         VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0)
+            .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (cube || (!e->is3d && e->layers >= 6 && t->d.width == t->d.height && t->d.target != NVN_TEXTURE_TARGET_1D_ARRAY) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0)   // a square 2D array of 6 layers or more may be sampled as a cube (the descriptor, not the object, says which)
                    | (e->is3d && (u & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0),   // a slice of a 3D texture can be a render target (colour LUTs)
             .imageType = e->is3d ? VK_IMAGE_TYPE_3D : t->d.target == NVN_TEXTURE_TARGET_1D || t->d.target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D,
             .format = e->fmt, .extent = {t->d.width ? t->d.width : 1, t->d.height ? t->d.height : 1, e->is3d && t->d.depth ? t->d.depth : 1},
@@ -197,9 +243,8 @@ void mtl_tex_release(tex_t *t) {
     vktex_t *e = g_bucket[t->serial & (NB - 1)];
     while (e && e->serial != t->serial) e = e->next;
     if (e && !e->dead) {
-        e->dead = 1; gone_add(t->serial, GONE_FINALIZED);
-        if (g_ndead == g_cdead) { g_cdead = g_cdead ? g_cdead * 2 : 256; g_dead = realloc(g_dead, g_cdead * sizeof *g_dead); }
-        g_dead[g_ndead++] = (struct dead){e}; g_dead_bytes += e->L.size;
+        gone_add(t->serial, GONE_FINALIZED);
+        dead_push(e);
     }
     sweep_dead();
     pthread_mutex_unlock(&g_mu);
@@ -236,6 +281,13 @@ static void to_general(vktex_t *e, VkCommandBuffer cb) {
     vk_barrier_image_all(cb, e->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, e->aspect);   // every level and every layer
     e->inited = 1;
+    // A new depth or stencil image reads as zero, as a freshly mapped Switch memory pool does (a title may test against a depth texture it never clears: Vulkan would give undefined contents)
+    if (e->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        VkClearDepthStencilValue z = {0.0f, 0};
+        VkImageSubresourceRange rg = {e->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        vkCmdClearDepthStencilImage(cb, e->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
+        nvn_vk_barrier_all(cb);
+    }
 }
 
 // De-swizzle the dirty subresources of the storage and copy them into the image
@@ -334,10 +386,11 @@ done:
 // Make the image current for a GPU use in the submission being recorded; returns 0 when the texture has no image
 // CPU writes into a texture's storage after its first upload (glyph caches, the text of menus) do not fault and nothing else reports them: the storage is
 // hashed again at most every 100 ms when the texture is used, and a change makes every subresource the GPU has not written dirty
-static uint64_t storage_hash(const uint8_t *p, size_t n) {
-    uint64_t h = 0x9E3779B97F4A7C15ull, w; size_t i = 0;
-    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
-    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+static uint64_t storage_hash(const uint8_t *p, size_t n, int *allzero) {
+    uint64_t h = 0x9E3779B97F4A7C15ull, w, any = 0; size_t i = 0;
+    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); any |= w; h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
+    for (; i < n; i++) { any |= p[i]; h = (h ^ p[i]) * 0x100000001B3ull; }
+    if (allzero) *allzero = any == 0;
     return h;
 }
 static void recheck(vktex_t *e) {
@@ -349,9 +402,9 @@ static void recheck(vktex_t *e) {
     uint64_t ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
     if (e->hash_ms && ms - e->hash_ms < 100) return;
     e->hash_ms = ms;
-    uint64_t h = storage_hash(e->mem, e->L.size);
+    int z = 0; uint64_t h = storage_hash(e->mem, e->L.size, &z);
     if (h == e->hash) return;
-    int first = !e->hash; e->hash = h;
+    int first = !e->hash; e->hash = h; e->zero = z;
     if (first) return;                                             // the initial contents are uploaded by the F_DIRTY set at creation
     for (size_t i = 0; i < (size_t)e->levels * e->nsub; i++) {
         uint8_t f = __atomic_load_n(&e->st[i], __ATOMIC_ACQUIRE);
@@ -511,6 +564,15 @@ long nvn_vk_debug_lit(uint64_t serial, size_t *total, const char *ppm) {
             for (size_t i = 0; i < (size_t)t.d.width * t.d.height; i++) { uint32_t px; memcpy(&px, buf + i * 4, 4); uint8_t c[3] = {(uint8_t)((px & 1023) >> 2), (uint8_t)(((px >> 10) & 1023) >> 2), (uint8_t)(((px >> 20) & 1023) >> 2)}; fwrite(c, 1, 3, o); } fclose(o); } }
     free(buf); if (total) *total = wb * hb; return (long)lit;
 }
+// The staging buffer for reading a GPU-owned texture back (the window frame every present): kept between calls, in memory the CPU reads quickly (vkbuf_create). One reader at a time.
+static pthread_mutex_t g_rb_mu = PTHREAD_MUTEX_INITIALIZER; static vkbuf_t g_rb; static size_t g_rb_size;
+static vkbuf_t *rb_get(vkctx_t *c, size_t n) {                     // caller holds g_rb_mu
+    if (g_rb_size >= n) return &g_rb;
+    if (g_rb_size) vkbuf_destroy(c, &g_rb);
+    g_rb_size = 0;
+    if (vkbuf_create(c, &g_rb, n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) return NULL;
+    g_rb_size = n; return &g_rb;
+}
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     vktex_t *e = find(t->serial);
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -530,8 +592,8 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
             mtl_finish();
             vkctx_t *ctx = nvn_vk_ctx();
             VkCommandBuffer cb = nvn_vk_oneshot_begin();
-            vkbuf_t st;
-            if (!cb || vkbuf_create(ctx, &st, wb * hb, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) { if (cb) nvn_vk_oneshot_end(cb); memset(dst + (size_t)z * img, 0, img); continue; }
+            pthread_mutex_lock(&g_rb_mu); vkbuf_t *stp = rb_get(ctx, wb * hb); vkbuf_t st; if (stp) st = *stp;
+            if (!cb || !stp) { pthread_mutex_unlock(&g_rb_mu); if (cb) nvn_vk_oneshot_end(cb); memset(dst + (size_t)z * img, 0, img); continue; }
             nvn_vk_barrier_all(cb);
             VkBufferImageCopy rg = {.bufferRowLength = (uint32_t)(wb / bpb) * bw, .bufferImageHeight = (uint32_t)hb * bh,
                 .imageSubresource = {copy_aspect(e), level, layer, 1}, .imageOffset = {r->xoffset, r->yoffset, 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}};
@@ -539,7 +601,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
             nvn_vk_barrier_all(cb);
             nvn_vk_oneshot_end(cb);
             for (size_t y = 0; y < hb; y++) memcpy(dst + (size_t)z * img + y * row, (uint8_t *)st.map + y * wb, wb);
-            vkbuf_destroy(ctx, &st);
+            pthread_mutex_unlock(&g_rb_mu);
         } else read_storage(t, level, layer, 0, 1, z, r, dst, row, img, 0);
     }
     return;
@@ -547,8 +609,8 @@ gpu_slices: {
         vkctx_t *ctx = nvn_vk_ctx();
         mtl_finish();
         VkCommandBuffer cb = nvn_vk_oneshot_begin();
-        vkbuf_t st;
-        if (!cb || vkbuf_create(ctx, &st, wb * hb * nz, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) { if (cb) nvn_vk_oneshot_end(cb); memset(dst, 0, img * nz); return; }
+        pthread_mutex_lock(&g_rb_mu); vkbuf_t *stp = rb_get(ctx, wb * hb * nz); vkbuf_t st; if (stp) st = *stp;
+        if (!cb || !stp) { pthread_mutex_unlock(&g_rb_mu); if (cb) nvn_vk_oneshot_end(cb); memset(dst, 0, img * nz); return; }
         nvn_vk_barrier_all(cb);
         VkBufferImageCopy rg = {.bufferRowLength = (uint32_t)(wb / bpb) * bw, .bufferImageHeight = (uint32_t)hb * bh, .imageSubresource = {copy_aspect(e), level, 0, 1},
             .imageOffset = {r->xoffset, r->yoffset, r->zoffset}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, (uint32_t)nz}};
@@ -556,7 +618,7 @@ gpu_slices: {
         nvn_vk_barrier_all(cb);
         nvn_vk_oneshot_end(cb);
         for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(dst + (size_t)z * img + y * row, (uint8_t *)st.map + ((size_t)z * hb + y) * wb, wb);
-        vkbuf_destroy(ctx, &st);
+        pthread_mutex_unlock(&g_rb_mu);
     }
 }
 
@@ -751,6 +813,7 @@ int nvn_vk_tex_sampled(uint64_t serial, const view_t *v, int has_view, int tex_s
     vkctx_t *c = nvn_vk_ctx();
     vktex_t *e = find(serial); touch(e);
     if (!c || !e || !e->ok) return 0;
+    if (e->zero) recheck(e);                                        // uploaded as zeros: has the title filled the storage since?
     int dirty = !e->inited;
     for (size_t i = 0; i < (size_t)e->levels * e->nsub && !dirty; i++) dirty = (__atomic_load_n(&e->st[i], __ATOMIC_ACQUIRE) & F_DIRTY) != 0;
     if (dirty) { VkCommandBuffer cb = nvn_vk_cmd(); if (!cb || !use(e, c, cb)) return 0; }
@@ -766,9 +829,17 @@ int nvn_vk_tex_sampled(uint64_t serial, const view_t *v, int has_view, int tex_s
         fixed = (want & 256) ? 0 : ((want & 255) == 5 ? 6 : 1);
         *code = want;
     }
+    else if ((want & 255) == 5 && (*code & 255) == 3 && !e->is3d && e->layers >= 6 && e->d.width == e->d.height) {
+        // the shader samples a cube and the object is a 2D texture array of 6 layers (or a multiple): MK8D's reflection maps. The image is cube-compatible (mtl_tex_init)
+        vt = (want & 256) ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE; fixed = (want & 256) ? 0 : 6; *code = want;
+    }
+    if (want && want != *code) { static _Atomic int nm; if (atomic_fetch_add(&nm, 1) < 6)         // a sampler type the texture cannot give: what it is
+        fprintf(stderr, "[dm] [nvn] sampler mismatch: texture serial %llu target %u %ux%ux%u, %u layers, %u levels, fmt %#x, view %d; the shader wants type %#x, the texture gives %#x\n",
+                (unsigned long long)serial, target, e->d.width, e->d.height, e->d.depth, e->layers, e->levels, e->d.format, has_view, want, *code); }
     uint32_t l0 = has_view && v->set_levels ? v->base_level : 0, nl = has_view && v->set_levels && v->nlevels ? v->nlevels : e->levels - l0;
     uint32_t a0 = has_view && v->set_layers ? v->min_layer : 0, na = fixed ? (uint32_t)fixed : has_view && v->set_layers && v->nlayers ? v->nlayers : e->layers - a0;
     if (e->is3d) { a0 = 0; na = 1; }
+    if (vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) na -= na % 6;
     if (l0 >= e->levels) return 0;
     if (l0 + nl > e->levels) nl = e->levels - l0;
     if (a0 + na > (e->is3d ? 1u : e->layers)) { red_once(&bad, "a texture view names layers the texture does not have", e->d.format); return 0; }

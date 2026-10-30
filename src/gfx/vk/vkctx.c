@@ -136,7 +136,9 @@ int vkbuf_create(vkctx_t *c, vkbuf_t *b, VkDeviceSize size, VkBufferUsageFlags u
     if (vkCreateBuffer(c->dev, &bi, NULL, &b->buf)) FAIL("vkCreateBuffer failed");
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(c->dev, b->buf, &mr);
     VkMemoryPropertyFlags want = host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    uint32_t mt = vkctx_memtype(c, mr.memoryTypeBits, want);
+    uint32_t mt = UINT32_MAX;
+    if (host && usage == VK_BUFFER_USAGE_TRANSFER_DST_BIT) mt = vkctx_memtype(c, mr.memoryTypeBits, want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);   // a read-back buffer: the CPU reads it, and reads from uncached (write-combined) memory crawl
+    if (mt == UINT32_MAX) mt = vkctx_memtype(c, mr.memoryTypeBits, want);
     if (mt == UINT32_MAX) FAIL("no memory type for a %s buffer", host ? "host" : "device");
     VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) ? VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT : 0};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fi, mr.size, mt};
