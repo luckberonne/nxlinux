@@ -14,14 +14,33 @@
 // A session may be converted to a domain: its requests then carry an object id, and the objects the service hands out are ids in the same domain instead of new sessions.
 #define DOM_MAX 1024
 typedef struct { uint32_t id; char name[16]; ipc_handler_t fn; void *data; } dom_obj_t;
-// The objects belong to the domain, not to the session: every clone of a session sees the same table.
-struct domain { uint32_t next_id; dom_obj_t obj[DOM_MAX]; };
+// The objects belong to the domain, not to the session: every clone of a session sees the same table, and it goes with the last of them (refs).
+struct domain { uint32_t next_id; int refs; dom_obj_t obj[DOM_MAX]; };
 static pthread_mutex_t g_dom_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct { int used; char name[16]; ipc_handler_t fn; void *data; struct domain *dom; } g_s[S_MAX];
 static struct { char name[16]; ipc_handler_t fn; } g_svc[64];
 static int g_nsvc;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_trace = -1;
+
+// State made with ipc_new_session_owned: each session and domain object holding it is a reference, and the last one to close calls fin
+#define OWN_MAX 1024
+static struct { void *data; void (*fin)(void *); int refs; } g_own[OWN_MAX];
+static pthread_mutex_t g_own_mu = PTHREAD_MUTEX_INITIALIZER;
+static void own_ref(void *data) {
+    if (!data) return;
+    pthread_mutex_lock(&g_own_mu);
+    for (int i = 0; i < OWN_MAX; i++) if (g_own[i].data == data) { g_own[i].refs++; break; }
+    pthread_mutex_unlock(&g_own_mu);
+}
+static void own_unref(void *data) {
+    if (!data) return;
+    void (*fin)(void *) = NULL;
+    pthread_mutex_lock(&g_own_mu);
+    for (int i = 0; i < OWN_MAX; i++) if (g_own[i].data == data) { if (--g_own[i].refs == 0) { fin = g_own[i].fin; g_own[i].data = NULL; } break; }
+    pthread_mutex_unlock(&g_own_mu);
+    if (fin) fin(data);
+}
 
 void ipc_register_service(const char *name, ipc_handler_t fn) {
     pthread_mutex_lock(&g_mu);
@@ -34,6 +53,15 @@ uint32_t ipc_new_session_data(const char *name, ipc_handler_t fn, void *data) {
     uint32_t h = ipc_new_session(name, fn);
     g_s[h - S_H0].data = data;
     return h;
+}
+
+uint32_t ipc_new_session_owned(const char *name, ipc_handler_t fn, void *data, void (*fin)(void *)) {
+    pthread_mutex_lock(&g_own_mu);
+    int i = 0; while (i < OWN_MAX && g_own[i].data) i++;
+    if (i < OWN_MAX) { g_own[i].data = data; g_own[i].fin = fin; g_own[i].refs = 1; }
+    pthread_mutex_unlock(&g_own_mu);
+    if (i == OWN_MAX) fprintf(stderr, "[RED] ipc: more than %d objects with state to free: %s keeps its state\n", OWN_MAX, name);
+    return ipc_new_session_data(name, fn, data);
 }
 
 uint32_t ipc_new_session(const char *name, ipc_handler_t fn) {
@@ -135,7 +163,7 @@ static uint32_t send(uint32_t h, uint32_t *m) {
         if (o && dtype == 2) o->id = 0;                                   // close the object
         pthread_mutex_unlock(&g_dom_mu);
         if (!o) { fprintf(stderr, "[RED] ipc: %s: no object %u in the domain\n", g_s[s].name, id); out.result = 0xE401u; reply(m, &out, objs, 0, 1); return 0; }
-        if (dtype == 2) { reply(m, &out, objs, 0, 1); return 0; }
+        if (dtype == 2) { own_unref(found.data); reply(m, &out, objs, 0, 1); return 0; }
         fn = found.fn; oname = found.name; in.data = found.data;
         const uint32_t *c = raw + 4;                                   // SFCI header, then the arguments (dsize counts both)
         in.cmd = c[2]; in.nargs = dsize / 4 < 4 ? 0 : dsize / 4 - 4; if (in.nargs > IPC_MAX_ARGS) in.nargs = IPC_MAX_ARGS;
@@ -154,12 +182,15 @@ static uint32_t send(uint32_t h, uint32_t *m) {
     if (in.control) {
         switch (in.cmd) {
         case 0:                                                        // ConvertCurrentObjectToDomain → the object's id
-            D = g_s[s].dom = calloc(1, sizeof *D);
+            D = g_s[s].dom = calloc(1, sizeof *D); D->refs = 1;
+            own_ref(g_s[s].data);                                      // object 1 holds the session's state as well as the session
             D->obj[0].id = 1; strlcpy(D->obj[0].name, g_s[s].name, 16); D->obj[0].fn = g_s[s].fn; D->obj[0].data = g_s[s].data; D->next_id = 2;
             out.out[out.nout++] = 1; break;
         case 2: case 4: {                                              // CloneCurrentObject(Ex): another session to the same object, in the same domain if there is one
             uint32_t h2 = ipc_new_session_data(g_s[s].name, g_s[s].fn, g_s[s].data); int c2 = slot(h2);
+            own_ref(g_s[s].data);
             g_s[c2].dom = g_s[s].dom;                                 // the same domain
+            if (g_s[c2].dom) { pthread_mutex_lock(&g_dom_mu); g_s[c2].dom->refs++; pthread_mutex_unlock(&g_dom_mu); }
             out.move[out.nmove++] = h2; break;                                 // the clone comes back as a move handle
         }
         case 3: out.out[out.nout++] = 0x1000; break;                                              // QueryPointerBufferSize: a service whose arrays travel by pointer (X) needs room for them
@@ -212,7 +243,12 @@ int ipc_svc(cpu_t *c, uint32_t swi) {
     case 0x16: {   // CloseHandle of a session
         uint32_t h = (uint32_t)cpu_get_x(c, 0); int s = slot(h);
         if (s < 0) return 0;
-        pthread_mutex_lock(&g_mu); g_s[s].used = 0; pthread_mutex_unlock(&g_mu);
+        pthread_mutex_lock(&g_mu); void *data = g_s[s].data; struct domain *D = g_s[s].dom; g_s[s].used = 0; g_s[s].data = NULL; g_s[s].dom = NULL; pthread_mutex_unlock(&g_mu);
+        own_unref(data);
+        if (D) {                                                       // the last session of a domain closes its objects
+            pthread_mutex_lock(&g_dom_mu); int last = --D->refs == 0; pthread_mutex_unlock(&g_dom_mu);
+            if (last) { for (int k = 0; k < DOM_MAX; k++) if (D->obj[k].id) own_unref(D->obj[k].data); free(D); }
+        }
         cpu_set_x(c, 0, 0); return 1;
     }
     }

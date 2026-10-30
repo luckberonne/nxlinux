@@ -227,6 +227,7 @@ int mem_svc(cpu_t *c, uint32_t num) {
         // Larger than the heap region: ResultOutOfMemory, as KPageTable::SetHeapSize returns. nn::os::SetMemoryHeapSize turns only that, 103 and
         // LimitReached into os::ResultOutOfMemory and aborts on anything else; games find their heap size by binary search and need the error back.
         if (size > g_heap_cap) { regs[0] = R_OUT_OF_MEMORY; break; }
+        if (size & 0xfff) { regs[0] = R_INVALID_SIZE; break; }   // Horizon asks for 2 MB multiples; a part page would leave the next change's mprotect unaligned
         pthread_mutex_lock(&g_map_lock);
         size_t previous = g_heap_cur;
         uint64_t image = module_image_bytes();
@@ -315,7 +316,7 @@ int mem_svc(cpu_t *c, uint32_t num) {
     }
     case 0x1E: regs[0] = kernel_cntpct(); break;   // GetSystemTick: the tick count itself in x0 (not a Result)
     case 0x26: {  // Break(reason, ptr, size): the SDK's fatal abort; bit 31 of the reason marks a notification that can continue
-        (g_break ? g_break : default_break)(regs[0], regs[1], regs[2], regs[30]);
+        (g_break ? g_break : default_break)(regs[0], regs[1], regs[2], cpu_get_x(c, 30));
         regs[0] = 0; break;
     }
     case 0x27: {  // OutputDebugString(str, len)

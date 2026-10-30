@@ -242,7 +242,7 @@ static uint32_t fsp(int session, const ipc_in_t *in, ipc_out_t *out) {
     switch (in->cmd) {
     case 1: return 0;                                              // Initialize(pid)
     case 200: out->move[out->nmove++] = ipc_new_session("IStorage", storage); return 0;   // OpenDataStorageByCurrentProcess → IStorage of the RomFS
-    case 22: case 25: { extern uint32_t fsfs_open_savedata(ipc_out_t *); ipc_out_t tmp = {0}; return fsfs_open_savedata(&tmp); }   // CreateSaveDataFileSystem*: the directory is made on first open
+    case 22: case 25: { extern uint32_t fsfs_create_savedata(void); return fsfs_create_savedata(); }   // CreateSaveDataFileSystem*: the directory, with no session for it
     case 51: case 52: case 53: return fsfs_open_savedata(out);      // OpenSaveDataFileSystem* → IFileSystem of the save data directory
     case 202: {                                                     // OpenDataStorageByDataId(storage, data id): system data (fonts, Mii resources) is firmware, which the host does not have
         uint64_t id = in->args[2] | (uint64_t)in->args[3] << 32;

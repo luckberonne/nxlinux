@@ -32,3 +32,5 @@ typedef struct { const uint8_t *data; size_t size; uint64_t mapped; } ipc_shmem_
 void fsp_set_romfs(const char *path);   // the RomFS image fsp-srv serves as the title's data storage
 uint32_t ipc_new_session_data(const char *name, ipc_handler_t fn, void *data);   // as ipc_new_session, with state the handler finds in in->data (it stays with the object when the session becomes a domain object)
 uint32_t ipc_new_session(const char *name, ipc_handler_t fn);   // a session handle for a service the host answers, for a handler that hands out objects
+// As ipc_new_session_data, for state that must be freed: fin(data) runs when the last session or domain object holding it closes (clones share it)
+uint32_t ipc_new_session_owned(const char *name, ipc_handler_t fn, void *data, void (*fin)(void *));

@@ -26,15 +26,23 @@ void nvn_cap_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; }
 void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) { (void)f; (void)gpu_ms; (void)frame_ms; }
 void mtl_alloc_stats(uint64_t *wired, uint64_t *gpu, int *n) { if (wired) *wired = 0; if (gpu) *gpu = 0; if (n) *n = 0; }
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { if (enc) *enc = 0; if (reuse) *reuse = 0; }
+void mtl_barrier_stats(uint64_t *skip, uint64_t *full) { if (skip) *skip = 0; if (full) *full = 0; }
+uint64_t mtl_blit_splits(void) { return 0; }
 void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full_rw_passes) { if (load) *load = 0; if (store) *store = 0; if (full_rw_passes) *full_rw_passes = 0; }
+uint64_t mtl_copy_cut_count(void) { return 0; }
 unsigned mtl_cpu_tex_count(void) { return 0; }
 void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { if (lib_ns) *lib_ns = 0; if (pso_ns) *pso_ns = 0; }
 void mtl_create_stats(uint64_t *lib, uint64_t *pso) { if (lib) *lib = 0; if (pso) *pso = 0; }
+void mtl_cshoist_stats(uint64_t *moved, uint64_t *depth, uint64_t stops[8]) { if (moved) *moved = 0; if (depth) *depth = 0; if (stops) for (int i = 0; i < 8; i++) stops[i] = 0; }
+uint64_t mtl_cut_count(void) { return 0; }
 uint64_t mtl_drawable_ns_take(void) { return 0; }
 uint64_t mtl_ds_omit(void) { return 0; }
+void mtl_geohoist_stats(uint64_t *draws, uint64_t *runs, uint64_t stops[6]) { if (draws) *draws = 0; if (runs) *runs = 0; if (stops) for (int i = 0; i < 6; i++) stops[i] = 0; }
+void mtl_geomesh_stats(uint64_t *mesh, uint64_t *compute) { if (mesh) *mesh = 0; if (compute) *compute = 0; }
 double mtl_gpu_ms(uint64_t f) { (void)f; return 0.0; }
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { if (t0) *t0 = 0; if (t1) *t1 = 0; return 0; }
 void mtl_hybrid_stats(uint64_t *draws, uint64_t *made, uint64_t *none) { if (draws) *draws = 0; if (made) *made = 0; if (none) *none = 0; }
+void mtl_lc_stats(uint64_t *taken, uint64_t *landed) { if (taken) *taken = 0; if (landed) *landed = 0; }
 void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { (void)frame; (void)mb; }
 uint64_t mtl_pkg_edge_skips(void) { return 0; }
 uint64_t mtl_pkg_miss(void) { return 0; }
@@ -45,10 +53,15 @@ void mtl_pso_line(char *out, size_t n) { if (n) out[0] = 0; }
 void mtl_queue_activate(uint64_t serial) { (void)serial; }
 void mtl_queue_forget(uint64_t serial) { (void)serial; }
 void mtl_reg_image(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
+void mtl_res_stats(char *out, size_t n) { if (n) out[0] = 0; }
 void mtl_set_frame(uint64_t f) { (void)f; }
 void mtl_set_tex_pool_n(int n) { (void)n; }
+void mtl_sm_stats(uint64_t *passes, uint64_t *layers, uint64_t *waits) { if (passes) *passes = 0; if (layers) *layers = 0; if (waits) *waits = 0; }
 void mtl_stats(uint64_t *passes, uint64_t *draws) { if (passes) *passes = 0; if (draws) *draws = 0; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
+void mtl_ubd_stats(uint64_t *deferred, uint64_t *cut) { if (deferred) *deferred = 0; if (cut) *cut = 0; }
+void mtl_ubp_stats(uint64_t *partial, uint64_t *cached, uint64_t *refused) { if (partial) *partial = 0; if (cached) *cached = 0; if (refused) *refused = 0; }
+void mtl_ubp_why(uint64_t why[5]) { for (int i = 0; i < 5; i++) why[i] = 0; }
 uint64_t mtl_udc_saved_bytes(void) { return 0; }
 uint64_t mtl_upload_bytes(void) { return 0; }
 uint64_t mtl_upload_gpu_ns_take(void) { return 0; }
