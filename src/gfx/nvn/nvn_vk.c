@@ -80,6 +80,30 @@ static void post_add(post_op o) {
 }
 void nvn_vk_post_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post_add((post_op){1, val, mode, v, 0, 0}); }
 void nvn_vk_post_counter(uint64_t addr, uint32_t type) { post_add((post_op){2, NULL, 0, 0, addr, type}); }
+// ---- transient uniform arena: chunks of TR_CHUNK bytes; a chunk is tagged with the last submission that took from it and handed out again once that one completed
+enum { TR_CHUNK = 4 << 20, TR_MAX = 64 };
+static struct { vkbuf_t b; size_t used; uint64_t fence; } g_tr[TR_MAX]; static int g_ntr, g_trcur = -1;
+static pthread_mutex_t g_tr_mu = PTHREAD_MUTEX_INITIALIZER;
+int nvn_vk_transient(size_t size, VkDescriptorBufferInfo *out, void **map) {
+    if (!gpu() || size > TR_CHUNK) return -1;
+    static size_t align; if (!align) { align = G.c.props.limits.minUniformBufferOffsetAlignment; if (align < 16) align = 16; }
+    uint64_t fence = nvn_vk_next_fence();
+    pthread_mutex_lock(&g_tr_mu);
+    if (g_trcur >= 0 && ((g_tr[g_trcur].used + align - 1) & ~(align - 1)) + size > TR_CHUNK) g_trcur = -1;
+    if (g_trcur < 0) {
+        uint64_t done = nvn_gpu_completed();
+        for (int i = 0; i < g_ntr && g_trcur < 0; i++) if (g_tr[i].fence <= done) { g_trcur = i; g_tr[i].used = 0; }
+        if (g_trcur < 0 && g_ntr < TR_MAX && !vkbuf_create(&G.c, &g_tr[g_ntr].b, TR_CHUNK, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 1)) { g_tr[g_ntr].used = 0; g_trcur = g_ntr++; }
+        if (g_trcur < 0) { pthread_mutex_unlock(&g_tr_mu); return -1; }   // every chunk is still in flight: the caller makes its own buffer
+    }
+    size_t off = (g_tr[g_trcur].used + align - 1) & ~(align - 1);
+    g_tr[g_trcur].used = off + size; g_tr[g_trcur].fence = fence;
+    *out = (VkDescriptorBufferInfo){g_tr[g_trcur].b.buf, off, size};
+    *map = (uint8_t *)g_tr[g_trcur].b.map + off;
+    pthread_mutex_unlock(&g_tr_mu);
+    return 0;
+}
+
 void nvn_vk_keep(const vkbuf_t *b) {
     if (G.nstg == G.capstg) { G.capstg = G.capstg ? G.capstg * 2 : 8; G.stg = realloc(G.stg, (size_t)G.capstg * sizeof *G.stg); }
     G.stg[G.nstg++] = *b;
@@ -313,7 +337,9 @@ void mtl_finish(void) { if (gpu()) mtl_wait(atomic_load(&G.submitted), UINT64_MA
 void mtl_drain(void) { mtl_finish(); }
 
 // ---- operations inside the submission being recorded
+_Atomic uint64_t g_nvn_nbarrier;                          // counted for the per-frame statistics (nvn_replay_report)
 void nvn_vk_barrier_all(VkCommandBuffer cb) {
+    atomic_fetch_add(&g_nvn_nbarrier, 1);
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};

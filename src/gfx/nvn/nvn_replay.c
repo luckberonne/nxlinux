@@ -27,6 +27,21 @@ static const char *const op_name[OP_COUNT_] = {
 #undef N
 
 static _Atomic uint64_t g_seen[OP_COUNT_], g_pending[OP_COUNT_];
+// Per-frame averages since the last report of the ops replayed most, render passes begun and full barriers (the timing line calls it)
+void nvn_replay_report(uint64_t frames) {
+    static uint64_t last[OP_COUNT_], lpass, lbar; extern _Atomic uint64_t g_nvn_npass, g_nvn_nbarrier;
+    if (!frames) return;
+    uint64_t d[OP_COUNT_]; for (unsigned i = 0; i < OP_COUNT_; i++) { uint64_t v = atomic_load(&g_seen[i]); d[i] = v - last[i]; last[i] = v; }
+    uint64_t p = atomic_load(&g_nvn_npass), b = atomic_load(&g_nvn_nbarrier);
+    char line[1024]; size_t o = 0;
+    o += snprintf(line + o, sizeof line - o, "per frame: %.0f render passes, %.0f full barriers;", (double)(p - lpass) / frames, (double)(b - lbar) / frames); lpass = p; lbar = b;
+    for (int k = 0; k < 10; k++) {
+        unsigned best = 0; for (unsigned i = 1; i < OP_COUNT_; i++) if (d[i] > d[best]) best = i;
+        if (!d[best]) break;
+        o += snprintf(line + o, sizeof line - o, " %s %.0f", op_name[best] ? op_name[best] : "?", (double)d[best] / frames); d[best] = 0;
+    }
+    fprintf(stderr, "[dm] [nvn] replay %s\n", line);
+}
 uint64_t nvn_replay_ops(unsigned op) { return op < OP_COUNT_ ? atomic_load(&g_seen[op]) : 0; }          // how many times an op was replayed
 uint64_t nvn_replay_skipped(unsigned op) { return op < OP_COUNT_ ? atomic_load(&g_pending[op]) : 0; }   // ... and how many of those did nothing yet
 

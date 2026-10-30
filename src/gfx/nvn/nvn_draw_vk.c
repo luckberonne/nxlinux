@@ -251,8 +251,9 @@ void nvn_draw_new_submission(void) { P.active = 0; P.bound = VK_NULL_HANDLE; }
 
 static int rt_same(const nvn_rt_t *a, const nvn_rt_t *b) { return !memcmp(a, b, sizeof *a); }
 
+_Atomic uint64_t g_nvn_npass;                             // render passes begun, for the per-frame statistics
 static int pass_begin(vkctx_t *c, VkCommandBuffer cb) {
-    (void)c;
+    (void)c; atomic_fetch_add(&g_nvn_npass, 1);
     nvn_attach *col = P.col, *dep = &P.dep; int have_dep = 0;
     VkRenderingAttachmentInfo ca[8], da, sa;
     uint32_t w = 0, h = 0, layers = 1;
@@ -292,8 +293,10 @@ static void put_f(uint8_t *b, size_t off, float v) { memcpy(b + off, &v, 4); }
 static void put_u(uint8_t *b, size_t off, uint32_t v) { memcpy(b + off, &v, 4); }
 static VkDescriptorBufferInfo driver_buffer(vkctx_t *c, int kind, int stage, float vw, float vh) {
     size_t size = kind == NVN_SB_SUPPORT ? SUPPORT_SIZE : DMSH_DRV_SIZE;
-    vkbuf_t b;
-    if (vkbuf_create(c, &b, size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 1)) return (VkDescriptorBufferInfo){zero_buffer(c), 0, 4096};
+    vkbuf_t b = {0}; VkDescriptorBufferInfo r; void *mp;
+    if (!nvn_vk_transient(size, &r, &mp)) b.map = mp;                                  // a piece of the transient arena (no allocation per draw)
+    else if (vkbuf_create(c, &b, size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 1)) return (VkDescriptorBufferInfo){zero_buffer(c), 0, 4096};
+    else { nvn_vk_keep(&b); r = (VkDescriptorBufferInfo){b.buf, 0, size}; }           // its own buffer, freed once the submission has completed
     uint8_t *m = b.map; memset(m, 0, size);
     if (kind == NVN_SB_SUPPORT) {
         put_f(m, 144, vw > 0 ? 2.0f / vw : 0); put_f(m, 148, vh > 0 ? 2.0f / vh : 0);   // viewport inverse: what a shader with the viewport transform off scales to clip space with
@@ -312,8 +315,7 @@ static VkDescriptorBufferInfo driver_buffer(vkctx_t *c, int kind, int stage, flo
         for (int r = 0; r < DMSH_C2_TEX_SLOTS; r++) put_u(m, DMSH_C2_TEX + (size_t)r * DMSH_C2_ROW, S.tex[stage][r]);
         for (int r = 0; r < DMSH_C2_SEP_SLOTS; r++) put_u(m, DMSH_C2_SEPTEX + (size_t)r * DMSH_C2_ROW, S.tex[stage][DMSH_SEPTEX_SLOT0 + r]);
     }
-    nvn_vk_keep(&b);                                                                     // freed once the submission has completed
-    return (VkDescriptorBufferInfo){b.buf, 0, size};
+    return r;
 }
 static VkBuffer zero_storage(vkctx_t *c) {                        // what an unbound storage buffer slot reads
     static vkbuf_t z; static int made;
