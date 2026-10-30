@@ -10,6 +10,14 @@ boots too, but it has not been taken as far (see [The 32-bit base](#the-32-bit-b
 Keys, dumps and firmware never go in the repo: `work/` and `*.keys`, `*.nsp`, `*.nsz` are git-ignored. The reference implementation this
 ports is `seedds/nxnative`; its Mario Kart profile (`dm/games/0100152000022000/`) is the best description of what the game needs.
 
+## The race
+
+With the movie decoder replaced, A goes through single player, Grand Prix, 50cc, Mario, the default kart and the Mushroom Cup into Mario Kart Stadium, and the race runs:
+the kart drives, overtakes, collects coins, the anti-gravity section and the stands are drawn. What it took on the NVN side: room for 16384 memory pools (a course
+makes more than a thousand), finalized textures kept alive (the scene's HDR target, 1920x1080 R11G11B10F, is finalized right after it is made and used every frame;
+other textures alias its memory), colour targets that are slices of a 3D texture (an 8x8x8 colour LUT), and the shaders captured during a race (2839 in the
+library). Still wrong: parts of the road are black, about 90 ms per frame (11 fps), and some draws skip for render targets that never existed in the host.
+
 ## Movies
 
 The menus play `content:/UI/cmn/movie/MovieMenu.mp4` (H.264, 512x608) behind them and wait for its frames: with the SDK's hardware decoder (NVIDIA's NVOMX over nvdrv) the decoder thread
@@ -145,7 +153,8 @@ All are environment variables; nothing costs anything when unset.
 | `NX_HID_SCRIPT="<s>:<bit>[:<ms>],..."` | press buttons at given seconds after the hid block is mapped (each logged); e.g. `50:0,65:15` = A at 50 s, down at 65 s |
 | `NX_FRAME_EVERY=<n>` | with `NX_FRAME_DUMP`: also every n-th frame |
 | `NX_MOVIE_LOG=1` | the movie decoder takeover's calls (`hle_movie.c`) |
-| `NX_HID_TAP=<bit>[:<s>]` | press that `NpadButton` bit (0 = A) for 150 ms every `<s>` seconds (default 4), for runs nobody sits at |
+| `NX_HID_TAP=<bit>[:<s>[:<ms>]]` | press that `NpadButton` bit (0 = A) for 150 ms (or `<ms>`) every `<s>` seconds (default 4), for runs nobody sits at; `0:4:3500` goes through every menu into a Grand Prix and keeps accelerating in the race |
+| `NX_TEX_TRACE=<serial>` | log when that texture is initialized and finalized |
 | `NX_NO_CULL=1`, `NX_TEX_CLEAN=1`, `NX_NVN_ITEMS=1` | test switches: no culling, textures start clean, log each device-info item queried |
 | `NX_TRACE_SVC` | 32-bit: every SVC and hook. 64-bit: `1` = the first 3000 SVCs, `<name part>` = only the hooks whose name contains it, without limit |
 | `NX_SVC_ERRORS=1` | each distinct (SVC, non-zero result) once |

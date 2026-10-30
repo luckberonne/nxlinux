@@ -28,8 +28,8 @@ void hid_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t
 static void publish(uint8_t *mem) {
     uint8_t *e = mem + NPAD_BASE;
     uint64_t buttons; int32_t st[4];
-    static int tap = -2; static unsigned period = 4;                // NX_HID_TAP=<button bit>[:<period in s>]: presses that button for 150 ms every period, for runs nobody sits at
-    if (tap == -2) { const char *t = getenv("NX_HID_TAP"); tap = t ? atoi(t) : -1; if (t && strchr(t, ':')) period = (unsigned)atoi(strchr(t, ':') + 1); if (!period) period = 4; }
+    static int tap = -2; static unsigned period = 4, hold = 150;     // NX_HID_TAP=<button bit>[:<period s>[:<press ms>]]: presses that button for 150 ms (or press ms) every period, for runs nobody sits at
+    if (tap == -2) { const char *t = getenv("NX_HID_TAP"); tap = t ? atoi(t) : -1; if (t && strchr(t, ':')) { const char *q = strchr(t, ':') + 1; period = (unsigned)atoi(q); if (strchr(q, ':')) hold = (unsigned)atoi(strchr(q, ':') + 1); } if (!period) period = 4; }
     pthread_mutex_lock(&g_mu); buttons = g_buttons; memcpy(st, g_stick, sizeof st); pthread_mutex_unlock(&g_mu);
     static struct { uint32_t at, len; int bit; } scr[64]; static int nscr = -1; static uint64_t t_start;   // NX_HID_SCRIPT="<s>:<bit>[:<ms>],...": presses at seconds after the block is mapped
     if (nscr < 0) {
@@ -42,7 +42,7 @@ static void publish(uint8_t *mem) {
         for (int i = 0; i < nscr; i++) if (ms - t_start >= scr[i].at && ms - t_start < (uint64_t)scr[i].at + scr[i].len) {
             buttons |= 1ull << scr[i].bit;
             if (!said[i]) { said[i] = 1; fprintf(stderr, "[dm] [hid] script: button bit %d at %.1f s\n", scr[i].bit, (ms - t_start) / 1000.0); } } }
-    if (tap >= 0) { struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); uint64_t ms = (uint64_t)t0.tv_sec * 1000 + (uint64_t)t0.tv_nsec / 1000000; if (ms % (period * 1000ull) < 150) buttons |= 1ull << tap; }
+    if (tap >= 0) { struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); uint64_t ms = (uint64_t)t0.tv_sec * 1000 + (uint64_t)t0.tv_nsec / 1000000; if (ms % (period * 1000ull) < hold) buttons |= 1ull << tap; }
     uint64_t n = ++g_sample;
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t ticks = ((uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec) * 12 / 625;   // the 19.2 MHz system counter
