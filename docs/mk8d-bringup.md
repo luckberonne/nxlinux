@@ -10,6 +10,14 @@ boots too, but it has not been taken as far (see [The 32-bit base](#the-32-bit-b
 Keys, dumps and firmware never go in the repo: `work/` and `*.keys`, `*.nsp`, `*.nsz` are git-ignored. The reference implementation this
 ports is `seedds/nxnative`; its Mario Kart profile (`dm/games/0100152000022000/`) is the best description of what the game needs.
 
+## Movies
+
+The menus play `content:/UI/cmn/movie/MovieMenu.mp4` (H.264, 512x608) behind them and wait for its frames: with the SDK's hardware decoder (NVIDIA's NVOMX over nvdrv) the decoder thread
+dies and the menus never move past the first choice. `src/host/svc/hle_movie.c` takes over `movie::Decoder` (its methods forward to a `DecoderImpl` the host never makes)
+and decodes with FFmpeg (libavcodec, found by pkg-config; without it the frames are black). The SDK's own extractor still reads the MP4. The SPS and PPS come from the
+track's `avcc` record, the frames go out as NV12 into the title's buffers, and input is held back while the output slots are full.
+With it, A goes through single player, Grand Prix, 50cc and into character select.
+
 ## Controls
 
 The window is player 1's Pro Controller, always connected (`src/host/svc/hid_input.c` fills the `hid` shared memory: the npad entry of player 1 at +0x9A00, style set Pro Controller, a ring of 17 states, a new one every 8 ms; the SDL thread in `nvn_present_vk.c` feeds it).
@@ -117,6 +125,9 @@ All are environment variables; nothing costs anything when unset.
 | `NX_DRAW_SERIAL=<serial>` | details of the draws that sample that texture: attributes, the first vertex words, the bound uniform buffers |
 | `NX_TEX_ARRAYS=1` | with `NX_FRAME_DUMP`: list the 2D array textures at frame 1000 and write layer 0 of the BC4 ones (font sheets) as raw blocks |
 | `NX_TEX_NO_RECHECK=1` | do not hash texture storage to catch CPU rewrites after the first upload |
+| `NX_HID_SCRIPT="<s>:<bit>[:<ms>],..."` | press buttons at given seconds after the hid block is mapped (each logged); e.g. `50:0,65:15` = A at 50 s, down at 65 s |
+| `NX_FRAME_EVERY=<n>` | with `NX_FRAME_DUMP`: also every n-th frame |
+| `NX_MOVIE_LOG=1` | the movie decoder takeover's calls (`hle_movie.c`) |
 | `NX_HID_TAP=<bit>[:<s>]` | press that `NpadButton` bit (0 = A) for 150 ms every `<s>` seconds (default 4), for runs nobody sits at |
 | `NX_NO_CULL=1`, `NX_TEX_CLEAN=1`, `NX_NVN_ITEMS=1` | test switches: no culling, textures start clean, log each device-info item queried |
 | `NX_TRACE_SVC` | 32-bit: every SVC and hook. 64-bit: `1` = the first 3000 SVCs, `<name part>` = only the hooks whose name contains it, without limit |

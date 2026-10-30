@@ -31,6 +31,17 @@ static void publish(uint8_t *mem) {
     static int tap = -2; static unsigned period = 4;                // NX_HID_TAP=<button bit>[:<period in s>]: presses that button for 150 ms every period, for runs nobody sits at
     if (tap == -2) { const char *t = getenv("NX_HID_TAP"); tap = t ? atoi(t) : -1; if (t && strchr(t, ':')) period = (unsigned)atoi(strchr(t, ':') + 1); if (!period) period = 4; }
     pthread_mutex_lock(&g_mu); buttons = g_buttons; memcpy(st, g_stick, sizeof st); pthread_mutex_unlock(&g_mu);
+    static struct { uint32_t at, len; int bit; } scr[64]; static int nscr = -1; static uint64_t t_start;   // NX_HID_SCRIPT="<s>:<bit>[:<ms>],...": presses at seconds after the block is mapped
+    if (nscr < 0) {
+        nscr = 0; const char *p = getenv("NX_HID_SCRIPT");
+        while (p && *p && nscr < 64) { double s = strtod(p, (char **)&p); if (*p != ':') break; p++; int bit = (int)strtol(p, (char **)&p, 10); uint32_t len = 200; if (*p == ':') { p++; len = (uint32_t)strtoul(p, (char **)&p, 10); }
+            scr[nscr].at = (uint32_t)(s * 1000); scr[nscr].bit = bit; scr[nscr].len = len; nscr++; if (*p == ',') p++; }
+    }
+    if (nscr) { struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); uint64_t ms = (uint64_t)t0.tv_sec * 1000 + (uint64_t)t0.tv_nsec / 1000000; if (!t_start) t_start = ms;
+        static int said[64];
+        for (int i = 0; i < nscr; i++) if (ms - t_start >= scr[i].at && ms - t_start < (uint64_t)scr[i].at + scr[i].len) {
+            buttons |= 1ull << scr[i].bit;
+            if (!said[i]) { said[i] = 1; fprintf(stderr, "[dm] [hid] script: button bit %d at %.1f s\n", scr[i].bit, (ms - t_start) / 1000.0); } } }
     if (tap >= 0) { struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); uint64_t ms = (uint64_t)t0.tv_sec * 1000 + (uint64_t)t0.tv_nsec / 1000000; if (ms % (period * 1000ull) < 150) buttons |= 1ull << tap; }
     uint64_t n = ++g_sample;
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
