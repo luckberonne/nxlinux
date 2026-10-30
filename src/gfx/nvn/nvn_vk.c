@@ -20,7 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_POOLS 1024
+#define MAX_POOLS 16384    // Mario Kart 8 Deluxe makes well over a thousand while a course loads
 #define MAX_INFLIGHT 64
 
 uint64_t guest_ns(void);                                 // the guest clock (hostsvc.c)
@@ -172,34 +172,43 @@ static void pool_release(gpool_t *p) {
     p->buf = VK_NULL_HANDLE; p->mem = VK_NULL_HANDLE;
 }
 
+static int pool_slot(uint64_t base) {                     // the first entry whose base is >= base: caller holds pool_mu
+    int lo = 0, hi = G.npool;
+    while (lo < hi) { int m = (lo + hi) / 2; if (G.pool[m].base < base) lo = m + 1; else hi = m; }
+    return lo;
+}
 void mtl_pool_add(const void *mem, uint64_t size) {
     int on = gpu();
     pthread_mutex_lock(&G.pool_mu);
-    int i = 0;
-    for (; i < G.npool; i++) if (G.pool[i].base == (uint64_t)(uintptr_t)mem) break;
-    if (i == G.npool && G.npool == MAX_POOLS) { pthread_mutex_unlock(&G.pool_mu); fprintf(stderr, "[dm] [RED] [nvn] pool table full\n"); return; }
-    if (i < G.npool && on) pool_release(&G.pool[i]);      // the same base again: a pool re-created over its memory
+    uint64_t base = (uint64_t)(uintptr_t)mem;
+    int i = pool_slot(base);                              // the table is sorted by base, for pool_find's binary search
+    int same = i < G.npool && G.pool[i].base == base;
+    if (!same && G.npool == MAX_POOLS) { pthread_mutex_unlock(&G.pool_mu); fprintf(stderr, "[dm] [RED] [nvn] pool table full\n"); return; }
+    if (same && on) pool_release(&G.pool[i]);             // the same base again: a pool re-created over its memory
+    if (!same) { memmove(&G.pool[i + 1], &G.pool[i], (size_t)(G.npool - i) * sizeof G.pool[0]); G.npool++; }
     gpool_t *p = &G.pool[i];
-    memset(p, 0, sizeof *p); p->base = (uint64_t)(uintptr_t)mem; p->size = size;
-    if (i == G.npool) G.npool++;
+    memset(p, 0, sizeof *p); p->base = base; p->size = size;
     if (on) pool_import(p);
     pthread_mutex_unlock(&G.pool_mu);
 }
 void mtl_pool_del(const void *mem) {
     int on = gpu();
     pthread_mutex_lock(&G.pool_mu);
-    for (int i = 0; i < G.npool; i++)
-        if (G.pool[i].base == (uint64_t)(uintptr_t)mem) { if (on) pool_release(&G.pool[i]); G.pool[i] = G.pool[--G.npool]; break; }
+    int i = pool_slot((uint64_t)(uintptr_t)mem);
+    if (i < G.npool && G.pool[i].base == (uint64_t)(uintptr_t)mem) {
+        if (on) pool_release(&G.pool[i]);
+        memmove(&G.pool[i], &G.pool[i + 1], (size_t)(G.npool - i - 1) * sizeof G.pool[0]); G.npool--;
+    }
     pthread_mutex_unlock(&G.pool_mu);
 }
 void mtl_alias_drop_pool(const void *pool) { (void)pool; }
 
 // The pool that holds [addr, addr+len): caller holds pool_mu. The returned pointer is valid until the table changes.
 static gpool_t *pool_find(uint64_t addr, uint64_t len) {
-    for (int i = 0; i < G.npool; i++) {
-        gpool_t *p = &G.pool[i];
-        if (addr >= p->base && len <= p->size && addr - p->base <= p->size - len) return p;
-    }
+    int i = pool_slot(addr + 1) - 1;                      // the last pool starting at or below addr (pools do not overlap)
+    if (i < 0) return NULL;
+    gpool_t *p = &G.pool[i];
+    if (addr >= p->base && len <= p->size && addr - p->base <= p->size - len) return p;
     return NULL;
 }
 int nvn_vk_pool_buffer(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
