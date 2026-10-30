@@ -145,3 +145,6 @@ Cada paso cierra con un test que falla con `NX_NULL_GPU=1` o sin la pieza nueva,
 - Commits sin mencionar a Claude ni a ningún agente, mensajes de una línea (regla del usuario, skill `commits-sin-claude`).
 - Dependencias nuevas: dynarmic, SDL3, ffmpeg, SPIRV-Reflect, CMake, .NET (ya requerido por `nx_extract`); y `cryptography` para la venv de Python (kit sintético de `tools/synth_nsp.py`).
 - El código de `dm/` seguirá en inglés, como pide `AGENTS.md`, y las líneas rojas de log empiezan con `[RED]`.
+
+## Estado (2026-10-30)
+MK8D 4.0.1 (proceso de 64 bits) arranca con su propio `rtld`, precarga sus archivos, dibuja con 1508 shaders traducidos y muestra su pantalla de presentación en la ventana a 60 Hz. La base 1.0.0 es de 32 bits y también arranca (CPU A32, cargador ELF32, SVC y ganchos por símbolo, unos veinte servicios por IPC). Notas, comandos y lo que falta (mando, audio, menús, carreras, `nvdrv` 13, escrituras de la CPU en texturas ya usadas): `docs/mk8d-bringup.md`.
