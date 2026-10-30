@@ -217,7 +217,7 @@ is read (`cb_slot`, `cb_offset` in words); `shader_pack.py` accepts the ones ins
 a game uniform buffer. The binding of c[0] itself is not in the reflection when only the storage conversion reads it, so the packer now takes every constant-buffer binding from the
 module's own uniform blocks (`<stage>_c<n>`). The replay keeps the storage buffers bound per stage and slot (`OP_BIND_SSBO`); a draw binds each as a storage buffer descriptor (an unbound slot
 reads zeros) and writes the same addresses and sizes into the c[0] table. Stage fifteen of the draw test loads a float that way.
-The shader's own constant segment c[1] (the 0x100 bytes before its control section) is captured with the shader and stored in the library (NXSL version 3), and a draw binds
+The shader's own constant segment c[1] (the end of its code area: control +0x700 is its offset, +0x704 the area's length; the bytes before the control section are only the same when the two were allocated together, and Mario Kart 8 Deluxe's were not) is captured with the shader and stored in the library (NXSL version 3), and a draw binds
 it as a uniform buffer (binding kind 7). Not done yet: images, the geometry helpers, separate textures and samplers, multisampled and buffer textures, and indexing storage buffers by a game-computed address.
 
 ## Presentation

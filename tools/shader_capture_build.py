@@ -7,7 +7,7 @@ For every <key>.code in DUMP_DIR (the key is the one the host computes from the 
 compute shader), the constant segment c[1] from <key>.c1. The Maxwell → SPIR-V translator (tools/dmsh_xlate, built with `dotnet build -c Release -o work/dmsh_xlate`) runs over all of them
 and tools/shader_pack.py packs its output. A shader the translator rejects is listed and left out; the host then skips the draws that use it, as it does for a missing library.
 Run the title again with --shaders OUT.nxsl; shaders the library lacks are captured by the next run, so coverage grows as more of the game is played."""
-import argparse, json, subprocess, sys
+import argparse, json, struct, subprocess, sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -30,8 +30,12 @@ def main(argv=None):
         if stage != 'cs':            # a graphics code area starts with a 0x30-byte header (the 0x12345678 magic); the 0x50-byte SPH after it is read by the translator itself, as nxnative's dmsh_build does
             path = work / (key + '.gfx'); path.write_bytes(code.read_bytes()[0x30:])
         job = {'key': key, 'stage': stage, 'code': str(path), 'debug': False}
-        c1 = code.with_suffix('.c1')
-        if c1.is_file(): job['c1'] = c1.read_bytes().hex()
+        c1 = code.with_suffix('.c1'); ctl = code.with_suffix('.ctl')
+        data = code.read_bytes()
+        if ctl.is_file() and len(ctl.read_bytes()) >= 0x708:        # c[1] is the end of the code area, from control +0x700 (older dumps took the 0x100 bytes before the control section, which are not the constants)
+            c1o, c1t = struct.unpack_from('<2I', ctl.read_bytes(), 0x700)
+            if c1o <= c1t <= len(data): job['c1'] = data[c1o:c1t].hex()
+        if 'c1' not in job and c1.is_file(): job['c1'] = c1.read_bytes().hex()
         if stage == 'cs': job['local'] = [64, 1, 1]
         jobs.append(job)
     if not jobs: sys.exit('[RED] no captured shaders in ' + str(dump))

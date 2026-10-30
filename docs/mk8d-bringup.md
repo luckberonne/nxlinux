@@ -2,8 +2,8 @@
 
 State on 2026-10-30: the 4.0.1 build (a 64-bit process) boots, runs its preload, renders with the translated shader library and shows its title
 splash (the key art with the logo) in the SDL window at 60 Hz. Pressing A passes the title and reaches the player-select menu (input is done, see
-[Controls](#controls)). Since the shaders' constant segment c[1] is bound, the menu text and the intro screens are drawn; the glyphs come out as
-horizontal slices (the font sheets themselves de-swizzle correctly; the text draw's per-character data is next to look at) and the menu background is black. Not done: audio, races (never reached), the movie decoder (`nvdrv` command 13: its thread faults,
+[Controls](#controls)). Menu text and backgrounds render correctly (Single Player, Grand Prix, 100cc, ...; the character and kart screens show their icons and
+labels). Not done: audio, races (never reached), the movie panels behind some menus (black rectangles), the movie decoder (`nvdrv` command 13: its thread faults,
 the rest goes on), texture writes by the CPU after a texture's first use. The 1.0.0 base alone is a 32-bit process and
 boots too, but it has not been taken as far (see [The 32-bit base](#the-32-bit-base-1-0-0)).
 
@@ -97,6 +97,10 @@ failed to allocate and created textures in a NULL pool. The game then needs `Par
   filled yet (it makes thousands before its assets load). **`0x12345678` is not a placeholder marker.**
 - `NX_SHADER_DUMP=<dir>` writes each shader once per key (`<key>.code/.c1/.ctl/.stage`). A program's key is taken when its code is there: a stage that
   was reserved at `ProgramSetShaders` gets its key at the first draw that uses it (`nvn_prog_keys`).
+  **c[1] is the end of the code area** (control +0x700 = its offset, +0x704 = the area's length), not the 0x100 bytes before the control section: the first
+  version of the capture took those, and for this title they are other data (pointers), so every shader that reads c[1] (glyph quads: the corner tables and
+  a 0.25 factor, most backgrounds) drew garbage: text as horizontal slices, black menu backgrounds. `shader_capture_build.py` now derives c[1] from `.code` and
+  `.ctl`, so dumps made before the fix only need the library rebuilt.
 - `tools/shader_capture_build.py` strips the 0x30-byte header from graphics code before the translator sees it (compute code is passed as is),
   runs `tools/dmsh_xlate` (Ryujinx's translator, built with `dotnet build -c Release -o work/dmsh_xlate`) and packs the result.
   The translator numbers a stage's resources from 1; one draw binds both stages in one push-descriptor set, so pixel-stage bindings start at 64.

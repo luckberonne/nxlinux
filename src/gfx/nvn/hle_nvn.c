@@ -672,7 +672,7 @@ int nvn_prog_keys(const prog_t *p, uint8_t out[6][8]) {
 }
 // mapped = 1: computed only when the code area is in a registered memory pool (at SetShaders: Mario sets some programs with an unmapped address first and fills it in before the first draw)
 // NX_SHADER_DUMP=<dir>: every shader a title sets (once per key), for the translator (tools/shader_capture_build.py): <key>.code (the code area: the 0x50-byte program header and the
-// instructions), <key>.c1 (the 0x100 bytes before the control section, where the constant segment c[1] and its jump tables are) and <key>.stage (the header's shader type: vs or ps).
+// instructions), <key>.c1 (the constant segment c[1] and its jump tables: the end of the code area, from control +0x700) and <key>.stage (the header's shader type: vs or ps).
 static void shader_dump(const NVNshaderData *sd, const uint8_t key[8]) {
     static const char *dir; static int init;
     if (!init) { dir = getenv("NX_SHADER_DUMP"); init = 1; if (dir) LOG("[nvn] NX_SHADER_DUMP: shaders are written to %s", dir); }
@@ -698,7 +698,10 @@ static void shader_dump(const NVNshaderData *sd, const uint8_t key[8]) {
     { static int shown; if (shown++ < 6) LOG("[nvn] NX_SHADER_DUMP: a real shader (%s, key %02x%02x%02x%02x..) with its code area at %#llx, %u bytes, first words %08x %08x", stage, key[0], key[1], key[2], key[3], (unsigned long long)sd->data, ncode, ((uint32_t *)(uintptr_t)sd->data)[0], ((uint32_t *)(uintptr_t)sd->data)[1]); }
     FILE *f = fopen(path, "wb"); if (!f) return;
     fwrite((const void *)(uintptr_t)sd->data, 1, ncode, f); fclose(f);
-    snprintf(path, sizeof path, "%s.c1", base); if ((f = fopen(path, "wb"))) { fwrite((const uint8_t *)sd->control - 0x100, 1, 0x100, f); fclose(f); }
+    // c[1] is the tail of the code area: control +0x700 is its offset, +0x704 the code area's length (nxnative's dmsh_build job_for). Bytes before the control section are the tail of the code area only when
+    // the two are allocated together, which is not the case for Mario Kart 8 Deluxe (they held pointers)
+    uint32_t c1o; memcpy(&c1o, (const uint8_t *)sd->control + 0x700, 4);
+    snprintf(path, sizeof path, "%s.c1", base); if ((f = fopen(path, "wb"))) { if (c1o <= ncode) fwrite((const uint8_t *)(uintptr_t)sd->data + c1o, 1, ncode - c1o, f); fclose(f); }
     snprintf(path, sizeof path, "%s.stage", base); if ((f = fopen(path, "w"))) { fputs(stage, f); fclose(f); }
     snprintf(path, sizeof path, "%s.ctl", base); if ((f = fopen(path, "wb"))) { fwrite(sd->control, 1, 0x880, f); fclose(f); }
 }
