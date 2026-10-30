@@ -1,31 +1,87 @@
 // audren:u, the audio renderer service. The title's nn::audio library builds a block of voice, memory pool and sink descriptions every 5 ms frame and sends it with RequestUpdate; the
 // service answers with the new state of each memory pool and how many wave buffers each voice has played. Formats: libnx's audren.h (revisions 1 to 4) and the Nintendo SDK's client.
-// The host renders no sound: memory pools are attached on request, every queued wave buffer counts as played at once, and the frame event fires at 200 Hz while the renderer is started.
+// The host renders the sound (svc/audren_mix.c): while the renderer is started a clock thread renders a frame every 5 ms, queues it on the SDL3 audio device and fires the
+// frame event. NX_AUDIO=0 keeps the device closed (the frames are still rendered, so streaming advances); NX_AUDIO_WAV=file also writes them as a 16-bit stereo WAV.
 #include "ipc.h"
 #include "kernel.h"
+#include "audren_mix.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef NX_HAVE_SDL3
+#include <SDL3/SDL.h>
+#endif
 
 #define R_NOT_IMPL 0xF201u
 #define OUT32(v) (out->out[out->nout++] = (uint32_t)(v))
 #define OUT64(v) do { uint64_t _v = (v); OUT32(_v); OUT32(_v >> 32); } while (0)
-enum { HDR = 0x40, MEMPOOL_IN = 0x20, MEMPOOL_OUT = 0x10, VOICE_IN = 0x170, VOICE_OUT = 0x10, EFFECT_OUT = 0x10, SINK_OUT = 0x20, PERF_OUT = 0x10, BEHAVIOR_OUT = 0xb0, MAX_VOICES = 1024 };
 
 typedef struct {
     uint32_t p[13];                           // AudioRendererParameter: sample rate, sample count, mix buffers, submixes, voices, sinks, effects, ..., revision at [12]
     uint32_t event;                           // the readable end of the frame event
     int started, stop;
     pthread_t ticker; int ticking;
-    uint32_t consumed[MAX_VOICES];            // wave buffers reported played so far, per voice (the client diffs the running total)
-    uint64_t played[MAX_VOICES];              // samples
+    pthread_mutex_t lock;                     // the mixer, between RequestUpdate and the clock thread
+    ar_mixer_t *mix;
+    FILE *wav; uint32_t wav_bytes;
+#ifdef NX_HAVE_SDL3
+    SDL_AudioStream *stream;
+#endif
 } renderer_t;
 
-static void *tick(void *arg) {                // the audio frame clock: 5 ms
+static void wav_header(renderer_t *r) {       // RIFF header for what has been written so far
+    uint32_t rate = r->p[0], h[11] = { 0x46464952, 36 + r->wav_bytes, 0x45564157, 0x20746d66, 16, 0x00020001, rate, rate * 4, 0x00100004, 0x61746164, r->wav_bytes };
+    long at = ftell(r->wav); fseek(r->wav, 0, SEEK_SET); fwrite(h, 4, 11, r->wav); fseek(r->wav, at, SEEK_SET); fflush(r->wav);
+}
+
+static void output_open(renderer_t *r) {
+    const char *wav = getenv("NX_AUDIO_WAV");
+    if (wav && *wav && (r->wav = fopen(wav, "wb"))) wav_header(r);
+    const char *on = getenv("NX_AUDIO");
+    if (on && *on == '0') return;
+#ifdef NX_HAVE_SDL3
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");          // when audio starts SDL first (no window), SIGINT and SIGTERM must still end the process
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { fprintf(stderr, "[RED] audren: SDL audio could not start (%s): no sound\n", SDL_GetError()); return; }
+    SDL_AudioSpec spec = { SDL_AUDIO_F32, 2, (int)r->p[0] };
+    r->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!r->stream) { fprintf(stderr, "[RED] audren: no audio device (%s): no sound\n", SDL_GetError()); return; }
+    SDL_ResumeAudioStreamDevice(r->stream);
+#else
+    fprintf(stderr, "[RED] audren: built without SDL3: no sound\n");
+#endif
+}
+
+static void output_write(renderer_t *r, const float *f, uint32_t n) {   // n stereo frames
+#ifdef NX_HAVE_SDL3
+    // the device's clock and the host's drift apart: more than 100 ms queued means the device is behind, and the frame is dropped
+    if (r->stream && SDL_GetAudioStreamQueued(r->stream) < (int)(r->p[0] / 10 * 8)) SDL_PutAudioStreamData(r->stream, f, (int)(n * 8));
+#endif
+    if (r->wav) {
+        int16_t s[2048];
+        for (uint32_t k = 0; k < 2 * n && k < 2048; k++) s[k] = (int16_t)(f[k] * 32767.0f);
+        fwrite(s, 2, 2 * n, r->wav); r->wav_bytes += 4 * n;
+        if (r->wav_bytes % (r->p[0] * 4) < 4 * n) wav_header(r);   // about once a second
+    }
+}
+
+static void *tick(void *arg) {                // the audio frame clock: sample count / sample rate, 5 ms
     renderer_t *r = arg;
-    while (!r->stop) { struct timespec ts = {0, 5000000}; nanosleep(&ts, NULL); if (r->started) kernel_event_signal(r->event); }
+    uint32_t n = r->p[1] && r->p[1] <= 1024 ? r->p[1] : 240;
+    long period = (long)(1000000000ull * n / (r->p[0] ? r->p[0] : 48000));
+    float frame[2 * 1024];
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    while (!r->stop) {
+        t.tv_nsec += period; if (t.tv_nsec >= 1000000000) { t.tv_nsec -= 1000000000; t.tv_sec++; }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL);
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((now.tv_sec - t.tv_sec) * 1000000000l + (now.tv_nsec - t.tv_nsec) > 100000000l) t = now;   // more than 100 ms late (suspended): start over
+        if (!r->started) continue;
+        pthread_mutex_lock(&r->lock); ar_mixer_render(r->mix, frame); pthread_mutex_unlock(&r->lock);
+        output_write(r, frame, n);
+        kernel_event_signal(r->event);
+    }
     return NULL;
 }
 
@@ -39,31 +95,10 @@ static uint32_t renderer(int session, const ipc_in_t *in, ipc_out_t *out) {
     case 3: OUT32(r->started ? 0 : 1); return 0;            // GetState: 0 started, 1 stopped
     case 4: case 10: {                                      // RequestUpdate / RequestUpdateAuto(input buffer; output and performance buffers)
         if (!in->nsend || !in->nrecv) return 0xc01u;
-        const uint32_t *h = (const uint32_t *)(uintptr_t)in->send[0].addr; uint8_t *o = (uint8_t *)(uintptr_t)in->recv[0].addr;
-        uint32_t behavior = h[1], pools = h[2], voices_sz = h[3], chans = h[4], effects_sz = h[5], perf = h[8];
-        uint32_t npool = pools / MEMPOOL_IN, nvoice = voices_sz % VOICE_IN ? r->p[4] : voices_sz / VOICE_IN;
-        uint32_t neffect = r->p[6], nsink = r->p[5];
-        if (nvoice > MAX_VOICES) nvoice = MAX_VOICES;
-        uint32_t o_pool = npool * MEMPOOL_OUT, o_voice = nvoice * VOICE_OUT, o_effect = neffect * EFFECT_OUT, o_sink = nsink * SINK_OUT, o_perf = perf ? PERF_OUT : 0;
-        uint32_t total = HDR + o_pool + o_voice + o_effect + o_sink + o_perf + BEHAVIOR_OUT;
-        if (total > in->recv[0].size) { fprintf(stderr, "[RED] audren: the response (%#x bytes) does not fit the output buffer (%#x)\\n", total, in->recv[0].size); return 0xc01u; }
-        memset(o, 0, total);
-        uint32_t *oh = (uint32_t *)o;
-        oh[0] = h[0]; oh[1] = BEHAVIOR_OUT; oh[2] = o_pool; oh[3] = o_voice; oh[5] = o_effect; oh[7] = o_sink; oh[8] = o_perf; oh[15] = total;
-        // Memory pools: a pool the title asks to attach is attached, one it asks to detach is detached
-        const uint32_t *mp = (const uint32_t *)((const uint8_t *)h + HDR + behavior);
-        uint32_t *omp = (uint32_t *)(o + HDR);
-        for (uint32_t i = 0; i < npool; i++) { uint32_t st = mp[i * 8 + 4]; omp[i * 4] = st == 4 ? 5 : st == 2 ? 3 : 0; }   // RequestAttach → Attached, RequestDetach → Detached
-        // Voices: a started voice has played everything queued on it
-        const uint8_t *vin = (const uint8_t *)h + HDR + behavior + pools + chans;
-        uint8_t *ov = o + HDR + o_pool;
-        for (uint32_t i = 0; i < nvoice; i++) {
-            const uint8_t *v = vin + (size_t)i * VOICE_IN;
-            if (v[9] && v[10] == 0) { r->consumed[i] += *(const uint32_t *)(v + 0x3c); r->played[i] += (uint64_t)r->p[1] * 1; }   // is_used and Started
-            memcpy(ov + i * VOICE_OUT, &r->played[i], 8); memcpy(ov + i * VOICE_OUT + 8, &r->consumed[i], 4);
-        }
-        (void)effects_sz;
-        return 0;
+        pthread_mutex_lock(&r->lock);
+        uint32_t rc = ar_mixer_update(r->mix, (const uint8_t *)(uintptr_t)in->send[0].addr, in->send[0].size, (uint8_t *)(uintptr_t)in->recv[0].addr, in->recv[0].size);
+        pthread_mutex_unlock(&r->lock);
+        return rc;
     }
     case 5: r->started = 1; return 0;                       // Start
     case 6: r->started = 0; return 0;                       // Stop
@@ -71,7 +106,7 @@ static uint32_t renderer(int session, const ipc_in_t *in, ipc_out_t *out) {
     case 8: return 0;                                       // SetRenderingTimeLimit
     case 9: OUT32(100); return 0;                           // GetRenderingTimeLimit
     case 11: return 0;                                      // ExecuteAudioRendererRendering
-    default: fprintf(stderr, "[RED] ipc: audren IAudioRenderer command %u is not implemented\\n", in->cmd); return R_NOT_IMPL;
+    default: fprintf(stderr, "[RED] ipc: audren IAudioRenderer command %u is not implemented\n", in->cmd); return R_NOT_IMPL;
     }
 }
 
@@ -90,7 +125,7 @@ static uint32_t device(int session, const ipc_in_t *in, ipc_out_t *out) {
         return 0;
     case 4: case 11: case 12: out->copy[out->ncopy++] = kernel_event_new(0); return 0;   // QueryAudioDeviceSystemEvent / InputEvent / OutputEvent
     case 5: OUT32(2); return 0;                             // GetActiveChannelCount
-    default: fprintf(stderr, "[RED] ipc: audren IAudioDevice command %u is not implemented\\n", in->cmd); return R_NOT_IMPL;
+    default: fprintf(stderr, "[RED] ipc: audren IAudioDevice command %u is not implemented\n", in->cmd); return R_NOT_IMPL;
     }
 }
 
@@ -100,8 +135,10 @@ static uint32_t manager(int session, const ipc_in_t *in, ipc_out_t *out) {
     case 0: case 3: {                                       // OpenAudioRenderer(parameters, work buffer size, aruid; transfer memory and process handles) → IAudioRenderer
         renderer_t *r = calloc(1, sizeof *r);
         memcpy(r->p, in->args, sizeof r->p);
-        if (r->p[4] > MAX_VOICES) r->p[4] = MAX_VOICES;
+        r->mix = ar_mixer_new(r->p);
+        pthread_mutex_init(&r->lock, NULL);
         r->event = kernel_event_new(0);
+        output_open(r);
         r->ticking = !pthread_create(&r->ticker, NULL, tick, r); if (r->ticking) pthread_detach(r->ticker);
         out->move[out->nmove++] = ipc_new_session_data("IAudioRenderer", renderer, r);
         return 0;
@@ -111,7 +148,7 @@ static uint32_t manager(int session, const ipc_in_t *in, ipc_out_t *out) {
         OUT64((sz + 0xfff) & ~0xfffull); return 0;
     }
     case 2: case 4: out->move[out->nmove++] = ipc_new_session("IAudioDevice", device); return 0;   // GetAudioDeviceService(aruid) / WithRevisionInfo
-    default: fprintf(stderr, "[RED] ipc: audren:u command %u is not implemented\\n", in->cmd); return R_NOT_IMPL;
+    default: fprintf(stderr, "[RED] ipc: audren:u command %u is not implemented\n", in->cmd); return R_NOT_IMPL;
     }
 }
 

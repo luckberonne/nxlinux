@@ -24,6 +24,14 @@ The window is player 1's Pro Controller, always connected (`src/host/svc/hid_inp
 Keyboard: arrows = D-pad, WASD = left stick, K or Return = A, J or Backspace = B, I = X, U = Y, Q = L, E = R, 1 = ZL, 3 = ZR, P = Plus, O = Minus.
 A gamepad SDL knows works too, with its physical layout (the east button is A). `hid` commands 100/101 keep the style set the title asks for; 11, 66, 67, 120 to 128 are accepted; 203 returns an empty vibration device list.
 
+## Audio
+
+`audren:u` renders on the host (`src/host/svc/audren_mix.c`, IPC in `ipc_audren.c`). Each RequestUpdate (revision 4: 96 voices, the final mix of 6 buffers and one
+submix of 24, a 5.1 device sink) updates a server copy of every voice; a clock thread renders 240 samples every 5 ms (PCM8/PCM16/float and DSP-ADPCM wave
+buffers, linear resampling, channel resource volumes, submix matrices, 5.1 downmixed to stereo), queues them on the SDL3 audio device and fires the frame event.
+The play counts in the answer pace the title's streaming: the menu music is two mono ADPCM voices at 32 kHz. Effects (aux, delay, reverb) are not rendered:
+their sends are dropped, so only the dry signal is heard. `NX_AUDIO=0` keeps the device closed, `NX_AUDIO_WAV=file.wav` also records the output (headless checks).
+
 ## Running it
 
 ```
