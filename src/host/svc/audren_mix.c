@@ -42,6 +42,7 @@ struct ar_mixer {
     effect_t effect[MAX_EFFECTS];
     uint8_t sink_in[6]; int sink_n;
     float buf[MAX_MIXES][NBUF][MAX_FRAME];
+    float voicebuf[6][MAX_FRAME];
 };
 
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -216,7 +217,7 @@ void ar_mixer_render(ar_mixer_t *m, float *stereo) {
         if (!dst) continue;
         float (*db)[MAX_FRAME] = m->buf[dst - m->mix];
         double step = (double)v->rate * (v->pitch > 0 ? v->pitch : 1.0f) / m->rate;
-        float s[6];
+        float (*s)[MAX_FRAME] = m->voicebuf;    // the voice's channels at the output rate, then added into each mix buffer with a gain
         for (uint32_t k = 0; k < n; k++) {
             while (v->frac >= 1.0) {
                 memcpy(v->prev, v->next, sizeof v->prev);
@@ -224,13 +225,18 @@ void ar_mixer_render(ar_mixer_t *m, float *stereo) {
                 v->frac -= 1.0;
             }
             float t = (float)v->frac, vol = v->prev_volume + (v->volume - v->prev_volume) * (float)k / (float)n;
-            for (int c = 0; c < v->nch; c++) s[c] = (v->prev[c] + (v->next[c] - v->prev[c]) * t) * vol;
-            for (int c = 0; c < v->nch; c++) {
-                uint32_t id = v->chan[c]; if (id >= MAX_CHANS) continue;
-                const float *g = m->chanvol[id];
-                for (int b = 0; b < NBUF && b < (dst->nbuf ? dst->nbuf : NBUF); b++) if (g[b] != 0.0f) db[b][k] += s[c] * g[b];
-            }
+            for (int c = 0; c < v->nch; c++) s[c][k] = (v->prev[c] + (v->next[c] - v->prev[c]) * t) * vol;
             v->frac += step;
+        }
+        int nb = dst->nbuf ? dst->nbuf : NBUF;
+        for (int c = 0; c < v->nch; c++) {
+            uint32_t id = v->chan[c]; if (id >= MAX_CHANS) continue;
+            const float *g = m->chanvol[id];
+            for (int b = 0; b < nb; b++) {
+                if (g[b] == 0.0f) continue;
+                float gb = g[b], *d = db[b]; const float *src = s[c];
+                for (uint32_t k = 0; k < n; k++) d[k] += src[k] * gb;
+            }
         }
         v->prev_volume = v->volume;
     }
