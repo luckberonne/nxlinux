@@ -102,7 +102,7 @@ static void free_tex(vktex_t *e) {
     for (int i = 0; i < e->nviews; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->views[i].v, VK_NULL_HANDLE);
     for (int i = 0; i < e->nsvs; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->svs[i].v, VK_NULL_HANDLE);
     if (e->img) nvn_vk_defer_image(e->img, VK_NULL_HANDLE, e->vmem);           // a submission in flight may still use it
-    if (e->has_alias) { vkDestroyImage(nvn_vk_ctx()->dev, e->alias_img, NULL); vkFreeMemory(nvn_vk_ctx()->dev, e->alias_vmem, NULL); }
+    if (e->has_alias) { vkctx_t *_c = nvn_vk_ctx(); if (_c) { vkDestroyImage(_c->dev, e->alias_img, NULL); vkFreeMemory(_c->dev, e->alias_vmem, NULL); } }
     free(e->st); free(e);
 }
 static void sweep_dead(void) {                                    // caller holds g_mu
@@ -319,6 +319,20 @@ static void recheck(vktex_t *e) {
 }
 static int use(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
     if (!e || !e->ok) return 0;
+    if (e->has_alias && e->alias_dirty) {   // a compressed texture written through its integer alias: copy the raw blocks back into the compressed image (both are linear-tiled with the same row pitch, so a buffer round-trip moves the bytes unchanged)
+        uint32_t aw = (e->d.width + 3) / 4; if (!aw) aw = 1;
+        uint32_t ah = (e->d.height + 3) / 4; if (!ah) ah = 1;
+        size_t total = (size_t)aw * ah * 16;
+        vkbuf_t st;
+        if (!vkbuf_create(c, &st, total ? total : 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) {
+            VkBufferImageCopy r1 = { .bufferOffset = 0, .bufferRowLength = aw, .bufferImageHeight = ah, .imageSubresource = {e->aspect, 0, 0, 1}, .imageOffset = {0, 0, 0}, .imageExtent = {aw, ah, 1} };
+            VkBufferImageCopy r2 = { .bufferOffset = 0, .bufferRowLength = aw, .bufferImageHeight = ah, .imageSubresource = {e->aspect, 0, 0, 1}, .imageOffset = {0, 0, 0}, .imageExtent = {aw, ah, 1} };
+            vkCmdCopyImageToBuffer(cb, e->alias_img, VK_IMAGE_LAYOUT_GENERAL, st.buf, 1, &r1);
+            vkCmdCopyBufferToImage(cb, st.buf, e->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r2);
+            nvn_vk_keep(&st);
+        }
+        e->alias_dirty = 0;
+    }
     recheck(e);
     to_general(e, cb);
     upload(e, c, cb);                                              // only what is dirty
@@ -658,7 +672,7 @@ int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach
             (unsigned long long)serial, e->d.format, e->d.target, e->d.width, e->d.height, e->d.depth, e->levels, e->nsub, has_view, has_view && v->set_levels, has_view ? v->base_level : 0, has_view && v->set_layers, has_view ? v->min_layer : 0, has_view ? v->nlayers : 0);
         return 0; }
     VkFormat vf = (e->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? fmt : e->fmt;
-    if (vf != e->fmt && bc_block_size(e->fmt) > 0) ensure_alias(e, c);
+    if (vf != e->fmt && bc_block_size(e->fmt) > 0) { ensure_alias(e, c); if (e->has_alias) e->alias_dirty = 1; }
     VkImageView iv = view_for(e, c, vf, level, layer0, n);
     if (!iv) return 0;
     mark_gpu(e, level, layer0, n);
