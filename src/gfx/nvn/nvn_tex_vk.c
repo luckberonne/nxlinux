@@ -42,6 +42,7 @@ typedef struct vktex {
     uint64_t hash, hash_ms;                                    // the storage's hash and when it was taken (recheck below)
     int dead;                                                  // finalized: waits in g_dead to be freed
     uint64_t last_use;                                         // when a replay last attached or sampled it (g_use_tick)
+    int used;                                                  // touched at least once since it died
 } vktex_t;
 enum { F_DIRTY = 1, F_GPU = 2 };
 #define SUB(e, lv, ly) ((e)->st[(size_t)(lv) * (e)->nsub + (ly)])
@@ -71,11 +72,30 @@ static VkFormatFeatureFlags features(vkctx_t *c, VkFormat f) { VkFormatPropertie
 // A finalized texture stays findable: an NVN texture is a description of pool memory, and a title may Finalize an object (or a copy of it: they are plain
 // memory) while the commands that use it keep being replayed (Mario Kart 8 Deluxe finalizes its scene targets right after making them, and makes other
 // textures over the same memory). The host frees finalized textures least recently used first, once they hold more than DEAD_BYTES or number DEAD_MAX.
-enum { DEAD_MAX = 4096 };
-#define DEAD_BYTES (768ull << 20)
+enum { DEAD_MAX = 32768 };                              // entries, not bytes: a course load finalizes thousands of textures at once, and a small cap evicted some before their first use (skipped draws)
+#define DEAD_BYTES (1536ull << 20)   // VRAM budget for dead-but-still-referenced textures; the dGPU has 4 GB, and the iGPU shares system RAM
 static struct dead { vktex_t *e; } *g_dead; static size_t g_ndead, g_cdead; static uint64_t g_dead_bytes;
+static uint64_t g_nswept;
 static _Atomic uint64_t g_use_tick;
-static void touch(vktex_t *e) { if (e) e->last_use = atomic_fetch_add(&g_use_tick, 1) + 1; }
+static void touch(vktex_t *e) { if (e) { e->last_use = atomic_fetch_add(&g_use_tick, 1) + 1; e->used = 1; } }
+// The serials that recently left the table and why: when the game attaches one of them the log says how it went instead of a bare "never registered".
+// (A render target that is finalized or re-initialized while replayed commands still name its serial is a skipped draw.)
+enum { GONE_MAX = 8192, GONE_FINALIZED = 1, GONE_REINIT = 2, GONE_SWEPT = 3 };
+static struct { uint64_t serial; uint64_t tick; uint8_t why; } g_gone[GONE_MAX];
+static unsigned g_ngone_total;
+static void gone_add(uint64_t serial, int why) {
+    if (!serial) return;
+    unsigned i = g_ngone_total++ % GONE_MAX;
+    g_gone[i].serial = serial; g_gone[i].tick = atomic_load(&g_use_tick); g_gone[i].why = (uint8_t)why;
+}
+static int gone_why(uint64_t serial, uint64_t *age) {              // the reason and how many texture uses ago (0 when the serial is not in the ring)
+    unsigned n = g_ngone_total < GONE_MAX ? g_ngone_total : GONE_MAX;
+    for (unsigned k = 0; k < n; k++) {
+        unsigned i = (g_ngone_total - 1 - k) % GONE_MAX;
+        if (g_gone[i].serial == serial) { if (age) *age = atomic_load(&g_use_tick) - g_gone[i].tick; return g_gone[i].why; }
+    }
+    return 0;
+}
 static void free_tex(vktex_t *e) {
     for (int i = 0; i < e->nviews; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->views[i].v, VK_NULL_HANDLE);
     for (int i = 0; i < e->nsvs; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->svs[i].v, VK_NULL_HANDLE);
@@ -86,9 +106,14 @@ static void sweep_dead(void) {                                    // caller hold
     vktex_t *gone[64]; int ngone = 0;
     while ((g_ndead > DEAD_MAX || g_dead_bytes > DEAD_BYTES) && ngone < 64) {
         size_t lru = 0;
-        for (size_t i = 1; i < g_ndead; i++) if (g_dead[i].e->last_use < g_dead[lru].e->last_use) lru = i;
+        for (size_t i = 1; i < g_ndead; i++) {
+            int lu = g_dead[lru].e->used, ui = g_dead[i].e->used;
+            if (ui && !lu) { lru = i; continue; }          // evict a used (touched) texture before a never-used one
+            if (ui == lu && g_dead[i].e->last_use < g_dead[lru].e->last_use) lru = i;
+        }
         vktex_t *e = g_dead[lru].e; g_dead[lru] = g_dead[--g_ndead]; g_dead_bytes -= e->L.size;
         for (vktex_t **p = &g_bucket[e->serial & (NB - 1)]; *p; p = &(*p)->next) if (*p == e) { *p = e->next; break; }
+        gone_add(e->serial, GONE_SWEPT); g_nswept++;
         gone[ngone++] = e;
     }
     if (!ngone) return;
@@ -155,18 +180,30 @@ keep:
     pthread_mutex_unlock(&g_mu);
 }
 
+// How many textures the host holds and how much of that is only kept for commands that may still name it (the timing line reports it)
+void mtl_tex_stats(uint64_t *live, uint64_t *dead, uint64_t *dead_bytes, uint64_t *swept) {
+    uint64_t n = 0;
+    pthread_mutex_lock(&g_mu);
+    for (size_t b = 0; b < NB; b++) for (vktex_t *e = g_bucket[b]; e; e = e->next) if (!e->dead) n++;
+    *live = n; *dead = g_ndead; *dead_bytes = g_dead_bytes; *swept = g_nswept;
+    pthread_mutex_unlock(&g_mu);
+}
 void mtl_tex_release(tex_t *t) {
     if (tex_trace() >= 0 && (uint64_t)tex_trace() == t->serial) fprintf(stderr, "[dm] [nvn] trace: texture serial %llu finalized\n", (unsigned long long)t->serial);
     pthread_mutex_lock(&g_mu);
     vktex_t *e = g_bucket[t->serial & (NB - 1)];
     while (e && e->serial != t->serial) e = e->next;
     if (e && !e->dead) {
-        e->dead = 1;
+        e->dead = 1; gone_add(t->serial, GONE_FINALIZED);
         if (g_ndead == g_cdead) { g_cdead = g_cdead ? g_cdead * 2 : 256; g_dead = realloc(g_dead, g_cdead * sizeof *g_dead); }
         g_dead[g_ndead++] = (struct dead){e}; g_dead_bytes += e->L.size;
     }
     sweep_dead();
     pthread_mutex_unlock(&g_mu);
+}
+void mtl_tex_reinit(tex_t *t) {   // TextureInitialize on a live object: the old serial leaves the table the same way, but kept findable so commands still naming it resolve
+    gone_add(t->serial, GONE_REINIT);
+    mtl_tex_release(t);
 }
 void mtl_tex_cpu_written_sub(const tex_t *t, unsigned level, unsigned layer0, unsigned nlayers) {
     vktex_t *e = find(t->serial);
@@ -567,7 +604,9 @@ void nvn_vk_clear_ds(uint64_t serial, const view_t *v, int has_view, float depth
 int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach *out) {
     static int bad;
     { static int lg = -1; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;     // with NX_SKIP_LOG: which serials fail, counted
-      if (lg) { vktex_t *f = find(serial); static _Atomic unsigned nf; if (!f || !f->ok) { unsigned k = atomic_fetch_add(&nf, 1); if (k < 40 || k % 500 == 0) fprintf(stderr, "[dm] [nvn] attach fail #%u serial %llu (%s)\n", k, (unsigned long long)serial, !f ? "unregistered" : "no image"); } } }
+      if (lg) { vktex_t *f = find(serial); static _Atomic unsigned nf; if (!f || !f->ok) { unsigned k = atomic_fetch_add(&nf, 1); uint64_t age = 0; int why = f ? 0 : gone_why(serial, &age);
+          if (k < 40 || k % 500 == 0) fprintf(stderr, "[dm] [nvn] attach fail #%u serial %llu (%s)\n", k, (unsigned long long)serial,
+              !f ? (why == GONE_SWEPT ? "swept from the table" : why == GONE_REINIT ? "left by a re-initialization" : why ? "finalized and freed" : "never registered") : "no image"); } } }
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd();
     if (!c || !cb) return 0;
     vktex_t *e = find(serial); touch(e);

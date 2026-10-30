@@ -13,7 +13,9 @@ void nvn_vk_keep(const vkbuf_t *b);
 // Short-lived uniform data for the submission being recorded (driver segments, support buffers): a piece of a large host-visible buffer, reused once the
 // GPU has finished the submissions that read it. Returns 0 and fills *out and *map, or -1.
 int nvn_vk_transient(size_t size, VkDescriptorBufferInfo *out, void **map);
-void nvn_vk_barrier_all(VkCommandBuffer cb);   // everything before is visible to everything after
+void nvn_vk_barrier_all(VkCommandBuffer cb);   // immediate full barrier (used by OP_BARRIER and OP_UPDATE_UB)
+void nvn_vk_barrier_mark(void);                // deferred mark: a full barrier is needed before the next read
+void nvn_vk_barrier_flush(VkCommandBuffer cb);  // emits one full barrier if a deferred one is pending (many marks collapse into a single)
 // Host-side effects of GPU completion, performed after the submission has completed on the GPU and in submission order
 void nvn_vk_post_event(volatile uint32_t *val, uint32_t mode, uint32_t v);   // mode 0 writes v, 1 adds it
 void nvn_vk_post_counter(uint64_t addr, uint32_t type);                       // writes the 16-byte report {counter, timestamp}

@@ -14,11 +14,16 @@ typedef struct nvn_shader {
     nvn_shbind *binds; int nbinds;
     uint8_t *c1; size_t c1_bytes; vkbuf_t c1buf; int c1made;   // c[1] and the uniform buffer holding it, made on first use
     VkShaderModule module;                 // made on first use
-    struct nvn_shader *next;
+    struct nvn_shader *next, *hnext;       // next: registration order (kept for nothing but memory); hnext: the key's bucket
 } nvn_shader;
 
 static nvn_shader *g_head;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+// Every draw resolves two shaders by key, and a course's library holds thousands: the registry is a hash table on the key, with a one-entry cache per
+// thread because consecutive draws usually use the same program. A linear walk here cost about 100 us per draw with 2,839 shaders (each hop a cache miss).
+enum { SHADER_BUCKETS = 8192 };
+static nvn_shader *g_shash[SHADER_BUCKETS];
+static unsigned shader_bucket(uint64_t v) { v *= 0x9E3779B97F4A7C15ull; return (unsigned)(v >> 51); }   // 8192 = 2^13: the key's high bits after mixing
 
 uint64_t nvn_vk_shader_key(const uint8_t key[8]) { uint64_t v; memcpy(&v, key, 8); return v; }
 
@@ -28,18 +33,24 @@ void nvn_vk_shader_register(const uint8_t key[8], const nvn_shader_desc *d) {
     s->spirv = malloc(d->bytes); memcpy(s->spirv, d->spirv, d->bytes); s->bytes = d->bytes;
     if (d->c1_bytes) { s->c1 = malloc(d->c1_bytes); memcpy(s->c1, d->c1, d->c1_bytes); s->c1_bytes = d->c1_bytes; }
     s->binds = malloc((d->nbinds ? d->nbinds : 1) * sizeof *s->binds); if (d->nbinds) memcpy(s->binds, d->binds, d->nbinds * sizeof *s->binds); s->nbinds = d->nbinds;
+    uint64_t kv; memcpy(&kv, key, 8); unsigned b = shader_bucket(kv);
     pthread_mutex_lock(&g_mu);
-    for (nvn_shader **p = &g_head; *p; p = &(*p)->next)
-        if (!memcmp((*p)->key, key, 8)) { s->next = (*p)->next; /* the old one may still be in a pipeline: it is leaked on purpose */ *p = s; pthread_mutex_unlock(&g_mu); return; }
-    s->next = g_head; g_head = s;
+    for (nvn_shader **p = &g_shash[b]; *p; p = &(*p)->hnext)
+        if (!memcmp((*p)->key, key, 8)) { s->hnext = (*p)->hnext; /* the old one may still be in a pipeline: it is leaked on purpose */ *p = s; s->next = g_head; g_head = s; pthread_mutex_unlock(&g_mu); return; }
+    s->hnext = g_shash[b]; g_shash[b] = s; s->next = g_head; g_head = s;
     pthread_mutex_unlock(&g_mu);
 }
 
 const nvn_shader *nvn_shader_find(const uint8_t key[8]) {
+    static _Thread_local nvn_shader *last; static _Thread_local uint64_t lastv;
+    uint64_t kv; memcpy(&kv, key, 8);
+    if (last && lastv == kv) return last;
+    unsigned b = shader_bucket(kv);
     pthread_mutex_lock(&g_mu);
-    nvn_shader *s = g_head;
-    while (s && memcmp(s->key, key, 8)) s = s->next;
+    nvn_shader *s = g_shash[b];
+    while (s && memcmp(s->key, key, 8)) s = s->hnext;
     pthread_mutex_unlock(&g_mu);
+    if (s) { last = s; lastv = kv; }
     return s;
 }
 int nvn_shader_stage(const nvn_shader *s) { return s->stage; }
@@ -48,15 +59,17 @@ const nvn_shbind *nvn_shader_binds(const nvn_shader *s, int *n) { *n = s->nbinds
 enum { C1_SIZE = 4096 };                   // the buffer covers what a uniform block of the translator may declare beyond the 0x100 captured bytes (zeros)
 VkDescriptorBufferInfo nvn_shader_c1(const nvn_shader *cs) {
     nvn_shader *s = (nvn_shader *)cs;
-    pthread_mutex_lock(&g_mu);
-    if (!s->c1made) {
-        vkctx_t *c = nvn_vk_ctx(); s->c1made = 1;
-        if (c && !vkbuf_create(c, &s->c1buf, C1_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 1)) { memset(s->c1buf.map, 0, C1_SIZE); memcpy(s->c1buf.map, s->c1, s->c1_bytes < C1_SIZE ? s->c1_bytes : C1_SIZE); }
-        else s->c1buf.buf = VK_NULL_HANDLE;
+    if (!__atomic_load_n(&s->c1made, __ATOMIC_ACQUIRE)) {       // every draw binds it: the lock is taken once, at the first use
+        pthread_mutex_lock(&g_mu);
+        if (!s->c1made) {
+            vkctx_t *c = nvn_vk_ctx();
+            if (c && !vkbuf_create(c, &s->c1buf, C1_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 1)) { memset(s->c1buf.map, 0, C1_SIZE); memcpy(s->c1buf.map, s->c1, s->c1_bytes < C1_SIZE ? s->c1_bytes : C1_SIZE); }
+            else s->c1buf.buf = VK_NULL_HANDLE;
+            __atomic_store_n(&s->c1made, 1, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&g_mu);
     }
-    VkDescriptorBufferInfo r = {s->c1buf.buf, 0, C1_SIZE};
-    pthread_mutex_unlock(&g_mu);
-    return r;
+    return (VkDescriptorBufferInfo){s->c1buf.buf, 0, C1_SIZE};
 }
 VkShaderModule nvn_shader_module(nvn_shader *s) {
     pthread_mutex_lock(&g_mu);

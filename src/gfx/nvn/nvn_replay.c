@@ -27,14 +27,29 @@ static const char *const op_name[OP_COUNT_] = {
 #undef N
 
 static _Atomic uint64_t g_seen[OP_COUNT_], g_pending[OP_COUNT_];
-// Per-frame averages since the last report of the ops replayed most, render passes begun and full barriers (the timing line calls it)
+// Per-frame averages since the last report of the ops replayed most, render passes begun, full barriers, where the host time goes (replay, driver submit, a
+// draw's prepare and its parts, barrier recording), pipeline lookups and the texture table (the timing line calls it)
 void nvn_replay_report(uint64_t frames) {
-    static uint64_t last[OP_COUNT_], lpass, lbar; extern _Atomic uint64_t g_nvn_npass, g_nvn_nbarrier;
+    static uint64_t last[OP_COUNT_], lpass, lbar, lrep, lcom, llk, llast, lnew, lprep, lpipe, lbuf, lps, lbns;
+    extern _Atomic uint64_t g_nvn_npass, g_nvn_nbarrier_emitted;
     if (!frames) return;
     uint64_t d[OP_COUNT_]; for (unsigned i = 0; i < OP_COUNT_; i++) { uint64_t v = atomic_load(&g_seen[i]); d[i] = v - last[i]; last[i] = v; }
-    uint64_t p = atomic_load(&g_nvn_npass), b = atomic_load(&g_nvn_nbarrier);
-    char line[1024]; size_t o = 0;
-    o += snprintf(line + o, sizeof line - o, "per frame: %.0f render passes, %.0f full barriers;", (double)(p - lpass) / frames, (double)(b - lbar) / frames); lpass = p; lbar = b;
+    uint64_t p = atomic_load(&g_nvn_npass), b = atomic_load(&g_nvn_nbarrier_emitted);
+    extern _Atomic uint64_t g_replay_ns, g_commit_ns;
+    uint64_t rep = atomic_load(&g_replay_ns), com = atomic_load(&g_commit_ns);
+    extern _Atomic uint64_t g_draw_prepare_ns, g_draw_pipe_ns, g_draw_buf_ns, g_draw_pass_ns, g_nvn_barrier_ns;
+    uint64_t prep = atomic_load(&g_draw_prepare_ns), pipe = atomic_load(&g_draw_pipe_ns), buf = atomic_load(&g_draw_buf_ns), pss = atomic_load(&g_draw_pass_ns), bns = atomic_load(&g_nvn_barrier_ns);
+    void nvn_draw_pipe_stats(uint64_t *, uint64_t *, uint64_t *); uint64_t look, lastk, made; nvn_draw_pipe_stats(&look, &lastk, &made);
+    void mtl_tex_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t tl, td, tdb, tsw; mtl_tex_stats(&tl, &td, &tdb, &tsw);
+    char line[1600]; size_t o = 0;
+    o += snprintf(line + o, sizeof line - o, "per frame: %.0f render passes, %.0f full barriers; replay %.2f ms, submit %.2f ms; draws %.2f ms (pipeline %.2f, driver buffers %.2f, pass %.2f), barriers %.2f ms; pipeline lookups %.0f (%.0f%% last key, %.0f new, %llu built); textures %llu live, %llu dead, %llu MB dead, %llu swept;",
+                  (double)(p - lpass) / frames, (double)(b - lbar) / frames, (double)(rep - lrep) / frames / 1e6, (double)(com - lcom) / frames / 1e6,
+                  (double)(prep - lprep) / frames / 1e6, (double)(pipe - lpipe) / frames / 1e6, (double)(buf - lbuf) / frames / 1e6, (double)(pss - lps) / frames / 1e6,
+                  (double)(bns - lbns) / frames / 1e6,
+                  (double)(look - llk) / frames, look - llk ? 100.0 * (double)(lastk - llast) / (double)(look - llk) : 0.0, (double)(made - lnew) / frames,
+                  (unsigned long long)made, (unsigned long long)tl, (unsigned long long)td, (unsigned long long)(tdb >> 20), (unsigned long long)tsw);
+    lpass = p; lbar = b; lrep = rep; lcom = com; llk = look; llast = lastk; lnew = made;
+    lprep = prep; lpipe = pipe; lbuf = buf; lps = pss; lbns = bns;
     for (int k = 0; k < 10; k++) {
         unsigned best = 0; for (unsigned i = 1; i < OP_COUNT_; i++) if (d[i] > d[best]) best = i;
         if (!d[best]) break;
@@ -92,7 +107,7 @@ void mtl_exec(const uint8_t *p) {
         case OP_CLEAR_BUF: { const p_clear_buf *cb = (const p_clear_buf *)a; mtl_sub_fill(cb->addr, cb->size, cb->value); break; }
         case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s_, d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); update_ub(d, n, a + 16); break; }
-        case OP_BARRIER: { VkCommandBuffer cb = nvn_vk_cmd(); if (cb) nvn_vk_barrier_all(cb); break; }   // a full barrier covers every combination of the game's bits
+        case OP_BARRIER: { VkCommandBuffer cb = nvn_vk_cmd_raw(); if (cb) { nvn_vk_barrier_flush(cb); nvn_vk_barrier_all(cb); } break; }   // a full barrier covers every combination of the game's bits; it does not end the pass
         case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) g_copy_img = (uint64_t)cs->stride; else g_copy_row = (uint64_t)cs->stride; break; }
         case OP_COPY_B2T: nvn_vk_copy_b2t((const p_copy_b2t *)a, g_copy_row, g_copy_img); break;
         case OP_COPY_T2B: nvn_vk_copy_t2b((const p_copy_b2t *)a, g_copy_row, g_copy_img); break;   // the record is a p_copy_b2t whose src is the destination buffer

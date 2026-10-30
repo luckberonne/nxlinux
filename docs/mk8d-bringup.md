@@ -190,3 +190,18 @@ A guest access outside the window stops that thread and prints its registers and
 - **Compare with nxnative before assuming.** Its profile said the shaders live in the assets and that the game runs unpatched; both ended long detours.
 - **Look at the pixels.** Dumping the offscreen target and the sampled textures to PPM showed that the game was rendering its title (the textures held
   the logo) while the output stayed black, which pointed at texture upload instead of shaders or draws.
+
+## Frame time (Mario Kart 8 Deluxe, 1080p, dGPU)
+
+Measured with `NX_PRESENT=null NX_HID_TAP=0:4:3500 NX_SKIP_LOG=1` plus `NX_FRAME_DUMP=...` and the per-block log line added by commit 4002439:
+`per frame: N render passes, M full barriers; replay X ms, submit Y ms; ...`. The game reaches a race at about frame 3000.
+
+- Baseline (before 4002439): about 130 ms per frame in the race, ~100 ms of it in the emulator translating graphics commands to Vulkan, ~10 ms game code.
+- After 4002439 (per-draw driver allocations replaced by a transient arena): about 124 ms per frame in the race. Menus went to ~50 ms but have no earlier baseline.
+- The replay line showed the real cost was not the arena: 591 draws per frame, each spending ~100 us looking up a shader in a linear list of 2,839 entries (pointer chase, cache misses) and another ~25 us in the pipeline list. Hashing both (plus a thread-local last-key cache) cut the replay from ~76 ms to ~23 ms in the race.
+- The remaining ~90 ms per frame is the GPU waiting on ~1000 render passes and ~150 full barriers per frame: the game switches targets before almost every draw, and every non-draw operation (including `OP_BARRIER`) ended the open pass. Making `OP_BARRIER` no longer end the pass and deferring the pass-end barrier collapsed marks into flushes; the pass count and emitted barriers both dropped.
+- The texture table evicted render targets before their first use (they were finalized during the course load and swept before the race used them) -> black asphalt and `attach fail ... (swept from the table)`. Fixed by not evicting a dead texture until it has been touched at least once, plus a 1536 MB dead pool.
+- The graphics bugs that remain identified but unfixed: 14 render targets whose NVN format has no Vulkan counterpart (`no image`), and a runtime-generated BC3 texture the game writes through an `R32G32B32A32_UINT` view of a `VK_FORMAT_BC3_UNORM_BLOCK` image (validation: incompatible format compatibility class) -- Vulkan needs two aliased images over the same memory (one BC3, one block-sized integer).
+- The machine has a discrete `GeForce RTX 2050` that the emulator never used: `VK_DRIVER_FILES` was pinned to the Radeon ICD. Selecting it is `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json` (or `NX_GPU` once both ICDs are visible). With it the race still spends ~90 ms per frame on barriers/passes, so the barrier work is the priority, not the device.
+
+NX_GPU is already honoured by `src/gfx/vk/vkctx.c` (it picks device index `NX_GPU`); the ICD override is the part that needs the environment.

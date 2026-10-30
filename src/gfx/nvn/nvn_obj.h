@@ -223,6 +223,7 @@ int mtl_snap_on(void); uint64_t mtl_snap_acquire_wait(void);   // present snapsh
 // Texture release (at Finalize)
 void mtl_tex_init(const tex_t *t);      // TextureInitialize: the serial belongs to a live texture object until mtl_tex_release
 void mtl_tex_release(tex_t *t);
+void mtl_tex_reinit(tex_t *t);          // TextureInitialize on an object that is still live: the old serial is released and noted as such
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
 unsigned mtl_cpu_tex_count(void);   // live textures the CPU writes (retired snapshots are excluded)
 uint64_t mtl_pkg_edge_skips(void);   // packaged texture checks that found only writes beside the texture (pkg_edges_clean)

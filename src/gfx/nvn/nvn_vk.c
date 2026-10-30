@@ -70,7 +70,7 @@ uint64_t nvn_gpu_completed(void) { uint64_t v = 0; if (gpu()) vkGetSemaphoreCoun
 vkctx_t *nvn_vk_ctx(void) { return gpu() ? &G.c : NULL; }
 VkCommandBuffer nvn_vk_cmd_raw(void) { return G.ok ? G.cur : NULL; }
 // Every other operation (copies, fills, barriers, clears) is invalid inside a render pass instance: asking for the command buffer ends the draw path's pass
-VkCommandBuffer nvn_vk_cmd(void) { if (!G.ok || !G.cur) return NULL; nvn_draw_pass_end(); return G.cur; }
+VkCommandBuffer nvn_vk_cmd(void) { if (!G.ok || !G.cur) return NULL; nvn_draw_pass_end(); if (G.cur) nvn_vk_barrier_flush(G.cur); return G.cur; }
 uint64_t nvn_vk_next_fence(void) { return gpu() ? atomic_load(&G.submitted) + 1 : 0; }
 
 // ---- effects of completion
@@ -309,6 +309,7 @@ uint64_t mtl_sub_commit(void) {
         return atomic_fetch_add(&n, 1) + 1;
     }
     nvn_draw_pass_end();                   // a render pass cannot cross the end of the command buffer
+    if (G.cur) nvn_vk_barrier_flush(G.cur);   // emit anything the deferred marks left pending
     uint64_t value = atomic_load(&G.submitted) + 1;
     VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = G.cur};
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = G.tl, .value = value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
@@ -338,12 +339,31 @@ void mtl_drain(void) { mtl_finish(); }
 
 // ---- operations inside the submission being recorded
 _Atomic uint64_t g_nvn_nbarrier;                          // counted for the per-frame statistics (nvn_replay_report)
-void nvn_vk_barrier_all(VkCommandBuffer cb) {
+static inline uint64_t barrier_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+_Atomic uint64_t g_nvn_barrier_ns;                        // host time spent recording full barriers (nvn_replay_report)
+static _Atomic int g_bar_pending;                          // a full barrier is needed before the next read of what was written (deferred: many marks collapse into one)
+_Atomic uint64_t g_nvn_nbarrier_emitted;                  // full barriers actually emitted (reported as the barrier count)
+void nvn_vk_barrier_all(VkCommandBuffer cb) {              // immediate full barrier (used by OP_BARRIER and OP_UPDATE_UB)
+    if (!cb) return;
     atomic_fetch_add(&g_nvn_nbarrier, 1);
+    uint64_t t0 = barrier_now();
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(cb, &di);
+    atomic_fetch_add(&g_nvn_barrier_ns, barrier_now() - t0);
+    atomic_fetch_add(&g_nvn_nbarrier_emitted, 1);
+}
+void nvn_vk_barrier_mark(void) { atomic_store(&g_bar_pending, 1); }   // deferred: pass_end only marks; the next flush emits
+void nvn_vk_barrier_flush(VkCommandBuffer cb) {
+    if (!cb || !atomic_exchange(&g_bar_pending, 0)) return;
+    uint64_t t0 = barrier_now();
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    atomic_fetch_add(&g_nvn_barrier_ns, barrier_now() - t0);
+    atomic_fetch_add(&g_nvn_nbarrier_emitted, 1);
 }
 static void barrier_transfer(VkCommandBuffer cb) {        // later copies and fills may depend on this one
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,

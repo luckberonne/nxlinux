@@ -17,6 +17,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+// Host time per frame in a draw, split into the parts that could dominate it (reported by nvn_replay_report). Two clock reads per draw cost about 40 ns.
+static inline uint64_t dnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+_Atomic uint64_t g_draw_prepare_ns, g_draw_pipe_ns, g_draw_buf_ns, g_draw_pass_ns;   // prepare (whole), its pipeline lookup, its driver buffers, its pass switch
 
 typedef struct nvn_shader nvn_shader;
 const nvn_shader *nvn_shader_find(const uint8_t key[8]);
@@ -169,9 +174,21 @@ typedef struct {
     uint8_t nattr, nbind; struct { VkFormat fmt; uint32_t off; uint8_t binding; } at[16]; struct { uint32_t stride; uint8_t inst; } bd[16];
 } pkey;
 
-typedef struct pipe_entry { pkey key; VkPipeline pipe; VkPipelineLayout layout; VkDescriptorSetLayout dsl; struct pipe_entry *next; } pipe_entry;
+typedef struct pipe_entry { pkey key; uint64_t hash; VkPipeline pipe; VkPipelineLayout layout; VkDescriptorSetLayout dsl; struct pipe_entry *next, *hnext; } pipe_entry;
 static pipe_entry *g_pipes;
+enum { PIPE_BUCKETS = 4096 };                             // a course builds thousands of pipelines, and every draw looks one up: a chain of four at most, not a walk over all of them
+static pipe_entry *g_pbuck[PIPE_BUCKETS];
 static pthread_mutex_t g_pmu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_nplook, g_nplast, g_npnew;      // lookups, answered by the last-key cache, built (for the per-frame statistics)
+void nvn_draw_pipe_stats(uint64_t *look, uint64_t *last, uint64_t *made) {
+    *look = atomic_load(&g_nplook); *last = atomic_load(&g_nplast); *made = atomic_load(&g_npnew);
+}
+static uint64_t pkey_hash(const pkey *k) {                 // over the whole key: a hash collision is still told apart by the memcmp
+    uint64_t h = 0x9E3779B97F4A7C15ull; const uint8_t *p = (const uint8_t *)k; size_t n = sizeof *k;
+    for (; n >= 8; p += 8, n -= 8) { uint64_t w; memcpy(&w, p, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 31; }
+    if (n) { uint64_t w = 0; memcpy(&w, p, n); h = (h ^ w) * 0x100000001B3ull; }
+    return h ^ (h >> 29);
+}
 
 static VkPipelineLayout make_layout(vkctx_t *c, const pkey *k, VkDescriptorSetLayout *dsl_out) {
     VkDescriptorSetLayoutBinding lb[32]; int nb = 0;
@@ -195,8 +212,12 @@ static VkPipelineLayout make_layout(vkctx_t *c, const pkey *k, VkDescriptorSetLa
 }
 
 static pipe_entry *get_pipeline(vkctx_t *c, const pkey *k) {
+    static _Thread_local pipe_entry *last;                  // a run of draws of one material (the common case) needs no hash and no lock
+    atomic_fetch_add_explicit(&g_nplook, 1, memory_order_relaxed);
+    if (last && !memcmp(&last->key, k, sizeof *k)) { atomic_fetch_add_explicit(&g_nplast, 1, memory_order_relaxed); return last; }
+    uint64_t h = pkey_hash(k); unsigned b = (unsigned)(h & (PIPE_BUCKETS - 1));
     pthread_mutex_lock(&g_pmu);
-    for (pipe_entry *e = g_pipes; e; e = e->next) if (!memcmp(&e->key, k, sizeof *k)) { pthread_mutex_unlock(&g_pmu); return e; }
+    for (pipe_entry *e = g_pbuck[b]; e; e = e->hnext) if (e->hash == h && !memcmp(&e->key, k, sizeof *k)) { pthread_mutex_unlock(&g_pmu); return last = e; }
     pthread_mutex_unlock(&g_pmu);
     pipe_entry *e = calloc(1, sizeof *e); e->key = *k;
     e->layout = make_layout(c, k, &e->dsl);
@@ -233,8 +254,9 @@ static pipe_entry *get_pipeline(vkctx_t *c, const pkey *k) {
         .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy, .layout = e->layout};
     if (vkCreateGraphicsPipelines(c->dev, VK_NULL_HANDLE, 1, &pi, NULL, &e->pipe)) { fprintf(stderr, "[dm] [RED] [nvn] pipeline creation failed\n"); e->pipe = VK_NULL_HANDLE; }
     atomic_fetch_add(&g_npipe, 1);
-    pthread_mutex_lock(&g_pmu); e->next = g_pipes; g_pipes = e; pthread_mutex_unlock(&g_pmu);
-    return e;
+    pthread_mutex_lock(&g_pmu); e->hash = h; e->hnext = g_pbuck[b]; g_pbuck[b] = e; e->next = g_pipes; g_pipes = e; pthread_mutex_unlock(&g_pmu);
+    atomic_fetch_add(&g_npnew, 1);
+    return last = e;
 }
 
 // ---- the render pass
@@ -245,7 +267,7 @@ void nvn_draw_pass_end(void) {
     if (!P.active || !cb) { P.active = 0; return; }
     vkCmdEndRendering(cb);
     P.active = 0;
-    nvn_vk_barrier_all(cb);                 // what the draws wrote is visible to whatever comes next
+    nvn_vk_barrier_mark();                 // deferred: what the draws wrote is visible to whatever reads it next
 }
 void nvn_draw_new_submission(void) { P.active = 0; P.bound = VK_NULL_HANDLE; }
 
@@ -352,6 +374,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     state_init();
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd_raw();
     if (!c || !cb) return 0;
+    nvn_vk_barrier_flush(cb);
     if (!c->has_push_descriptor) { skip("the device lacks VK_KHR_push_descriptor", &f_off); return 0; }
     if (!S.prog || !S.nkeys) { skip("no program is bound", &f_noprog); return 0; }
     const nvn_shader *vs = NULL, *fs = NULL; int focus = 0;
@@ -380,7 +403,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
                 if (b[i].kind != NVN_SB_TEX) continue;
                 if (b[i].reg >= NTEXSLOT || nt == 16) { skip("a shader samples more textures than the draw path binds", &f_ntex); return 0; }
                 { static int dd = -1; static unsigned cnt; if (dd < 0) dd = getenv("NX_DRAW_DETAIL") != NULL;
-                  if (dd && cnt < 24) { cnt++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); uint64_t sr = nvn_vk_desc_serial(S.tex[si][b[i].reg]); size_t tot = 0; char pn[300]; snprintf(pn, sizeof pn, "/tmp/claude-1000/-home-lucas-Proyectos-nxlinux/4e412c71-58e2-49fb-bfd2-dd41fc221dfa/scratchpad/tex_%llu.ppm", (unsigned long long)sr); long lit = sr ? nvn_vk_debug_lit(sr, &tot, pn) : -2;
+                  if (dd && cnt < 24) { cnt++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); uint64_t sr = nvn_vk_desc_serial(S.tex[si][b[i].reg]); size_t tot = 0; char pn[300]; const char *pre = getenv("NX_FRAME_DUMP"); snprintf(pn, sizeof pn, "%s.tex%llu.ppm", pre ? pre : "nvn_draw", (unsigned long long)sr); long lit = sr ? nvn_vk_debug_lit(sr, &tot, pn) : -2;
                     fprintf(stderr, "[dm] [nvn] draw samples handle %#x (texture id %u, sampler %u) serial %llu: %ld of %zu bytes not zero\n", S.tex[si][b[i].reg], S.tex[si][b[i].reg] & 0xfffff, S.tex[si][b[i].reg] >> 20, (unsigned long long)sr, lit, tot); } }
                 int r = nvn_vk_desc_sampled(S.tex[si][b[i].reg], (int)b[i].aux, &ti[nt]);
                 { static long fser = -2; if (fser == -2) fser = getenv("NX_DRAW_SERIAL") ? atol(getenv("NX_DRAW_SERIAL")) : -1;   // NX_DRAW_SERIAL=<texture serial>: details of the draws that sample it
@@ -405,7 +428,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     pkey k; memset(&k, 0, sizeof k);
     k.vs = vs; k.fs = fs; k.topo = (uint8_t)topo; k.restart = S.restart.on && is_strip(topo);
     // The pass first: it decides the attachment formats the pipeline is built for
-    if (!P.active || !rt_same(&P.rt, &g_rt)) { if (!pass_begin(c, cb)) { skip("a render target could not be attached", &f_pipe); return 0; } }
+    if (!P.active || !rt_same(&P.rt, &g_rt)) { uint64_t tq = dnow(); if (!pass_begin(c, cb)) { skip("a render target could not be attached", &f_pipe); return 0; } atomic_fetch_add(&g_draw_pass_ns, dnow() - tq); }
     k.ncolor = (uint8_t)g_rt.n;
     for (int i = 0; i < g_rt.n; i++) k.cfmt[i] = g_rt.cser[i] ? P.col[i].fmt : VK_FORMAT_UNDEFINED;
     if (P.have_dep) {
@@ -451,9 +474,10 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
         if (a.stream >= S.nstream) { skip("a vertex attribute names a stream that is not bound", &f_vattr); return 0; }
         k.at[i].fmt = vf; k.at[i].off = a.offset; k.at[i].binding = (uint8_t)a.stream;
     }
+    uint64_t tp = dnow();
     pipe_entry *pe = get_pipeline(c, &k);
+    atomic_fetch_add(&g_draw_pipe_ns, dnow() - tp);
     if (!pe || !pe->pipe) { skip("the pipeline could not be built", &f_pipe); return 0; }
-
     // dynamic state, every draw (cheap, and a new command buffer starts with none)
     if (P.bound != pe->pipe) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pe->pipe); P.bound = pe->pipe; }
     float vx = 0, vy = 0, vw = (float)P.w, vh = (float)P.h, vn = 0, vf2 = 1;
@@ -501,7 +525,9 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
             int n; const nvn_shbind *b = nvn_shader_binds(sh[si], &n);
             for (int i = 0; i < n && nw < 32; i++) {
                 if (b[i].kind == NVN_SB_SUPPORT || b[i].kind == NVN_SB_DRV0 || b[i].kind == NVN_SB_DRV2) {
+                    uint64_t tb = dnow();
                     bi[nw] = driver_buffer(c, (int)b[i].kind, si, vw, vh);
+                    atomic_fetch_add(&g_draw_buf_ns, dnow() - tb);
                     wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nw]};
                     nw++; continue;
                 }
@@ -556,7 +582,7 @@ void nvn_draw(const p_draw *d) {
     pipe_entry *pe;
     if (d->ind) { static int f; skip("indirect draws are not supported yet", &f); return; }
     g_base_instance = d->base_instance;
-    if (!prepare(d->prim, &pe)) return;
+    { uint64_t t0 = dnow(); int ok = prepare(d->prim, &pe); atomic_fetch_add(&g_draw_prepare_ns, dnow() - t0); if (!ok) return; }
     vkCmdDraw(nvn_vk_cmd_raw(), (uint32_t)d->count, d->instances ? (uint32_t)d->instances : 1, (uint32_t)d->first, (uint32_t)d->base_instance);
     draw_note(d->count);
 }
@@ -567,7 +593,7 @@ void nvn_draw_idx(const p_draw_idx *d) {
     if (d->ind) { skip("indirect draws are not supported yet", &f_ind); return; }
     if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) { skip("8-bit indices need widening first", &f_byte); return; }
     g_base_instance = d->base_instance;
-    if (!prepare(d->prim, &pe)) return;
+    { uint64_t t0 = dnow(); int ok = prepare(d->prim, &pe); atomic_fetch_add(&g_draw_prepare_ns, dnow() - t0); if (!ok) return; }
     VkCommandBuffer cb = nvn_vk_cmd_raw(); VkBuffer ib; VkDeviceSize ioff;
     uint64_t isz = d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 4;
     if (!nvn_vk_pool_buffer(d->ibuf, isz * (uint64_t)d->count, &ib, &ioff)) { static int f; skip("the index buffer lies outside the memory pools", &f); return; }
