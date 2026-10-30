@@ -106,6 +106,17 @@ class T(unittest.TestCase):
         self.assertFalse((self.root / 'a/two.txt').exists())
         self.assertIn('D\ta/two.txt', self.git('show', '--name-status', '--format=', 'HEAD'))
 
+    def test_commit_untracks_an_ignored_file_and_leaves_other_staged_work(self):
+        (self.root / '.gitignore').write_text('*.pyc\n'); self.git('add', '.gitignore'); self.git('commit', '-qm', 'ignore pyc')
+        (self.root / 'a/x.pyc').write_bytes(b'1'); self.git('add', '-f', 'a/x.pyc'); self.git('commit', '-qm', 'tracked by mistake')
+        (self.root / 'a/x.pyc').write_bytes(b'2')                                                   # modified on disk, as a rebuilt cache is
+        self.git('rm', '--cached', '-q', 'a/x.pyc')
+        (self.root / 'b/three.txt').write_text('staged by bob\n'); self.git('add', 'b/three.txt')
+        self.run_tool('alice', 'commit', '-m', 'Stop tracking pyc', 'a/x.pyc')
+        self.assertEqual(self.git('show', '--name-status', '--format=', 'HEAD').strip(), 'D\ta/x.pyc')   # removed, not re-added modified
+        self.assertTrue((self.root / 'a/x.pyc').exists())
+        self.assertEqual(self.git('diff', '--cached', '--name-only').strip(), 'b/three.txt')         # bob's staged file is still staged, untouched
+
     # ---- the entry point for an agent of any kind, and JSON for programs
     def test_start_shows_rules_status_and_mail_once(self):
         self.run_tool('alice', 'claim', 'a', '--note', 'on a')

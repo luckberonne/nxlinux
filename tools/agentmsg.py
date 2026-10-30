@@ -15,7 +15,7 @@ State lives in <repo>/.agents/ (git-ignored): one JSON file per message, one cla
 NAME comes from --as or the AGENT_NAME environment variable. See docs/agents/README.md. Any agent that can run a shell command can use it,
 whatever tool it is; --json makes inbox, status and start print JSON for programs.
 """
-import argparse, json, os, re, secrets, subprocess, sys, time
+import argparse, json, os, re, secrets, shutil, subprocess, sys, tempfile, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -219,6 +219,32 @@ def cmd_start(st, root, args):
 
 
 # ---------------------------------------------------------------- git
+def commit_paths(git, msg, paths):
+    """Commit exactly PATHS from a scratch copy of the index, so other staged files stay out. Plain `git commit -- PATH` re-reads the disk, which
+    brings back a file that was `git rm --cached` (the untracking of an ignored file), and `git add` refuses a named ignored file the index lacks."""
+    def out(*a, **kw): return subprocess.run(git + list(a), capture_output=True, text=True, **kw).stdout
+    real = Path(out('rev-parse', '--path-format=absolute', '--git-path', 'index').strip())
+    names = lambda *a: [n for n in out('diff', '--cached', '--name-only', '-z', *a).split('\0') if n]
+    removed = set(names('--diff-filter=D', '--', *paths))   # untracked on purpose: stay removed
+    inside = lambda n: any(n == p.rstrip('/') or n.startswith(p.rstrip('/') + '/') for p in paths) if paths != ['.'] else True
+    fd, tmp = tempfile.mkstemp(prefix='agentmsg-index-'); os.close(fd)
+    try:
+        shutil.copyfile(real, tmp)
+        env = dict(os.environ, GIT_INDEX_FILE=tmp)
+        run = lambda *a: subprocess.run(git + list(a), env=env, capture_output=True, text=True)
+        other = [n for n in names() if not inside(n)]
+        if other: run('reset', '-q', 'HEAD', '--', *other)                                  # staged by someone else: not in this commit
+        add = [p for p in paths if p not in removed]
+        if add:
+            a = run('add', '-A', '--', *add)
+            if a.returncode: return a
+        r = run('commit', '-m', msg)
+    finally:
+        os.unlink(tmp)
+    if r.returncode == 0: subprocess.run(git + ['reset', '-q', '--'] + paths, capture_output=True)   # the real index now matches HEAD for these paths
+    return r
+
+
 def cmd_commit(st, root, args):
     me = need_name(args)
     msg = args.message
@@ -232,8 +258,7 @@ def cmd_commit(st, root, args):
     f = st / 'claims' / f'{me}.json'                    # committing refreshes a claim that already exists, and never creates one:
     if f.exists(): os.utime(f)                          # a shared file does not become mine, and blocked for the others, by being committed
     git = ['git', '-C', str(root)]
-    subprocess.run(git + ['add', '-A', '--'] + paths, check=True)
-    r = subprocess.run(git + ['commit', '-m', msg, '--'] + paths, capture_output=True, text=True)
+    r = commit_paths(git, msg, paths)
     sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
     if r.returncode: sys.exit(r.returncode)
     print(subprocess.run(git + ['rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip())
