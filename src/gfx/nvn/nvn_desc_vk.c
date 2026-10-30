@@ -140,9 +140,12 @@ int nvn_vk_desc_sampled(uint32_t handle, int want, VkDescriptorImageInfo *out) {
     VkSampler smp = sd ? sd->s : VK_NULL_HANDLE;
     pthread_mutex_unlock(&g_mu);
     if (!td.used) return shadow ? 0 : dummy_get(c, want, out);
-    VkImageView iv; int code;
+    VkImageView iv; int code = want;
     if (!nvn_vk_tex_sampled(td.serial, &td.v, td.has_view, td.set_swz, td.swz, &iv, &code)) return shadow ? 0 : dummy_get(c, want, out);
-    if (code != want) return 3;
+    if (code != want) {
+        static int seen; if (!__atomic_exchange_n(&seen, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [RED] [nvn] texture id %u is sampler type %#x, the shader samples %#x\n", tid, code, want);
+        return 3;
+    }
     if (!smp) { VkDescriptorImageInfo tmp; if (!dummy_get(c, 3, &tmp)) return 0; smp = tmp.sampler; }
     *out = (VkDescriptorImageInfo){smp, iv, VK_IMAGE_LAYOUT_GENERAL};
     return 1;

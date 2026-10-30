@@ -21,6 +21,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define NB (1u << 14)
 typedef struct vktex {
@@ -38,6 +39,7 @@ typedef struct vktex {
     uint8_t *st;                                               // levels * nsub bytes of F_DIRTY | F_GPU, accessed atomically
     struct { VkFormat fmt; unsigned level, layer0, n; VkImageView v; } views[16]; int nviews;   // attachment views made so far; touched by the submit thread only
     struct { VkFormat fmt; uint32_t l0, nl, a0, na; int vtype; uint32_t swz; VkImageView v; } svs[8]; int nsvs;   // sampling views, the same way
+    uint64_t hash, hash_ms;                                    // the storage's hash and when it was taken (recheck below)
 } vktex_t;
 enum { F_DIRTY = 1, F_GPU = 2 };
 #define SUB(e, lv, ly) ((e)->st[(size_t)(lv) * (e)->nsub + (ly)])
@@ -219,8 +221,35 @@ done:
 }
 
 // Make the image current for a GPU use in the submission being recorded; returns 0 when the texture has no image
+// CPU writes into a texture's storage after its first upload (glyph caches, the text of menus) do not fault and nothing else reports them: the storage is
+// hashed again at most every 100 ms when the texture is used, and a change makes every subresource the GPU has not written dirty
+static uint64_t storage_hash(const uint8_t *p, size_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ull, w; size_t i = 0;
+    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+static void recheck(vktex_t *e) {
+    static int off = -1; if (off < 0) off = getenv("NX_TEX_NO_RECHECK") != NULL;
+    if (off || !e->mem || !e->L.size || e->L.size > (64u << 20)) return;
+    int cpu = 0; for (size_t i = 0; i < (size_t)e->levels * e->nsub && !cpu; i++) cpu = !(__atomic_load_n(&e->st[i], __ATOMIC_ACQUIRE) & F_GPU);
+    if (!cpu) return;                                              // a render target: the GPU owns every subresource
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    uint64_t ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    if (e->hash_ms && ms - e->hash_ms < 100) return;
+    e->hash_ms = ms;
+    uint64_t h = storage_hash(e->mem, e->L.size);
+    if (h == e->hash) return;
+    int first = !e->hash; e->hash = h;
+    if (first) return;                                             // the initial contents are uploaded by the F_DIRTY set at creation
+    for (size_t i = 0; i < (size_t)e->levels * e->nsub; i++) {
+        uint8_t f = __atomic_load_n(&e->st[i], __ATOMIC_ACQUIRE);
+        if (!(f & F_GPU)) __atomic_store_n(&e->st[i], (uint8_t)(f | F_DIRTY), __ATOMIC_RELEASE);
+    }
+}
 static int use(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
     if (!e || !e->ok) return 0;
+    recheck(e);
     to_general(e, cb);
     upload(e, c, cb);                                              // only what is dirty
     return 1;
@@ -228,6 +257,8 @@ static int use(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
 
 // ---- buffer <-> texture copies
 // One region per copy: the level, the first layer and the buffer layout come from the record and the stride state
+// A buffer copy takes one aspect: the depth of a depth-stencil texture (its stencil is not copied)
+static VkImageAspectFlags copy_aspect(const vktex_t *e) { return (e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : e->aspect; }
 static int regions(const vktex_t *e, const p_copy_b2t *c, uint64_t row, uint64_t img, VkBuffer *buf, VkBufferImageCopy *out, const char *what) {
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     uint32_t lw, lh, lz; level_dims(e, level, &lw, &lh, &lz);
@@ -248,7 +279,7 @@ static int regions(const vktex_t *e, const p_copy_b2t *c, uint64_t row, uint64_t
     if (!nvn_vk_pool_buffer(c->src, img * (uint64_t)nz, buf, &boff)) { fprintf(stderr, "[dm] [RED] [nvn] %s: the buffer address %#llx is in no memory pool\n", what, (unsigned long long)c->src); return 0; }
     if (boff % e->bpb || boff % 4) { fprintf(stderr, "[dm] [RED] [nvn] %s: buffer offset %llu is not aligned to the texel block\n", what, (unsigned long long)boff); return 0; }
     *out = (VkBufferImageCopy){.bufferOffset = boff, .bufferRowLength = (uint32_t)(row / e->bpb) * e->bw, .bufferImageHeight = (uint32_t)(img / row) * e->bh,
-        .imageSubresource = {e->aspect, level, e->is3d ? 0 : layer0 + c->r.zoffset, e->is3d ? 1u : (uint32_t)nz},
+        .imageSubresource = {copy_aspect(e), level, e->is3d ? 0 : layer0 + c->r.zoffset, e->is3d ? 1u : (uint32_t)nz},
         .imageOffset = {c->r.xoffset, c->r.yoffset, e->is3d ? c->r.zoffset : 0}, .imageExtent = {(uint32_t)c->r.width, (uint32_t)c->r.height, e->is3d ? (uint32_t)nz : 1}};
     return 1;
 }
@@ -284,6 +315,13 @@ static void read_storage(const tex_t *t, unsigned level, unsigned layer, int z0,
     if (!t->mem) { for (int z = 0; z < nzz; z++) memset(dst + (size_t)(zbase + z) * img, 0, img); return; }
     uint32_t lw = t->d.width >> level ? t->d.width >> level : 1, lh = t->d.height >> level ? t->d.height >> level : 1, lz = is3d ? (t->d.depth >> level ? t->d.depth >> level : 1) : 1;
     size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
+    if ((t->d.flags & 0x50) && !level && t->d.stride) {             // a linear texture: rows t->d.stride bytes apart, layers one after the other
+        for (int z = 0; z < nzz; z++) {
+            const uint8_t *src = (const uint8_t *)t->mem + (size_t)(is3d ? z0 + z : (int)layer) * t->d.stride * lr;
+            for (size_t y = 0; y < hb; y++) memcpy(dst + (size_t)(zbase + z) * img + y * row, src + (y0 + y) * t->d.stride + x0, wb);
+        }
+        return;
+    }
     uint8_t *lin = malloc(lp * lr * lz);
     if (nvn_deswizzle(&t->d, level, layer, t->mem, lin, lp)) { fprintf(stderr, "[dm] [RED] [nvn] ReadTexels: de-swizzling failed (format %#x target %d)\n", t->d.format, t->d.target); free(lin); return; }
     for (int z = 0; z < nzz; z++) {
@@ -352,7 +390,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
             if (!cb || vkbuf_create(ctx, &st, wb * hb, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) { if (cb) nvn_vk_oneshot_end(cb); memset(dst + (size_t)z * img, 0, img); continue; }
             nvn_vk_barrier_all(cb);
             VkBufferImageCopy rg = {.bufferRowLength = (uint32_t)(wb / bpb) * bw, .bufferImageHeight = (uint32_t)hb * bh,
-                .imageSubresource = {e->aspect, level, layer, 1}, .imageOffset = {r->xoffset, r->yoffset, 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}};
+                .imageSubresource = {copy_aspect(e), level, layer, 1}, .imageOffset = {r->xoffset, r->yoffset, 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}};
             vkCmdCopyImageToBuffer(cb, e->img, VK_IMAGE_LAYOUT_GENERAL, st.buf, 1, &rg);
             nvn_vk_barrier_all(cb);
             nvn_vk_oneshot_end(cb);
@@ -368,7 +406,7 @@ gpu_slices: {
         vkbuf_t st;
         if (!cb || vkbuf_create(ctx, &st, wb * hb * nz, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) { if (cb) nvn_vk_oneshot_end(cb); memset(dst, 0, img * nz); return; }
         nvn_vk_barrier_all(cb);
-        VkBufferImageCopy rg = {.bufferRowLength = (uint32_t)(wb / bpb) * bw, .bufferImageHeight = (uint32_t)hb * bh, .imageSubresource = {e->aspect, level, 0, 1},
+        VkBufferImageCopy rg = {.bufferRowLength = (uint32_t)(wb / bpb) * bw, .bufferImageHeight = (uint32_t)hb * bh, .imageSubresource = {copy_aspect(e), level, 0, 1},
             .imageOffset = {r->xoffset, r->yoffset, r->zoffset}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, (uint32_t)nz}};
         vkCmdCopyImageToBuffer(cb, e->img, VK_IMAGE_LAYOUT_GENERAL, st.buf, 1, &rg);
         nvn_vk_barrier_all(cb);
@@ -479,7 +517,7 @@ int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd();
     if (!c || !cb) return 0;
     vktex_t *e = find(serial);
-    if (!use(e, c, cb)) return 0;
+    if (!use(e, c, cb)) { static int none; if (!__atomic_exchange_n(&none, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [RED] [nvn] render target serial %llu has no Vulkan image (%s)\n", (unsigned long long)serial, e ? "its image could not be made" : "never registered"); return 0; }
     unsigned level, layer0, n; VkFormat fmt; VkRect2D area;
     if (!clear_target(e, v, has_view, NULL, &level, &layer0, &n, &fmt, &area) || !n) { red_once(&bad, "the render target is a 3D texture or names a level or layer that does not exist", e->d.format); return 0; }
     VkFormat vf = (e->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? fmt : e->fmt;
@@ -525,7 +563,16 @@ int nvn_vk_tex_sampled(uint64_t serial, const view_t *v, int has_view, int tex_s
     if (dirty) { VkCommandBuffer cb = nvn_vk_cmd(); if (!cb || !use(e, c, cb)) return 0; }
     unsigned target = has_view && v->set_target ? v->target : e->d.target;
     VkImageViewType vt; int fixed;
+    int want = *code;                                               // the SamplerType the shader declares (0: any)
     if (!sample_type(target, &vt, code, &fixed)) { red_once(&bad, "this texture target cannot be sampled yet", e->d.format); return 0; }
+    if (want && want != *code && (want & 255) == (*code & 255) && ((want & 255) == 1 || (want & 255) == 3 || (want & 255) == 5)) {
+        // the shader samples the array form of a plain texture or the reverse (a font's glyph sheets): Vulkan makes either view of the same image
+        static const VkImageViewType plain[6] = {0, VK_IMAGE_VIEW_TYPE_1D, 0, VK_IMAGE_VIEW_TYPE_2D, 0, VK_IMAGE_VIEW_TYPE_CUBE};
+        static const VkImageViewType arr[6] = {0, VK_IMAGE_VIEW_TYPE_1D_ARRAY, 0, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY};
+        vt = (want & 256) ? arr[want & 255] : plain[want & 255];
+        fixed = (want & 256) ? 0 : ((want & 255) == 5 ? 6 : 1);
+        *code = want;
+    }
     uint32_t l0 = has_view && v->set_levels ? v->base_level : 0, nl = has_view && v->set_levels && v->nlevels ? v->nlevels : e->levels - l0;
     uint32_t a0 = has_view && v->set_layers ? v->min_layer : 0, na = fixed ? (uint32_t)fixed : has_view && v->set_layers && v->nlayers ? v->nlayers : e->layers - a0;
     if (e->is3d) { a0 = 0; na = 1; }
