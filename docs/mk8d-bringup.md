@@ -1,12 +1,19 @@
 # Mario Kart 8 Deluxe on nxlinux: bring-up notes
 
 State on 2026-10-30: the 4.0.1 build (a 64-bit process) boots, runs its preload, renders with the translated shader library and shows its title
-splash (the key art with the logo) in the SDL window at 60 Hz. Not done: input (`hid` answers empty, so nothing can be pressed), audio, the menus and
-races (never reached), `nvdrv` command 13, texture writes by the CPU after a texture's first use. The 1.0.0 base alone is a 32-bit process and
+splash (the key art with the logo) in the SDL window at 60 Hz. Pressing A passes the title and reaches the player-select menu (input is done, see
+[Controls](#controls)). Not done: audio, text in the menus (the labels are blank), races (never reached), the movie decoder (`nvdrv` command 13: its thread faults,
+the rest goes on), texture writes by the CPU after a texture's first use. The 1.0.0 base alone is a 32-bit process and
 boots too, but it has not been taken as far (see [The 32-bit base](#the-32-bit-base-1-0-0)).
 
 Keys, dumps and firmware never go in the repo: `work/` and `*.keys`, `*.nsp`, `*.nsz` are git-ignored. The reference implementation this
 ports is `seedds/nxnative`; its Mario Kart profile (`dm/games/0100152000022000/`) is the best description of what the game needs.
+
+## Controls
+
+The window is player 1's Pro Controller, always connected (`src/host/svc/hid_input.c` fills the `hid` shared memory: the npad entry of player 1 at +0x9A00, style set Pro Controller, a ring of 17 states, a new one every 8 ms; the SDL thread in `nvn_present_vk.c` feeds it).
+Keyboard: arrows = D-pad, WASD = left stick, K or Return = A, J or Backspace = B, I = X, U = Y, Q = L, E = R, 1 = ZL, 3 = ZR, P = Plus, O = Minus.
+A gamepad SDL knows works too, with its physical layout (the east button is A). `hid` commands 100/101 keep the style set the title asks for; 11, 66, 67, 120 to 128 are accepted; 203 returns an empty vibration device list.
 
 ## Running it
 
@@ -49,7 +56,7 @@ The device must report NVN API 53.x with minor >= 105: the game compares it at `
 - Services run at the IPC level (`ipc.c`, `svc/ipc_*.c`): the SDK's own HIPC client talks to the host through `SendSyncRequest`. Domains, control
   messages, A/B/X/C buffer descriptors (36-bit addresses for a 64-bit process), copy and move handles and `QueryPointerBufferSize` are handled.
   Services: sm, lm, apm, aoc:u, pctl, appletOE, fsp-srv (RomFS image, save data under `work/save/<title>`, system data), nvdrv (stub), hid
-  (zeroed shared memory), set, mii, prepo, pl:u (the host's TrueType font in the shared-font layout), audren:u (SDK 4 and the 1.0.0 formats).
+  (npad shared memory refilled at 120 Hz), set, mii, prepo, pl:u (the host's TrueType font in the shared-font layout), audren:u (SDK 4 and the 1.0.0 formats).
 - `cpu_call32` / `cpu_call64` call a guest function from the host on the calling guest thread (used to bind `SystemEvent`s through the SDK's own
   `nn::os::AttachSystemEvent`).
 - A per-core priority scheduler (`kernel.c`) lets only one thread per core run: without it the SDK's init races (a worker using an object before
@@ -105,6 +112,7 @@ All are environment variables; nothing costs anything when unset.
 | `NX_FRAME_DUMP=<prefix>` | write presented frames 100, 400, 1000, 2500 and every 1500th to `<prefix>.<n>.ppm`, with the count of non-black pixels and statistics of the offscreen target |
 | `NX_DRAW_LOG=1` | first draws, per-target draw counts every 4000 draws, the first render-target sets |
 | `NX_DRAW_DETAIL=1` | for a few draws: pipeline state, vertex stream and uniform contents, sampled texture (and a PPM of it), texture uploads, viewport |
+| `NX_HID_TAP=<bit>[:<s>]` | press that `NpadButton` bit (0 = A) for 150 ms every `<s>` seconds (default 4), for runs nobody sits at |
 | `NX_NO_CULL=1`, `NX_TEX_CLEAN=1`, `NX_NVN_ITEMS=1` | test switches: no culling, textures start clean, log each device-info item queried |
 | `NX_TRACE_SVC` | 32-bit: every SVC and hook. 64-bit: `1` = the first 3000 SVCs, `<name part>` = only the hooks whose name contains it, without limit |
 | `NX_SVC_ERRORS=1` | each distinct (SVC, non-zero result) once |

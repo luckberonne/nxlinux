@@ -196,12 +196,17 @@ int ipc_svc(cpu_t *c, uint32_t swi) {
         uint64_t addr = cpu_get_x(c, 1), size = cpu_get_x(c, 2);
         if (slot((uint32_t)cpu_get_x(c, 0)) < 0) return 0;
         mprotect((void *)addr, size, PROT_READ | PROT_WRITE); memset((void *)addr, 0, size);
-        const ipc_shmem_t *blob = g_s[slot((uint32_t)cpu_get_x(c, 0))].data;       // a block with contents of its own (the shared fonts): copied in
+        ipc_shmem_t *blob = g_s[slot((uint32_t)cpu_get_x(c, 0))].data;             // a block with contents of its own (the shared fonts): copied in
         if (blob && blob->data) memcpy((void *)addr, blob->data, blob->size < size ? blob->size : size);
+        if (blob) __atomic_store_n(&blob->mapped, addr, __ATOMIC_RELEASE);
         cpu_set_x(c, 0, 0); return 1;
     }
     case 0x5f: cpu_set_x(c, 0, 0); return 1;                         // FlushEntireDataCache: x86 caches are coherent, nothing to do
-    case 0x14: if (slot((uint32_t)cpu_get_x(c, 0)) < 0) return 0; cpu_set_x(c, 0, 0); return 1;   // UnmapSharedMemory
+    case 0x14: {   // UnmapSharedMemory
+        int s = slot((uint32_t)cpu_get_x(c, 0)); if (s < 0) return 0;
+        ipc_shmem_t *blob = g_s[s].data; if (blob) __atomic_store_n(&blob->mapped, 0, __ATOMIC_RELEASE);
+        cpu_set_x(c, 0, 0); return 1;
+    }
     case 0x21: cpu_set_x(c, 0, send((uint32_t)cpu_get_x(c, 0), (uint32_t *)kernel_tls())); return 1;    // SendSyncRequest(handle)
     case 0x22: cpu_set_x(c, 0, send((uint32_t)cpu_get_x(c, 2), (uint32_t *)cpu_get_x(c, 0))); return 1;  // SendSyncRequestWithUserBuffer(buffer, size, handle)
     case 0x16: {   // CloseHandle of a session

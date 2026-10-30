@@ -28,7 +28,7 @@ void ipc_register_service(const char *name, ipc_handler_t fn);   // `name` as th
 // Returns 1 if swi was an IPC SVC (or a CloseHandle of a session) and has been handled. x0..x7 are the AArch64-layout arguments, results go back into x0..x3.
 int ipc_svc(cpu_t *c, uint32_t swi);
 // A shared memory block the host hands out (a session named "shmem" whose data is one of these): svcMapSharedMemory zeroes the guest's mapping, then copies data into it.
-typedef struct { const uint8_t *data; size_t size; } ipc_shmem_t;
+typedef struct { const uint8_t *data; size_t size; uint64_t mapped; } ipc_shmem_t;   // `mapped`: where the guest last mapped it (0 = not mapped), for a block the host keeps writing into
 void fsp_set_romfs(const char *path);   // the RomFS image fsp-srv serves as the title's data storage
 uint32_t ipc_new_session_data(const char *name, ipc_handler_t fn, void *data);   // as ipc_new_session, with state the handler finds in in->data (it stays with the object when the session becomes a domain object)
 uint32_t ipc_new_session(const char *name, ipc_handler_t fn);   // a session handle for a service the host answers, for a handler that hands out objects

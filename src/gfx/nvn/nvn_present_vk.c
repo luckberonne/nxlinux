@@ -28,10 +28,41 @@ static double now_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &
 
 // ---- the SDL sink: a thread that owns the window
 #ifdef NX_HAVE_SDL3
+// Controller: the keyboard and the first gamepad become player 1's Pro Controller (the hid service in src/host/svc/hid_input.c publishes it).
+// Keys: arrows D-pad, WASD left stick, K/Return A, J/Backspace B, I X, U Y, Q L, E R, 1 ZL, 3 ZR, P plus, O minus. A gamepad keeps its physical layout (east = A).
+void hid_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) __attribute__((weak));
+static int16_t axis_of(SDL_Gamepad *g, SDL_GamepadAxis a) { int v = SDL_GetGamepadAxis(g, a); return (int16_t)(v < -32767 ? -32767 : v); }
+static void input_poll(SDL_Gamepad **pad) {
+    if (!hid_input_set) return;
+    const bool *k = SDL_GetKeyboardState(NULL);
+    static const struct { SDL_Scancode sc; int bit; } kmap[] = {
+        {SDL_SCANCODE_K, 0}, {SDL_SCANCODE_RETURN, 0}, {SDL_SCANCODE_J, 1}, {SDL_SCANCODE_BACKSPACE, 1}, {SDL_SCANCODE_I, 2}, {SDL_SCANCODE_U, 3},
+        {SDL_SCANCODE_Q, 6}, {SDL_SCANCODE_E, 7}, {SDL_SCANCODE_1, 8}, {SDL_SCANCODE_3, 9}, {SDL_SCANCODE_P, 10}, {SDL_SCANCODE_O, 11},
+        {SDL_SCANCODE_LEFT, 12}, {SDL_SCANCODE_UP, 13}, {SDL_SCANCODE_RIGHT, 14}, {SDL_SCANCODE_DOWN, 15}};
+    uint64_t b = 0; int32_t lx = 0, ly = 0, rx = 0, ry = 0;
+    for (unsigned i = 0; i < sizeof kmap / sizeof *kmap; i++) if (k[kmap[i].sc]) b |= 1ull << kmap[i].bit;
+    lx = (k[SDL_SCANCODE_D] - k[SDL_SCANCODE_A]) * 32767; ly = (k[SDL_SCANCODE_W] - k[SDL_SCANCODE_S]) * 32767;
+    SDL_Gamepad *g = *pad;
+    if (g) {
+        static const struct { SDL_GamepadButton gb; int bit; } gmap[] = {
+            {SDL_GAMEPAD_BUTTON_EAST, 0}, {SDL_GAMEPAD_BUTTON_SOUTH, 1}, {SDL_GAMEPAD_BUTTON_NORTH, 2}, {SDL_GAMEPAD_BUTTON_WEST, 3},
+            {SDL_GAMEPAD_BUTTON_LEFT_STICK, 4}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, 5}, {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 6}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 7},
+            {SDL_GAMEPAD_BUTTON_START, 10}, {SDL_GAMEPAD_BUTTON_BACK, 11}, {SDL_GAMEPAD_BUTTON_DPAD_LEFT, 12}, {SDL_GAMEPAD_BUTTON_DPAD_UP, 13},
+            {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 14}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, 15}};
+        for (unsigned i = 0; i < sizeof gmap / sizeof *gmap; i++) if (SDL_GetGamepadButton(g, gmap[i].gb)) b |= 1ull << gmap[i].bit;
+        if (axis_of(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8000) b |= 1ull << 8;
+        if (axis_of(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000) b |= 1ull << 9;
+        int32_t gx = axis_of(g, SDL_GAMEPAD_AXIS_LEFTX), gy = -axis_of(g, SDL_GAMEPAD_AXIS_LEFTY);
+        if (gx * gx + gy * gy > 6000 * 6000) { lx = gx; ly = gy; }
+        rx = axis_of(g, SDL_GAMEPAD_AXIS_RIGHTX); ry = -axis_of(g, SDL_GAMEPAD_AXIS_RIGHTY);
+    }
+    hid_input_set(b, lx, ly, rx, ry);
+}
 static void *sdl_thread(void *arg) {
     (void)arg;
     SDL_Window *win = NULL; SDL_Renderer *rr = NULL; SDL_Texture *tx = NULL; uint32_t tw = 0, th = 0; uint64_t seen = 0;
-    if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "[dm] [RED] [nvn] SDL video could not start (%s): frames go to memory only\n", SDL_GetError()); goto fail; }
+    SDL_Gamepad *pad = NULL;
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "[dm] [RED] [nvn] SDL video could not start (%s): frames go to memory only\n", SDL_GetError()); goto fail; }
     for (;;) {
         pthread_mutex_lock(&g_mu);
         while (g_shown + 0 >= g_ticket && !g_quit) {                 // nothing new: wake up now and then to keep the window alive
@@ -53,7 +84,12 @@ static void *sdl_thread(void *arg) {
             free(copy);
         }
         SDL_Event ev;
-        while (SDL_PollEvent(&ev)) if (ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) __atomic_store_n(&g_quit, 1, __ATOMIC_RELEASE);
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) __atomic_store_n(&g_quit, 1, __ATOMIC_RELEASE);
+            else if (ev.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(ev.gdevice.which);
+            else if (ev.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == ev.gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; }
+        }
+        input_poll(&pad);
         pthread_mutex_lock(&g_mu); if (upto > seen) seen = upto; g_shown = seen; pthread_cond_broadcast(&g_cv); int quit = g_quit; pthread_mutex_unlock(&g_mu);
         if (quit) break;
     }

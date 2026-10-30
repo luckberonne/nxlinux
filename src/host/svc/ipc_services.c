@@ -4,6 +4,7 @@
 // A request that carries the caller's process id (send_pid) has two placeholder words at the start of in->args.
 #include "ipc.h"
 #include "kernel.h"
+#include "hid_input.h"
 #include "mem.h"
 #include <fcntl.h>
 #include <stdio.h>
@@ -286,19 +287,28 @@ static uint32_t hid_permissive(const char *what, const ipc_in_t *in) {
 static uint32_t applet_resource(int session, const ipc_in_t *in, ipc_out_t *out) {
     (void)session;
     switch (in->cmd) {
-    case 0: out->nmove += 0; out->copy[out->ncopy++] = ipc_new_session("shmem", NULL); return 0;     // GetSharedMemoryHandle → the 0x40000-byte input block
+    case 0: hid_start(); out->copy[out->ncopy++] = ipc_new_session_data("shmem", NULL, hid_block()); return 0;     // GetSharedMemoryHandle → the 0x40000-byte input block, refilled by hid_input.c
     default: return unimpl("hid IAppletResource", in);
     }
+}
+static uint32_t g_npad_styles;
+static uint32_t vibration_list(int session, const ipc_in_t *in, ipc_out_t *out) {   // IActiveVibrationDeviceList: ActivateVibrationDevice(handle) is the only command
+    (void)session; (void)out;
+    if (in->cmd == 0) return 0;
+    return unimpl("hid IActiveVibrationDeviceList", in);
 }
 static uint32_t hid(int session, const ipc_in_t *in, ipc_out_t *out) {
     (void)session;
     switch (in->cmd) {
     case 0: out->move[out->nmove++] = ipc_new_session("hid.res", applet_resource); return 0;   // CreateAppletResource(aruid) → IAppletResource
-    case 101: OUT32(0); return 0;                                  // GetSupportedNpadStyleSet → none
+    case 100: g_npad_styles = (uint32_t)in->args[0]; return 0;       // SetSupportedNpadStyleSet(style set, aruid)
+    case 101: OUT32(g_npad_styles); return 0;                      // GetSupportedNpadStyleSet → what the title set
+    case 102: case 103: case 104: return 0;                        // SetSupportedNpadIdType / ActivateNpad / DeactivateNpad
     case 106: out->copy[out->ncopy++] = kernel_event_new(0); return 0;   // AcquireNpadStyleSetUpdateEventHandle → event
     case 108: OUT64(0); return 0;                                  // GetPlayerLedPattern
     case 121: OUT64(0); return 0;                                  // GetNpadJoyHoldType
-    case 124: case 125: case 126: case 127: return 0;
+    case 11: case 66: case 67: case 120: case 122: case 123: case 124: case 125: case 126: case 127: case 128: return 0;   // touch screen, six-axis sensor, joy hold type, joy assignment, handheld mode: nothing to configure
+    case 203: out->move[out->nmove++] = ipc_new_session("hid.vib", vibration_list); return 0;   // CreateActiveVibrationDeviceList
     default: return hid_permissive("hid", in);
     }
 }

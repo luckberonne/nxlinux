@@ -27,7 +27,6 @@ A C `...` variadic hook cannot be used here (`hle_call` carries registers only).
 ## Retail titles: services answered at the IPC level (`ipc.c`, `svc/ipc_*.c`)
 A retail title (started at its `rtld`, not through the symbol hooks above) talks to the services through its own SDK, so the host answers the HIPC/CMIF requests of `SendSyncRequest`:
 sm:, lm, apm, aoc:u (`ListAddOnContent` family; the list-changed event is command 7 in the 1.0.0 SDK, 8 in the 4.x one), pctl, appletOE, fsp-srv (data storage from the RomFS image,
-save data under `work/save/<title>`, system data: the MiiModel stand-in, anything else "not found"), nvdrv (a stub; command 13 is not implemented), hid (a zeroed shared memory; commands 11, 100,
-102, 103, 120 and 128 are answered empty), set, mii (`mii:u`/`mii:e` database: empty, `BuildRandom`/`BuildDefault` return a default CharInfo), prepo, pl:u (commands 0 to 5), audren:u (the 1.0.0 and SDK 4
+save data under `work/save/<title>`, system data: the MiiModel stand-in, anything else "not found"), nvdrv (a stub; command 13 is not implemented), hid (shared memory with player 1's Pro Controller npad, fed from the keyboard and a gamepad by SDL; style set, npad activation, six-axis, joy hold and vibration-list commands are accepted), set, mii (`mii:u`/`mii:e` database: empty, `BuildRandom`/`BuildDefault` return a default CharInfo), prepo, pl:u (commands 0 to 5), audren:u (the 1.0.0 and SDK 4
 formats). Symbol hooks that still apply to a retail title: nn::vi / nvn loader / nn::oe notification and theme calls (`hle_vi32.c`, `hle_oe32.c`, `hle_oe.c`), nn::account (`hle_account32.c`),
 and the two Mii validity checks (`hle_mii32.c`). `docs/mk8d-bringup.md` lists what a title needed and how each part was found.
