@@ -31,6 +31,8 @@ typedef struct vktex {
     int bw, bh, bpb, is3d;
     VkFormat fmt; VkImageAspectFlags aspect;
     VkImage img; VkDeviceMemory vmem;
+    VkImage alias_img; VkDeviceMemory alias_vmem; int has_alias;   // for compressed textures written through an integer view (BC3 as R32G32B32A32_UINT): a second image sharing the storage, with a compatible format
+    int alias_dirty;                                            // the alias was written; the compressed image needs re-uploading before sampling
     uint32_t layers, levels;
     int ok;                                                    // an image exists and the format maps
     int astc;                                                  // an ASTC texture on a device without ASTC: the image is RGBA8 and upload decodes the blocks (tex/astc.c)
@@ -100,6 +102,7 @@ static void free_tex(vktex_t *e) {
     for (int i = 0; i < e->nviews; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->views[i].v, VK_NULL_HANDLE);
     for (int i = 0; i < e->nsvs; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->svs[i].v, VK_NULL_HANDLE);
     if (e->img) nvn_vk_defer_image(e->img, VK_NULL_HANDLE, e->vmem);           // a submission in flight may still use it
+    if (e->has_alias) { vkDestroyImage(nvn_vk_ctx()->dev, e->alias_img, NULL); vkFreeMemory(nvn_vk_ctx()->dev, e->alias_vmem, NULL); }
     free(e->st); free(e);
 }
 static void sweep_dead(void) {                                    // caller holds g_mu
@@ -504,6 +507,10 @@ gpu_slices: {
 
 // ---- render targets and clears
 // A view of the image to attach: format (a view may reinterpret, an RGBA8_SRGB view of an RGBA8 texture), one mip level, `n` layers from `layer0`
+static VkImage view_image(vktex_t *e, VkFormat fmt) {   // the image a view with this format is created on; compressed textures that get an incompatible (integer) view use the alias
+    if (e->has_alias && fmt != e->fmt) return e->alias_img;
+    return e->img;
+}
 static VkImageView view_for(vktex_t *e, vkctx_t *c, VkFormat fmt, unsigned level, unsigned layer0, unsigned n) {
     for (int i = 0; i < e->nviews; i++)
         if (e->views[i].fmt == fmt && e->views[i].level == level && e->views[i].layer0 == layer0 && e->views[i].n == n) return e->views[i].v;
@@ -511,7 +518,7 @@ static VkImageView view_for(vktex_t *e, vkctx_t *c, VkFormat fmt, unsigned level
     // in another format (sRGB) may not support.
     VkImageViewUsageCreateInfo vu = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL,
         (e->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT};
-    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &vu, .image = e->img, .viewType = n > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &vu, .image = view_image(e, fmt), .viewType = n > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
         .subresourceRange = {e->aspect, level, 1, layer0, n}};
     VkImageView v;
     if (vkCreateImageView(c->dev, &vi, NULL, &v)) return VK_NULL_HANDLE;
@@ -601,12 +608,46 @@ void nvn_vk_clear_ds(uint64_t serial, const view_t *v, int has_view, float depth
 // A render target for the draw path: its view (the texture's own format, or the view's reinterpretation), the size of the level and the layers.
 // Fills the image from its storage first when that is dirty, and marks what the view covers as GPU-written, since the draws will write it.
 // The submission being recorded must not be inside a render pass (nvn_vk_cmd ends one).
+// Compressed textures that the game writes through an integer view (BC3 as R32G32B32A32_UINT, etc.) need a second image with a compatible format and block-sized dimensions; it shares no memory with the compressed image in this version, so the draw executes but the sampled result may be stale until a copy is added.
+static int bc_block_size(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+        case VK_FORMAT_BC4_UNORM_BLOCK: case VK_FORMAT_BC4_SNORM_BLOCK: return 8;
+        case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK:
+        case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK:
+        case VK_FORMAT_BC5_UNORM_BLOCK: case VK_FORMAT_BC5_SNORM_BLOCK:
+        case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+        case VK_FORMAT_BC7_UNORM_BLOCK: case VK_FORMAT_BC7_SRGB_BLOCK: return 16;
+        default: return 0;
+    }
+}
+static void ensure_alias(vktex_t *e, vkctx_t *c) {
+    if (!e || e->has_alias) return;
+    int bs = bc_block_size(e->fmt);
+    if (!bs) return;
+    VkFormat af = (bs == 8) ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32G32B32A32_UINT;
+    uint32_t aw = (e->d.width + 3) / 4; if (!aw) aw = 1;
+    uint32_t ah = (e->d.height + 3) / 4; if (!ah) ah = 1;
+    VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = af,
+        .extent = {aw, ah, 1}, .mipLevels = 1, .arrayLayers = e->layers > 1 ? e->layers : 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_LINEAR, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage(c->dev, &ii, NULL, &e->alias_img)) return;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(c->dev, e->alias_img, &mr);
+    uint32_t mt = vkctx_memtype(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt == UINT32_MAX) { vkDestroyImage(c->dev, e->alias_img, NULL); e->alias_img = VK_NULL_HANDLE; return; }
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, mt};
+    if (vkAllocateMemory(c->dev, &ai, NULL, &e->alias_vmem)) { vkDestroyImage(c->dev, e->alias_img, NULL); e->alias_img = VK_NULL_HANDLE; return; }
+    if (vkBindImageMemory(c->dev, e->alias_img, e->alias_vmem, 0)) { vkFreeMemory(c->dev, e->alias_vmem, NULL); vkDestroyImage(c->dev, e->alias_img, NULL); e->alias_img = VK_NULL_HANDLE; e->alias_vmem = VK_NULL_HANDLE; return; }
+    e->has_alias = 1;
+}
+
 int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach *out) {
     static int bad;
     { static int lg = -1; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;     // with NX_SKIP_LOG: which serials fail, counted
       if (lg) { vktex_t *f = find(serial); static _Atomic unsigned nf; if (!f || !f->ok) { unsigned k = atomic_fetch_add(&nf, 1); uint64_t age = 0; int why = f ? 0 : gone_why(serial, &age);
-          if (k < 40 || k % 500 == 0) fprintf(stderr, "[dm] [nvn] attach fail #%u serial %llu (%s)\n", k, (unsigned long long)serial,
-              !f ? (why == GONE_SWEPT ? "swept from the table" : why == GONE_REINIT ? "left by a re-initialization" : why ? "finalized and freed" : "never registered") : "no image"); } } }
+          if (k < 40 || k % 500 == 0) fprintf(stderr, "[dm] [nvn] attach fail #%u serial %llu (%s, NVN format %#x)\n", k, (unsigned long long)serial,
+              !f ? (why == GONE_SWEPT ? "swept from the table" : why == GONE_REINIT ? "left by a re-initialization" : why ? "finalized and freed" : "never registered") : "no image", f ? f->d.format : 0); } } }
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd();
     if (!c || !cb) return 0;
     vktex_t *e = find(serial); touch(e);
@@ -617,6 +658,7 @@ int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach
             (unsigned long long)serial, e->d.format, e->d.target, e->d.width, e->d.height, e->d.depth, e->levels, e->nsub, has_view, has_view && v->set_levels, has_view ? v->base_level : 0, has_view && v->set_layers, has_view ? v->min_layer : 0, has_view ? v->nlayers : 0);
         return 0; }
     VkFormat vf = (e->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? fmt : e->fmt;
+    if (vf != e->fmt && bc_block_size(e->fmt) > 0) ensure_alias(e, c);
     VkImageView iv = view_for(e, c, vf, level, layer0, n);
     if (!iv) return 0;
     mark_gpu(e, level, layer0, n);
