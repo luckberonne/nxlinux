@@ -250,7 +250,10 @@ static void upload(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
     unsigned *slv = calloc(nreg ? nreg : 1, sizeof *slv), *sly = calloc(nreg ? nreg : 1, sizeof *sly);
     for (unsigned lv = 0; lv < e->levels; lv++) {
         uint32_t w, h, z; level_dims(e, lv, &w, &h, &z);
-        size_t wb = (size_t)((w + e->bw - 1) / e->bw) * e->bpb, hb = (h + e->bh - 1) / e->bh;
+        int is3comp = (e->bpb == 3 || e->bpb == 6 || e->bpb == 12);
+        size_t wb = is3comp ? (size_t)w * (e->bpb == 3 ? 4 : (e->bpb == 6 ? 8 : 16))  // expand 3->4 bytes per pixel
+            : (size_t)((w + e->bw - 1) / e->bw) * e->bpb;
+        size_t hb = (h + e->bh - 1) / e->bh;
         for (unsigned ly = 0; ly < e->nsub; ly++) {
             if (!(__atomic_fetch_and(&SUB(e, lv, ly), (uint8_t)~F_DIRTY, __ATOMIC_ACQ_REL) & F_DIRTY)) continue;     // clean: the image is current
             total = (total + 15) & ~(size_t)15;
@@ -263,8 +266,21 @@ static void upload(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
     if (!n || !total || vkbuf_create(c, &st, total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1)) goto done;
     if (e->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) {      // already linear: rows at d.stride, level 0 only
         uint32_t w, h, z; level_dims(e, 0, &w, &h, &z);
-        size_t wb = (size_t)((w + e->bw - 1) / e->bw) * e->bpb, hb = (h + e->bh - 1) / e->bh, stride = e->d.stride ? e->d.stride : wb;
-        for (size_t y = 0; y < hb; y++) memcpy((uint8_t *)st.map + off[0] + y * wb, e->mem + y * stride, wb);
+        int is3comp = (e->bpb == 3 || e->bpb == 6 || e->bpb == 12);
+        size_t wb3 = (size_t)((w + e->bw - 1) / e->bw) * e->bpb, hb = (h + e->bh - 1) / e->bh, stride = e->d.stride ? e->d.stride : wb3;
+        size_t wb4 = is3comp ? (size_t)w * (e->bpb == 3 ? 4 : (e->bpb == 6 ? 8 : 16)) : wb3;
+        if (is3comp) {
+            for (size_t y = 0; y < hb; y++) {
+                uint8_t *src = (uint8_t *)e->mem + y * stride;
+                uint8_t *dst = (uint8_t *)st.map + off[0] + y * wb4;
+                for (size_t x = 0; x < w; x++) {
+                    memcpy(dst + x * 4, src + x * 3, 3);
+                    dst[x * 4 + 3] = 0xFF;
+                }
+            }
+        } else {
+            for (size_t y = 0; y < hb; y++) memcpy((uint8_t *)st.map + off[0] + y * wb3, e->mem + y * stride, wb3);
+        }
         n = 1;
     } else {
         for (size_t i = 0; i < n; i++) {
@@ -275,9 +291,34 @@ static void upload(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
                 if (nvn_deswizzle(&e->d, slv[i], sly[i], e->mem, tmp, pitch[i])) memset(tmp, 0, bytes);
                 for (uint32_t zz = 0; zz < z; zz++) astc_decode_image(tmp + zz * pitch[i] * hb, (int)w, (int)h, e->bw, e->bh, (uint8_t *)st.map + off[i] + (size_t)zz * w * h * 4);
                 free(tmp);
-            } else if (nvn_deswizzle(&e->d, slv[i], sly[i], e->mem, (uint8_t *)st.map + off[i], pitch[i])) {
-                static _Atomic int nfail; if (atomic_fetch_add(&nfail, 1) < 8) fprintf(stderr, "[dm] [RED] [nvn] texture upload: de-swizzle of level %u layer %u failed (%ux%ux%u, NVN format %#x, target %d, flags %#x, stride %u): the level stays zero\n", slv[i], sly[i], e->d.width, e->d.height, e->d.depth, e->d.format, e->d.target, e->d.flags, e->d.stride);
-                memset((uint8_t *)st.map + off[i], 0, pitch[i]);
+            } else {
+                int is3comp = (e->bpb == 3 || e->bpb == 6 || e->bpb == 12);
+                if (is3comp) {
+                    uint32_t w, h, z; level_dims(e, slv[i], &w, &h, &z);
+                    size_t hb = (h + e->bh - 1) / e->bh;
+                    size_t wb3 = (size_t)w * e->bpb;  // 3 bytes per pixel (source)
+                    size_t tmp_sz = wb3 * hb * z ? wb3 * hb * z : 1;
+                    uint8_t *tmp = calloc(tmp_sz, 1);
+                    if (nvn_deswizzle(&e->d, slv[i], sly[i], e->mem, tmp, wb3)) {
+                        static _Atomic int nfail; if (atomic_fetch_add(&nfail, 1) < 8) fprintf(stderr, "[dm] [RED] [nvn] texture upload: de-swizzle of level %u layer %u failed (%ux%ux%u, NVN format %#x, target %d, flags %#x, stride %u): the level stays zero\n", slv[i], sly[i], e->d.width, e->d.height, e->d.depth, e->d.format, e->d.target, e->d.flags, e->d.stride);
+                        memset((uint8_t *)st.map + off[i], 0, pitch[i] * hb * z);
+                    } else {
+                        // Expand 3 bytes -> 4 bytes per pixel (RGB -> RGBA, alpha = 1)
+                        size_t wb4 = pitch[i];
+                        for (size_t y = 0; y < hb * z; y++) {
+                            uint8_t *src = tmp + y * wb3;
+                            uint8_t *dst = (uint8_t *)st.map + off[i] + y * wb4;
+                            for (size_t x = 0; x < w; x++) {
+                                memcpy(dst + x * 4, src + x * 3, 3);
+                                dst[x * 4 + 3] = 0xFF;  // alpha = 1.0 (ignored by shader as RGBX, but set for correctness)
+                            }
+                        }
+                    }
+                    free(tmp);
+                } else if (nvn_deswizzle(&e->d, slv[i], sly[i], e->mem, (uint8_t *)st.map + off[i], pitch[i])) {
+                    static _Atomic int nfail; if (atomic_fetch_add(&nfail, 1) < 8) fprintf(stderr, "[dm] [RED] [nvn] texture upload: de-swizzle of level %u layer %u failed (%ux%ux%u, NVN format %#x, target %d, flags %#x, stride %u): the level stays zero\n", slv[i], sly[i], e->d.width, e->d.height, e->d.depth, e->d.format, e->d.target, e->d.flags, e->d.stride);
+                    memset((uint8_t *)st.map + off[i], 0, pitch[i]);
+                }
             }
         }
     }

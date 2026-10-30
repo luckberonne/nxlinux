@@ -57,7 +57,9 @@ static const ent T[0x9D] = {
     // 0x19-0x24 RGB8 / RGB16 / RGB32 three-component: sampling support for 3-component images is not universal, so they return 0 as in nxnative.
     // Handling: on upload expand per pixel to the 4-component format of the same kind (RGBA8 / RGBA16 / RGBA32, a = 1; for integer kinds a = raw value 1), sampled as RGBX;
     //           when used as a buffer texture (target BUFFER), the shader reads the 3 components manually instead.
-    [0x19] = N, N, N, N, N, N, N, N, N, N, N, N,
+    [0x19] = S(RGBA8_UNORM), S(RGBA8_SNORM), S(RGBA8_UINT), S(RGBA8_SINT),
+    [0x1D] = S(RGBA16_SFLOAT), S(RGBA16_UNORM), S(RGBA16_SNORM), S(RGBA16_UINT), S(RGBA16_SINT),
+    [0x22] = S(RGBA32_SFLOAT), S(RGBA32_UINT), S(RGBA32_SINT),
     [0x25] = E(RGBA8_UNORM), E(RGBA8_SNORM), E(RGBA8_UINT), E(RGBA8_SINT),
     [0x29] = E(RGBA16_SFLOAT), E(RGBA16_UNORM), E(RGBA16_SNORM), E(RGBA16_UINT), E(RGBA16_SINT),
     [0x2E] = E(RGBA32_SFLOAT), E(RGBA32_UINT), E(RGBA32_SINT),

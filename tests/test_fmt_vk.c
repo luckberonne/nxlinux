@@ -32,8 +32,8 @@ int main(void) {
     CHECK(nvn_fmt_to_vk(0x9A, &f, NULL) == 1 && f == VK_FORMAT_B8G8R8A8_UNORM);
     CHECK(nvn_fmt_to_vk(0x9B, &f, s) == 1 && f == VK_FORMAT_B8G8R8A8_SRGB && s[3] == VK_COMPONENT_SWIZZLE_ONE);
     // No counterpart: the 3-component formats, out-of-range numbers, zero
-    CHECK(nvn_fmt_to_vk(0x19, &f, NULL) == 0 && f == VK_FORMAT_UNDEFINED);
-    CHECK(nvn_fmt_to_vk(0x24, &f, NULL) == 0 && f == VK_FORMAT_UNDEFINED);
+    CHECK(nvn_fmt_to_vk(0x19, &f, NULL) == 2 && f == VK_FORMAT_R8G8B8A8_UNORM);
+    CHECK(nvn_fmt_to_vk(0x24, &f, NULL) == 2 && f == VK_FORMAT_R32G32B32A32_SINT);
     CHECK(nvn_fmt_to_vk(0, &f, NULL) == 0 && f == VK_FORMAT_UNDEFINED);
     CHECK(nvn_fmt_to_vk(0x9D, &f, NULL) == 0 && f == VK_FORMAT_UNDEFINED);
     CHECK(nvn_fmt_to_vk(-1, &f, NULL) == 0 && f == VK_FORMAT_UNDEFINED);
