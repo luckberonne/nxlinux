@@ -40,6 +40,8 @@ typedef struct vktex {
     struct { VkFormat fmt; unsigned level, layer0, n; VkImageView v; } views[16]; int nviews;   // attachment views made so far; touched by the submit thread only
     struct { VkFormat fmt; uint32_t l0, nl, a0, na; int vtype; uint32_t swz; VkImageView v; } svs[8]; int nsvs;   // sampling views, the same way
     uint64_t hash, hash_ms;                                    // the storage's hash and when it was taken (recheck below)
+    int dead;                                                  // finalized: waits in g_dead to be freed
+    uint64_t last_use;                                         // when a replay last attached or sampled it (g_use_tick)
 } vktex_t;
 enum { F_DIRTY = 1, F_GPU = 2 };
 #define SUB(e, lv, ly) ((e)->st[(size_t)(lv) * (e)->nsub + (ly)])
@@ -66,8 +68,38 @@ static VkFormat vf_fix(const vktex_t *e, VkFormat f) {
 }
 static VkFormatFeatureFlags features(vkctx_t *c, VkFormat f) { VkFormatProperties p; vkGetPhysicalDeviceFormatProperties(c->pd, f, &p); return p.optimalTilingFeatures; }
 
+// A finalized texture stays findable: an NVN texture is a description of pool memory, and a title may Finalize an object (or a copy of it: they are plain
+// memory) while the commands that use it keep being replayed (Mario Kart 8 Deluxe finalizes its scene targets right after making them, and makes other
+// textures over the same memory). The host frees finalized textures least recently used first, once they hold more than DEAD_BYTES or number DEAD_MAX.
+enum { DEAD_MAX = 4096 };
+#define DEAD_BYTES (768ull << 20)
+static struct dead { vktex_t *e; } *g_dead; static size_t g_ndead, g_cdead; static uint64_t g_dead_bytes;
+static _Atomic uint64_t g_use_tick;
+static void touch(vktex_t *e) { if (e) e->last_use = atomic_fetch_add(&g_use_tick, 1) + 1; }
+static void free_tex(vktex_t *e) {
+    for (int i = 0; i < e->nviews; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->views[i].v, VK_NULL_HANDLE);
+    for (int i = 0; i < e->nsvs; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->svs[i].v, VK_NULL_HANDLE);
+    if (e->img) nvn_vk_defer_image(e->img, VK_NULL_HANDLE, e->vmem);           // a submission in flight may still use it
+    free(e->st); free(e);
+}
+static void sweep_dead(void) {                                    // caller holds g_mu
+    vktex_t *gone[64]; int ngone = 0;
+    while ((g_ndead > DEAD_MAX || g_dead_bytes > DEAD_BYTES) && ngone < 64) {
+        size_t lru = 0;
+        for (size_t i = 1; i < g_ndead; i++) if (g_dead[i].e->last_use < g_dead[lru].e->last_use) lru = i;
+        vktex_t *e = g_dead[lru].e; g_dead[lru] = g_dead[--g_ndead]; g_dead_bytes -= e->L.size;
+        for (vktex_t **p = &g_bucket[e->serial & (NB - 1)]; *p; p = &(*p)->next) if (*p == e) { *p = e->next; break; }
+        gone[ngone++] = e;
+    }
+    if (!ngone) return;
+    pthread_mutex_unlock(&g_mu);
+    for (int i = 0; i < ngone; i++) free_tex(gone[i]);
+    pthread_mutex_lock(&g_mu);
+}
+static long tex_trace(void) { static long s = -2; if (s == -2) s = getenv("NX_TEX_TRACE") ? atol(getenv("NX_TEX_TRACE")) : -1; return s; }   // NX_TEX_TRACE=<serial>: its creation and release
 void mtl_tex_init(const tex_t *t) {
     vkctx_t *c = nvn_vk_ctx();
+    if (tex_trace() >= 0 && (uint64_t)tex_trace() == t->serial) fprintf(stderr, "[dm] [nvn] trace: texture serial %llu initialized %ux%ux%u fmt %#x target %d flags %#x (vulkan %s)\n", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.flags, c ? "up" : "not up");
     if (!c || !t->serial) return;
     static int bad_fmt, bad_ms, bad_img;
     vktex_t *e = calloc(1, sizeof *e);
@@ -100,7 +132,8 @@ void mtl_tex_init(const tex_t *t) {
         if (f & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         int cube = t->d.target == NVN_TEXTURE_TARGET_CUBEMAP || t->d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
         VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0),
+            .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0)
+                   | (e->is3d && (u & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0),   // a slice of a 3D texture can be a render target (colour LUTs)
             .imageType = e->is3d ? VK_IMAGE_TYPE_3D : t->d.target == NVN_TEXTURE_TARGET_1D || t->d.target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D,
             .format = e->fmt, .extent = {t->d.width ? t->d.width : 1, t->d.height ? t->d.height : 1, e->is3d && t->d.depth ? t->d.depth : 1},
             .mipLevels = e->levels, .arrayLayers = e->layers, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = u,
@@ -123,21 +156,18 @@ keep:
 }
 
 void mtl_tex_release(tex_t *t) {
+    if (tex_trace() >= 0 && (uint64_t)tex_trace() == t->serial) fprintf(stderr, "[dm] [nvn] trace: texture serial %llu finalized\n", (unsigned long long)t->serial);
     pthread_mutex_lock(&g_mu);
-    for (vktex_t **p = &g_bucket[t->serial & (NB - 1)]; *p; p = &(*p)->next)
-        if ((*p)->serial == t->serial) {
-            vktex_t *e = *p; *p = e->next;
-            pthread_mutex_unlock(&g_mu);
-            for (int i = 0; i < e->nviews; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->views[i].v, VK_NULL_HANDLE);
-            for (int i = 0; i < e->nsvs; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->svs[i].v, VK_NULL_HANDLE);
-            if (e->img) nvn_vk_defer_image(e->img, VK_NULL_HANDLE, e->vmem);           // a submission in flight may still use it
-            free(e->st); free(e);
-            return;
-        }
+    vktex_t *e = g_bucket[t->serial & (NB - 1)];
+    while (e && e->serial != t->serial) e = e->next;
+    if (e && !e->dead) {
+        e->dead = 1;
+        if (g_ndead == g_cdead) { g_cdead = g_cdead ? g_cdead * 2 : 256; g_dead = realloc(g_dead, g_cdead * sizeof *g_dead); }
+        g_dead[g_ndead++] = (struct dead){e}; g_dead_bytes += e->L.size;
+    }
+    sweep_dead();
     pthread_mutex_unlock(&g_mu);
 }
-
-// The CPU wrote subresources: the storage is their truth again and the image must be filled from it
 void mtl_tex_cpu_written_sub(const tex_t *t, unsigned level, unsigned layer0, unsigned nlayers) {
     vktex_t *e = find(t->serial);
     if (!e || level >= e->levels) return;
@@ -460,7 +490,9 @@ static int clear_target(vktex_t *e, const view_t *v, int has_view, const int *re
     *n = has_view && v->set_layers && v->nlayers ? v->nlayers : 1;
     *fmt = e->fmt;
     if (has_view && v->set_format) { VkFormat vf; if (nvn_fmt_to_vk(v->format, &vf, NULL) && vf != VK_FORMAT_UNDEFINED) *fmt = vf_fix(e, vf); }
-    if (e->is3d || *level >= e->levels || *layer0 + *n > e->nsub) return 0;
+    if (*level >= e->levels) return 0;
+    if (e->is3d) { uint32_t dz = e->d.depth >> *level ? e->d.depth >> *level : 1; if (*layer0 + *n > dz) return 0; }   // the layers are depth slices (2D views of a 2D-array-compatible image)
+    else if (*layer0 + *n > e->nsub) return 0;
     uint32_t lw, lh, lz; level_dims(e, *level, &lw, &lh, &lz);
     int x0 = 0, y0 = 0, x1 = (int)lw, y1 = (int)lh;
     if (rect) { x0 = rect[0] > 0 ? rect[0] : 0; y0 = rect[1] > 0 ? rect[1] : 0; x1 = rect[0] + rect[2] < x1 ? rect[0] + rect[2] : x1; y1 = rect[1] + rect[3] < y1 ? rect[1] + rect[3] : y1; }
@@ -469,6 +501,7 @@ static int clear_target(vktex_t *e, const view_t *v, int has_view, const int *re
     return 1;
 }
 static void mark_gpu(vktex_t *e, unsigned level, unsigned layer0, unsigned n) {
+    if (e->is3d) { __atomic_store_n(&SUB(e, level, 0), F_GPU, __ATOMIC_RELEASE); return; }   // a 3D level is one subresource
     for (unsigned ly = layer0; ly < layer0 + n && ly < e->nsub; ly++) __atomic_store_n(&SUB(e, level, ly), F_GPU, __ATOMIC_RELEASE);
 }
 
@@ -533,12 +566,17 @@ void nvn_vk_clear_ds(uint64_t serial, const view_t *v, int has_view, float depth
 // The submission being recorded must not be inside a render pass (nvn_vk_cmd ends one).
 int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach *out) {
     static int bad;
+    { static int lg = -1; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;     // with NX_SKIP_LOG: which serials fail, counted
+      if (lg) { vktex_t *f = find(serial); static _Atomic unsigned nf; if (!f || !f->ok) { unsigned k = atomic_fetch_add(&nf, 1); if (k < 40 || k % 500 == 0) fprintf(stderr, "[dm] [nvn] attach fail #%u serial %llu (%s)\n", k, (unsigned long long)serial, !f ? "unregistered" : "no image"); } } }
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd();
     if (!c || !cb) return 0;
-    vktex_t *e = find(serial);
+    vktex_t *e = find(serial); touch(e);
     if (!use(e, c, cb)) { static int none; if (!__atomic_exchange_n(&none, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [RED] [nvn] render target serial %llu has no Vulkan image (%s)\n", (unsigned long long)serial, e ? "its image could not be made" : "never registered"); return 0; }
     unsigned level, layer0, n; VkFormat fmt; VkRect2D area;
-    if (!clear_target(e, v, has_view, NULL, &level, &layer0, &n, &fmt, &area) || !n) { red_once(&bad, "the render target is a 3D texture or names a level or layer that does not exist", e->d.format); return 0; }
+    if (!clear_target(e, v, has_view, NULL, &level, &layer0, &n, &fmt, &area) || !n) {
+        if (!__atomic_exchange_n(&bad, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [RED] [nvn] render target serial %llu cannot be attached: NVN format %#x target %d, %ux%ux%u, %u levels, %u layers; view %d (levels %d base %u, layers %d min %u n %u)\n",
+            (unsigned long long)serial, e->d.format, e->d.target, e->d.width, e->d.height, e->d.depth, e->levels, e->nsub, has_view, has_view && v->set_levels, has_view ? v->base_level : 0, has_view && v->set_layers, has_view ? v->min_layer : 0, has_view ? v->nlayers : 0);
+        return 0; }
     VkFormat vf = (e->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? fmt : e->fmt;
     VkImageView iv = view_for(e, c, vf, level, layer0, n);
     if (!iv) return 0;
@@ -575,7 +613,7 @@ static VkComponentSwizzle swz_compose(unsigned user, const VkComponentSwizzle fm
 int nvn_vk_tex_sampled(uint64_t serial, const view_t *v, int has_view, int tex_set_swz, unsigned tex_swz, VkImageView *out, int *code) {
     static int bad;
     vkctx_t *c = nvn_vk_ctx();
-    vktex_t *e = find(serial);
+    vktex_t *e = find(serial); touch(e);
     if (!c || !e || !e->ok) return 0;
     int dirty = !e->inited;
     for (size_t i = 0; i < (size_t)e->levels * e->nsub && !dirty; i++) dirty = (__atomic_load_n(&e->st[i], __ATOMIC_ACQUIRE) & F_DIRTY) != 0;
