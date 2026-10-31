@@ -733,7 +733,10 @@ static int trace_draw(const char *what, uint32_t count, int *skip_it) {
         for (int i = 0; i < S.nattr && i < 16; i++) { va_st a; memcpy(&a, &S.attr[i], sizeof a); fprintf(stderr, " %d:f%#x/s%u", i, (unsigned)a.fmt, (unsigned)a.stream); }
         if (count <= 2000 || count >= 8000) { extern uint64_t nvn_vk_desc_serial(uint32_t); for (int st = 0; st < 6; st++) for (int sl = 0; sl < NTEXSLOT; sl++) if (S.tex[st][sl]) { uint64_t sr = nvn_vk_desc_serial(S.tex[st][sl]); if (sr) nvn_draw_trace_note_target(sr); } }   // the textures a small (lighting) draw reads are dumped too
         fprintf(stderr, " | tex");
-        for (int st = 0; st < 6; st++) for (int sl = 0; sl < NTEXSLOT; sl++) if (S.tex[st][sl]) { extern uint64_t nvn_vk_desc_serial(uint32_t); fprintf(stderr, " s%d.%d=id%u/smp%u/ser%llu", st, sl, S.tex[st][sl] & 0xfffff, S.tex[st][sl] >> 20, (unsigned long long)nvn_vk_desc_serial(S.tex[st][sl])); }
+        for (int st = 0; st < 6; st++) for (int sl = 0; sl < NTEXSLOT; sl++) if (S.tex[st][sl]) { extern uint64_t nvn_vk_desc_serial(uint32_t); extern int nvn_vk_debug_info(uint64_t, unsigned *, unsigned *, unsigned *, unsigned *, unsigned *);
+            uint64_t sr = nvn_vk_desc_serial(S.tex[st][sl]); unsigned tf = 0, tw = 0, th = 0, tl = 0, td = 0; int have = nvn_vk_debug_info(sr, &tf, &tw, &th, &tl, &td);
+            fprintf(stderr, " s%d.%d=id%u/smp%u/ser%llu", st, sl, S.tex[st][sl] & 0xfffff, S.tex[st][sl] >> 20, (unsigned long long)sr);
+            if (have) fprintf(stderr, "[%#x %ux%u l%u]", tf, tw, th, tl); }
         fprintf(stderr, "\n");
     }
     if (count >= 10000) for (int st = 0; st < 6; st++) for (int sl = 0; sl < 16; sl++) {      // the uniform buffers a large draw reads: where they are and what they start with

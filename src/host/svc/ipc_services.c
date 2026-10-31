@@ -249,6 +249,8 @@ static uint32_t storage(int session, const ipc_in_t *in, ipc_out_t *out) {
         uint64_t off = in->args[0] | (uint64_t)in->args[1] << 32, len = in->args[2] | (uint64_t)in->args[3] << 32;
         if (!in->nrecv || g_romfs_fd < 0) return 0x2d6402u;        // fs ResultInvalidArgument-like: no buffer / no image
         uint8_t *dst = (uint8_t *)in->recv[0].addr; uint64_t n = len < in->recv[0].size ? len : in->recv[0].size, done = 0;
+        { static int lg = -1; if (lg < 0) lg = getenv("NX_FS_LOG") != NULL;     // NX_FS_LOG=1: every RomFS read (offset, length, where it goes)
+          if (lg) fprintf(stderr, "[fs] romfs read offset %#llx length %#llx into %p\n", (unsigned long long)off, (unsigned long long)n, (void *)dst); }
         while (done < n) { ssize_t r = pread(g_romfs_fd, dst + done, n - done, off + done); if (r <= 0) break; done += (uint64_t)r; }
         if (done < n) memset(dst + done, 0, n - done);
         return 0;

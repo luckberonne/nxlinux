@@ -99,7 +99,7 @@ struct jitenv final : UserCallbacks {
             mprotect((void *)g_watch_page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
             memcpy((void *)a, &v, sizeof v);
             mprotect((void *)g_watch_page, 0x1000, PROT_READ | PROT_EXEC);
-            if constexpr (sizeof(T) <= 8) watched(a, sizeof v, (uint64_t)v); else watched(a, sizeof v, 0);
+            if constexpr (sizeof(T) <= 8) watched(a, sizeof v, (uint64_t)v); else { uint64_t w = 0; size_t o = g_watch > a ? (size_t)(g_watch - a) : 0; if (o < sizeof v) memcpy(&w, (const char *)&v + o, std::min<size_t>(8, sizeof v - o)); watched(a, sizeof v, w); }
             return;
         }
         memcpy((void *)a, &v, sizeof v);
@@ -111,7 +111,7 @@ struct jitenv final : UserCallbacks {
             mprotect((void *)g_watch_page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
             bool done = __atomic_compare_exchange_n((T *)a, &expected, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
             mprotect((void *)g_watch_page, 0x1000, PROT_READ | PROT_EXEC);
-            if (done) { if constexpr (sizeof(T) <= 8) watched(a, sizeof v, (uint64_t)v); else watched(a, sizeof v, 0); }
+            if (done) { if constexpr (sizeof(T) <= 8) watched(a, sizeof v, (uint64_t)v); else { uint64_t w = 0; size_t o = g_watch > a ? (size_t)(g_watch - a) : 0; if (o < sizeof v) memcpy(&w, (const char *)&v + o, std::min<size_t>(8, sizeof v - o)); watched(a, sizeof v, w); } }
             return done;
         }
         return __atomic_compare_exchange_n((T *)a, &expected, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
@@ -182,7 +182,8 @@ static std::unique_ptr<jitenv> make_env(unsigned id) {
     e->id = id;
     UserConfig cfg{};
     cfg.callbacks = e.get();
-    cfg.fastmem_pointer = 0;                    // guest address == host address
+    if (!getenv("NX_SLOWMEM")) cfg.fastmem_pointer = 0;     // guest address == host address (NX_SLOWMEM=1: no fast memory, every access goes through the callbacks)
+    if (getenv("NX_JIT_NOOPT")) cfg.optimizations = no_optimizations;        // NX_JIT_NOOPT=1: dynarmic's IR and dispatch optimizations off, to tell a translation bug from the title's own
     cfg.fastmem_address_space_bits = 48;
     cfg.silently_mirror_fastmem = false;
     cfg.fastmem_exclusive_access = false;       // exclusives go through MemoryWriteExclusive* (compare-exchange). Inline ones (true) were measured in the race: no faster (19.7-20.5 ms against 18.7-20.6), and dynarmic warns that they do not reproduce ABA

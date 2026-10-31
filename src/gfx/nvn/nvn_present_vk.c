@@ -208,6 +208,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         static int dump = -1; static unsigned nth; if (dump < 0) dump = getenv("NX_FRAME_DUMP") != NULL;
         nth++;
         if (dump && nth == 1000) { extern void nvn_vk_debug_texstats(void); nvn_vk_debug_texstats(); }
+        if (dump && getenv("NX_TEX_RAW")) { extern void nvn_vk_debug_raw(unsigned); nvn_vk_debug_raw(nth); }
         static int every = -1; if (every < 0) every = getenv("NX_FRAME_EVERY") ? atoi(getenv("NX_FRAME_EVERY")) : 0;   // NX_FRAME_EVERY=<n>: also every n-th frame
         if (dump && (nth == 100 || nth == 400 || nth == 1000 || nth == 2500 || (nth > 2500 && nth % 1500 == 0) || (every > 0 && nth % (unsigned)every == 0))) {
             size_t lit = 0; for (size_t i = 0; i < (size_t)w * h; i++) if (px[i * 4] | px[i * 4 + 1] | px[i * 4 + 2]) lit++;

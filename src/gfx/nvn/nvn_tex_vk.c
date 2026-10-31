@@ -337,6 +337,8 @@ static void to_general(vktex_t *e, VkCommandBuffer cb) {
 
 // De-swizzle the dirty subresources of the storage and copy them into the image
 static int bc_block_size(VkFormat f);
+static uint64_t storage_hash(const uint8_t *p, size_t n, int *allzero);
+static int storage_zero(const uint8_t *p, size_t n);
 static void upload(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
     static int skipped;
     if (!e->mem) return;
@@ -354,6 +356,11 @@ static void upload(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
         }
         if (any) nvn_vk_barrier_all(cb);
         return;
+    }
+    if (tex_trace() >= 0 && (uint64_t)tex_trace() == e->serial) {      // NX_TEX_TRACE=<serial>: what the storage holds at each upload (its hash, and how many of its 64 KB pages are not all zero)
+        size_t pg = 0, np = (e->L.size + 65535) / 65536; for (size_t q = 0; q < np; q++) { size_t n1 = e->L.size - q * 65536 < 65536 ? e->L.size - q * 65536 : 65536; pg += !storage_zero(e->mem + q * 65536, n1); }
+        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        fprintf(stderr, "[dm] [nvn] trace: texture serial %llu uploaded at %ld.%03ld s: hash %016llx, %zu of %zu pages of 64 KB hold data\n", (unsigned long long)e->serial, (long)t0.tv_sec % 1000, t0.tv_nsec / 1000000, (unsigned long long)storage_hash(e->mem, e->L.size, NULL), pg, np);
     }
     size_t nreg = (size_t)e->levels * e->nsub, total = 0, n = 0;
     VkBufferImageCopy *rg = calloc(nreg ? nreg : 1, sizeof *rg);
@@ -586,6 +593,46 @@ static void read_storage(const tex_t *t, unsigned level, unsigned layer, int z0,
         for (size_t y = 0; y < hb; y++) memcpy(dst + (size_t)(zbase + z) * img + y * row, src + (y0 + y) * lp + x0, wb);
     }
     free(lin);
+}
+// Debugging: level 0 of a texture as the GPU holds it, decoded by the GPU (a blit to RGBA8), as a PPM; -1 when there is no such image
+int nvn_vk_debug_gpu_ppm(uint64_t serial, const char *path) {
+    vktex_t *e = find(serial); vkctx_t *c = nvn_vk_ctx(); if (!e || !e->ok || !c || !(e->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) return -1;
+    uint32_t w = e->d.width, h = e->d.height; int srgb = e->fmt == VK_FORMAT_BC7_SRGB_BLOCK || e->fmt == VK_FORMAT_BC1_RGBA_SRGB_BLOCK || e->fmt == VK_FORMAT_BC3_SRGB_BLOCK || e->fmt == VK_FORMAT_R8G8B8A8_SRGB;
+    vkimg_t dst; vkbuf_t out;
+    if (vkimg_create2d(c, &dst, srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, w, h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 1)) return -1;
+    if (vkbuf_create(c, &out, (VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) { vkimg_destroy(c, &dst); return -1; }
+    VkCommandBuffer cb = nvn_vk_oneshot_begin(); if (!cb) { vkbuf_destroy(c, &out); vkimg_destroy(c, &dst); return -1; }
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = dst.img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int)w, (int)h, 1}}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int)w, (int)h, 1}}};
+    vkCmdBlitImage(cb, e->img, VK_IMAGE_LAYOUT_GENERAL, dst.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    VkBufferImageCopy cp = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, dst.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buf, 1, &cp);
+    VkFence f = VK_NULL_HANDLE; int r = nvn_vk_oneshot_submit(cb, &f) || nvn_vk_oneshot_wait(f);
+    nvn_vk_oneshot_release(cb, f);
+    if (!r) { FILE *o = fopen(path, "wb"); if (o) { fprintf(o, "P6\n%u %u\n255\n", w, h); for (size_t i = 0; i < (size_t)w * h; i++) fwrite((uint8_t *)out.map + i * 4, 1, 3, o); fclose(o); } }
+    vkbuf_destroy(c, &out); vkimg_destroy(c, &dst);
+    return r ? -1 : 0;
+}
+// Debugging (NX_TEX_RAW=<serial> with NX_FRAME_DUMP, at every dumped frame): level 0 of a BC texture de-swizzled as raw blocks, its storage as the title wrote it, and the GPU's decoded view of the image
+void nvn_vk_debug_raw(unsigned nth) {
+    if (!getenv("NX_TEX_RAW") || !getenv("NX_FRAME_DUMP")) return;
+    unsigned ev = getenv("NX_FRAME_EVERY") ? (unsigned)atoi(getenv("NX_FRAME_EVERY")) : 0;         // the frames the presenter dumps
+    if (!(nth == 100 || nth == 400 || nth == 1000 || (ev && nth % ev == 0))) return;
+    uint64_t sr = (uint64_t)atoll(getenv("NX_TEX_RAW")); vktex_t *e = find(sr);
+    if (!e || !e->mem) { fprintf(stderr, "[dm] [nvn] raw blocks of serial %llu: no such texture with storage\n", (unsigned long long)sr); return; }
+    char gp[600]; snprintf(gp, sizeof gp, "%s.%u.gpu_%llu.ppm", getenv("NX_FRAME_DUMP"), nth, (unsigned long long)sr);
+    fprintf(stderr, "[dm] [nvn] GPU view of serial %llu at frame %u to %s: %d, storage hash %016llx\n", (unsigned long long)sr, nth, gp, nvn_vk_debug_gpu_ppm(sr, gp), (unsigned long long)storage_hash(e->mem, e->L.size, NULL));
+    if (nth != 1000) return;
+    size_t bs = bc_block_size(e->fmt) ? bc_block_size(e->fmt) : e->bpb; uint32_t bw4 = (e->d.width + e->bw - 1) / e->bw, bh4 = (e->d.height + e->bh - 1) / e->bh; uint8_t *lin = malloc((size_t)bw4 * bh4 * bs);
+    if (!nvn_deswizzle(&e->d, 0, 0, e->mem, lin, (size_t)bw4 * bs)) { char fn[600]; snprintf(fn, sizeof fn, "%s.raw_%llu.bin", getenv("NX_FRAME_DUMP"), (unsigned long long)sr);
+        FILE *o = fopen(fn, "wb"); if (o) { fwrite(lin, 1, (size_t)bw4 * bh4 * bs, o); fclose(o); } fprintf(stderr, "[dm] [nvn] raw blocks of serial %llu: %ux%u blocks of %zu bytes to %s, storage at %p\n", (unsigned long long)sr, bw4, bh4, bs, fn, (const void *)e->mem); }
+    free(lin);
+    char fs[600]; snprintf(fs, sizeof fs, "%s.swz_%llu.bin", getenv("NX_FRAME_DUMP"), (unsigned long long)sr);
+    FILE *o2 = fopen(fs, "wb"); if (o2) { fwrite(e->mem, 1, (size_t)e->L.size, o2); fclose(o2); }
 }
 // Debugging: how many registered textures hold any non-zero byte in their level 0 (read as the title wrote them); prints a summary by format
 long nvn_vk_debug_lit(uint64_t serial, size_t *total, const char *ppm);

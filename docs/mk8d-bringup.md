@@ -218,7 +218,10 @@ All are environment variables; nothing costs anything when unset.
 | `NX_FRAME_EVERY=<n>` | with `NX_FRAME_DUMP`: also every n-th frame |
 | `NX_MOVIE_LOG=1` | the movie decoder takeover's calls (`hle_movie.c`) |
 | `NX_HID_TAP=<bit>[:<s>[:<ms>]]` | press that `NpadButton` bit (0 = A) for 150 ms (or `<ms>`) every `<s>` seconds (default 4), for runs nobody sits at; `0:4:3500` goes through every menu into a Grand Prix and keeps accelerating in the race |
-| `NX_TEX_TRACE=<serial>` | log when that texture is initialized and finalized |
+| `NX_TEX_TRACE=<serial>` | log when that texture is initialized and finalized, and at each upload the hash of its storage and how many of its 64 KB pages hold data |
+| `NX_TEX_RAW=<serial>` | with `NX_FRAME_DUMP`: at every dumped frame the GPU's own view of that texture (a blit to RGBA8) goes to `<prefix>.<n>.gpu_<serial>.ppm`, and at frame 1000 its level 0 de-swizzled as raw blocks (`<prefix>.raw_<serial>.bin`) and its storage as the title wrote it (`<prefix>.swz_<serial>.bin`); the trace lines of draws (`NX_DRAW_TRACE_DETAIL=1`) carry each texture's NVN format, size and levels |
+| `NX_FS_LOG=1` | every read of the RomFS image: offset, length and the guest address it goes to |
+| `NX_SLOWMEM=1`, `NX_JIT_NOOPT=1` | the Jit without fast memory (every access goes through the callbacks) / without dynarmic's IR and dispatch optimizations: switches to tell an emulation fault from the title's own |
 | `NX_NO_CULL=1`, `NX_TEX_CLEAN=1`, `NX_NVN_ITEMS=1` | test switches: no culling, textures start clean, log each device-info item queried |
 | `NX_TRACE_SVC` | 32-bit: every SVC and hook. 64-bit: `1` = the first 3000 SVCs, `<name part>` = only the hooks whose name contains it, without limit |
 | `NX_SVC_ERRORS=1` | each distinct (SVC, non-zero result) once |
@@ -247,6 +250,10 @@ A guest access outside the window stops that thread and prints its registers and
 - **Compare with nxnative before assuming.** Its profile said the shaders live in the assets and that the game runs unpatched; both ended long detours.
 - **Look at the pixels.** Dumping the offscreen target and the sampled textures to PPM showed that the game was rendering its title (the textures held
   the logo) while the output stayed black, which pointed at texture upload instead of shaders or draws.
+- **Skip draws to find which one paints the wrong pixels, then dump what it samples.** `NX_DRAW_TRACE=<n>` with `NX_DRAW_SKIP=<a>-<b>` on a frame that stands still
+  (the title screen, frame 900) showed that three small draws made the confetti of blocks in the main menu's art, not the big background texture the eye went to; their textures
+  were ASTC. Then take the raw blocks (`NX_TEX_RAW`) and decode them with an independent decoder (a Python one in a throwaway venv will do) next to the host's: the host's ASTC decoder
+  got the trit and quint values of most blocks wrong, and a fuzz of random blocks against the other decoder (`tests/test_astc.c` keeps a few) found nothing else.
 
 ## Frame time (Mario Kart 8 Deluxe, 1080p, dGPU)
 
