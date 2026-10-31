@@ -5,7 +5,7 @@ Where Mario Kart 8 Deluxe stands on nxlinux and what to do next. The debugging s
 ## State
 
 - The title, menus and a Grand Prix race in Mario Kart Stadium run and look right on the Radeon 660M (RADV) and the RTX 2050 (the RTX is power-limited and about twice as slow).
-- Race: about 16.5 ms a frame (60 fps; p95 20 ms) with `NX_PRESENT_ASYNC=1`, no dumps, since the memory pools are imported when first used. The frame's work is the guest (JIT) and the replay: 638 draws, 55 render passes and 129 full barriers a frame cost 2.1 ms of replay and 0.8 ms of submission.
+- Race, measured 2026-10-31 after the pool change: Radeon in the real window 16.3 ms (p50) / 21 ms (p95); Radeon headless 16.5 / 20 ms; RTX 2050 (power-limited) 25-29 ms / 38-43 ms, GPU-bound, where it was about twice that before. Race: about 16.5 ms a frame (60 fps; p95 20 ms) with `NX_PRESENT_ASYNC=1`, no dumps, since the memory pools are imported when first used. The frame's work is the guest (JIT) and the replay: 638 draws, 55 render passes and 129 full barriers a frame cost 2.1 ms of replay and 0.8 ms of submission.
 - Controls: keyboard (WASD, K/J/I/U, Q/E, 1/3, arrows, P/O) and a gamepad with a driving layout (README).
 
 ## Speed
