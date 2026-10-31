@@ -77,20 +77,19 @@ The window is player 1's Pro Controller, always connected. A keyboard and one ga
 | B | J or Backspace | B (right button) |
 | X | I | X |
 | Y | U | Y |
-| L | Q | (see below) |
-| R | E | LB or LT (hop, drift) |
-| ZL | 1 | (see below) |
-| ZR | 3 | RB or RT (throw the item) |
+| L | Q | LB (throw the item) |
+| R | E | RB or RT (hop, drift) |
+| ZL | 1 | LT (throw the item) |
+| ZR | 3 | (none; RT sends R) |
 | D-pad | arrow keys | D-pad |
 | Plus / Minus | P / O | Menu (Start) / View (Back) |
 
 A gamepad's A and B follow the labels SDL knows for it: on an Xbox or generic pad the bottom button is A, on a pad with the
 Nintendo layout the right button is A. Sticks have a dead zone of about 18 %; triggers count as pressed past 25 %.
 
-The gamepad uses a driving layout: **left stick** steers, **A** accelerates, **B** brakes and reverses, **LB or LT** hop and drift (the
-console's R), **RB or RT** throw the item (the console's ZR). That leaves the console's L and ZL off the pad, which the menus use for
-paging (the cup list); the keyboard still has them on Q and 1. `NX_PAD_LAYOUT=pro` gives the physical layout back (LB = L, RB = R,
-LT = ZL, RT = ZR).
+The gamepad uses a driving layout: **left stick** steers, **A** accelerates, **B** brakes and reverses, **LB or LT** throw the item (the
+console's L and ZL, the game's item buttons), **RB or RT** hop and drift (the console's R). The trigger RT sends R as well, so ZR is not on the
+pad; the keyboard still has it on 3. `NX_PAD_LAYOUT=pro` makes RT send ZR (the physical Pro Controller).
 
 What each button does is the game's own scheme; for the rest (rear view, horn, camera) see the game's controls menu.
 
