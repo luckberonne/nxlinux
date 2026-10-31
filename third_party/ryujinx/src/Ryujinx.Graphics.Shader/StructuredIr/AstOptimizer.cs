@@ -24,7 +24,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                     {
                         bool isWorthPropagating = propVar.Uses.Count == 1 || IsWorthPropagating(assignment.Source);
 
-                        if (propVar.Defs.Count == 1 && isWorthPropagating)
+                        if (propVar.Defs.Count == 1 && isWorthPropagating && !IsCallArgument(propVar))
                         {
                             PropagateExpression(propVar, assignment.Source);
                         }
@@ -40,6 +40,21 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             }
 
             RemoveEmptyBlocks(mainBlock);
+        }
+
+        // The SPIR-V back end passes function arguments by pointer to a local variable (StructuredProgram copies each one into a temporary before the call): such a variable must stay a variable, or
+        // GenerateCall meets an expression (a texture sample, say) where it needs a local and throws InvalidCastException.
+        private static bool IsCallArgument(AstOperand propVar)
+        {
+            foreach (IAstNode use in propVar.Uses)
+            {
+                if (use is AstOperation operation && operation.Inst == Instruction.Call)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static bool IsWorthPropagating(IAstNode source)
