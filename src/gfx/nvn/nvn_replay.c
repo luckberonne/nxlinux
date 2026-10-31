@@ -138,7 +138,15 @@ void mtl_exec(const uint8_t *p) {
             nvn_vk_clear_ds(g_rt.dser, &g_rt.dview, g_rt.has_dview, cd->depth, cd->depth_mask, cd->stencil, cd->stencil_mask, g_sc.has ? g_sc.r : NULL);
             break; }
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;                        // descriptor pool state: only a draw or a dispatch reads it
-        case OP_CLEAR_TEX: { extern int nvn_trace_frame_now(void); if (nvn_trace_frame_now()) { const p_clear_tex *q = (const p_clear_tex *)a; fprintf(stderr, "[dm] [nvn] trace clear texture (not executed): serial %llu %dx%d\n", q->tex ? (unsigned long long)q->tex->serial : 0ull, q->r.width, q->r.height); } pending(h.op); break; }
+        case OP_CLEAR_TEX: {                                                      // nvnCommandBufferClearTexture(ui): a region of a colour texture (a title that relies on a cleared target, over memory that holds what a texture left there)
+            const p_clear_tex *q = (const p_clear_tex *)a;
+            if (!q->tex) break;
+            view_t v = q->view; int has_v = q->has_view;
+            if (q->r.depth > 1 && !(has_v && v.set_layers)) { memset(&v, 0, sizeof v); has_v = 1; v.set_layers = 1; v.min_layer = (uint16_t)q->r.zoffset; v.nlayers = (uint16_t)q->r.depth; }   // the slices of the region, when the view names none
+            int rect[4] = {q->r.xoffset, q->r.yoffset, q->r.width, q->r.height};
+            float rgba[4]; for (int i = 0; i < 4; i++) rgba[i] = q->is_uint ? (float)q->c.u[i] : q->c.f[i];
+            nvn_vk_clear_color(q->tex->serial, &v, has_v, q->mask, rgba, rect);
+            break; }
         default:
             if (h.op < OP_COUNT_) pending(h.op);
             else fprintf(stderr, "[dm] [RED] [nvn] replay: unknown command record %u\n", h.op);
