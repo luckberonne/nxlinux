@@ -46,6 +46,8 @@ typedef struct vktex {
     int dead;                                                  // finalized: waits in g_dead to be freed
     uint64_t last_use;                                         // when a replay last attached or sampled it (g_use_tick)
     int used;                                                  // touched at least once since it died
+    struct vktex *alias_of; int nalias;                        // a texture object over the same storage and description as another shares its image: alias_of names it; nalias counts the objects that name this one
+    struct vktex *snext;                                       // the chain of images that can be shared (g_share)
 } vktex_t;
 enum { F_DIRTY = 1, F_GPU = 2 };
 #define SUB(e, lv, ly) ((e)->st[(size_t)(lv) * (e)->nsub + (ly)])
@@ -82,10 +84,33 @@ static tomb_t *tomb_take(uint64_t serial) {                        // removes an
 }
 void mtl_tex_init(const tex_t *t);
 static void dead_push(vktex_t *e);
+// Texture objects over the same storage with the same description are one texture: the title draws a shadow map into one object and reads it through another it made over the same memory (the
+// transient targets of Mario Kart 8 Deluxe, made anew every frame), and on the hardware both are the same bytes. The host keeps one image for them; the second object is an alias of the first.
+static vktex_t *g_share[NB];
+static unsigned share_slot(const uint8_t *mem) { return (unsigned)(((uintptr_t)mem >> 6) * 0x9E3779B1u >> 7) & (NB - 1); }
+static int same_texture(const vktex_t *e, const nvn_texdesc *d, const nvn_texlayout *L, const uint8_t *mem) {
+    return e->mem == mem && e->L.size == L->size && e->d.target == d->target && e->d.format == d->format && e->d.flags == d->flags && e->d.samples == d->samples && e->d.width == d->width
+        && e->d.height == d->height && e->d.depth == d->depth && e->d.levels == d->levels && e->d.stride == d->stride;
+}
+static vktex_t *share_find(const nvn_texdesc *d, const nvn_texlayout *L, const uint8_t *mem) {      // caller holds g_mu
+    if (!mem) return NULL;
+    for (vktex_t *e = g_share[share_slot(mem)]; e; e = e->snext) if (same_texture(e, d, L, mem)) return e;
+    return NULL;
+}
+static void share_add(vktex_t *e) { unsigned k = share_slot(e->mem); e->snext = g_share[k]; g_share[k] = e; }         // caller holds g_mu
+static void share_remove(vktex_t *e) {                                                                                  // caller holds g_mu
+    for (vktex_t **p = &g_share[share_slot(e->mem)]; *p; p = &(*p)->snext) if (*p == e) { *p = e->snext; break; }
+}
+static vktex_t *find_raw(uint64_t serial) {        // the entry of a serial as it is (an alias stays an alias); caller holds g_mu
+    vktex_t *e = g_bucket[serial & (NB - 1)];
+    while (e && e->serial != serial) e = e->next;
+    return e;
+}
 static vktex_t *find(uint64_t serial) {
     pthread_mutex_lock(&g_mu);
     vktex_t *e = g_bucket[serial & (NB - 1)];
     while (e && e->serial != serial) e = e->next;
+    if (e && e->alias_of) e = e->alias_of;                          // an alias is its image's texture
     tomb_t *tb = e ? NULL : tomb_take(serial);
     pthread_mutex_unlock(&g_mu);
     if (!tb) return e;
@@ -149,19 +174,23 @@ static void free_tex(vktex_t *e) {
 static void dead_push(vktex_t *e) {                                // caller holds g_mu
     e->dead = 1;
     if (g_ndead == g_cdead) { g_cdead = g_cdead ? g_cdead * 2 : 256; g_dead = realloc(g_dead, g_cdead * sizeof *g_dead); }
-    g_dead[g_ndead++] = (struct dead){e}; g_dead_bytes += e->L.size;
+    g_dead[g_ndead++] = (struct dead){e}; g_dead_bytes += e->alias_of ? 0 : e->L.size;
 }
 static void sweep_dead(void) {                                    // caller holds g_mu
     vktex_t *gone[64]; int ngone = 0;
     while ((g_ndead > DEAD_MAX || g_dead_bytes > DEAD_BYTES) && ngone < 64) {
-        size_t lru = 0;
-        for (size_t i = 1; i < g_ndead; i++) {
+        size_t lru = (size_t)-1;
+        for (size_t i = 0; i < g_ndead; i++) {
+            if (g_dead[i].e->nalias) continue;              // another texture object shares this image: it stays while they do
+            if (lru == (size_t)-1) { lru = i; continue; }
             int lu = g_dead[lru].e->used, ui = g_dead[i].e->used;
             if (ui && !lu) { lru = i; continue; }          // evict a used (touched) texture before a never-used one
             if (ui == lu && g_dead[i].e->last_use < g_dead[lru].e->last_use) lru = i;
         }
-        vktex_t *e = g_dead[lru].e; g_dead[lru] = g_dead[--g_ndead]; g_dead_bytes -= e->L.size;
+        if (lru == (size_t)-1) break;                       // everything that is left is shared by a live object
+        vktex_t *e = g_dead[lru].e; g_dead[lru] = g_dead[--g_ndead]; g_dead_bytes -= e->alias_of ? 0 : e->L.size;
         for (vktex_t **p = &g_bucket[e->serial & (NB - 1)]; *p; p = &(*p)->next) if (*p == e) { *p = e->next; break; }
+        if (e->alias_of) e->alias_of->nalias--; else share_remove(e);
         gone_add(e->serial, GONE_SWEPT); g_nswept++; tomb_add(e);
         gone[ngone++] = e;
     }
@@ -178,6 +207,14 @@ void mtl_tex_init(const tex_t *t) {
     static int bad_fmt, bad_ms, bad_img;
     vktex_t *e = calloc(1, sizeof *e);
     e->serial = t->serial; e->d = t->d; e->L = t->L; e->mem = t->mem;
+    {
+        static int off = -1; if (off < 0) off = getenv("NX_NO_TEX_SHARE") != NULL;       // NX_NO_TEX_SHARE=1: one image per texture object, as before
+        pthread_mutex_lock(&g_mu);
+        vktex_t *pr = off ? NULL : share_find(&t->d, &t->L, t->mem);
+        if (pr) { e->alias_of = pr; pr->nalias++; e->next = g_bucket[e->serial & (NB - 1)]; g_bucket[e->serial & (NB - 1)] = e; }
+        pthread_mutex_unlock(&g_mu);
+        if (pr) { static _Atomic uint64_t n; if (atomic_fetch_add(&n, 1) == 0) fprintf(stderr, "[dm] [nvn] texture sharing: serial %llu is made over the storage and description of serial %llu and shares its image\n", (unsigned long long)t->serial, (unsigned long long)pr->serial); return; }
+    }
     e->bpb = nvn_fmt_bpb(t->d.format, &e->bw, &e->bh);
     e->is3d = t->d.target == NVN_TEXTURE_TARGET_3D;
     e->layers = (t->d.target == NVN_TEXTURE_TARGET_2D_ARRAY || t->d.target == NVN_TEXTURE_TARGET_1D_ARRAY || t->d.target == NVN_TEXTURE_TARGET_CUBEMAP ||
@@ -226,6 +263,7 @@ void mtl_tex_init(const tex_t *t) {
 keep:
     pthread_mutex_lock(&g_mu);
     e->next = g_bucket[e->serial & (NB - 1)]; g_bucket[e->serial & (NB - 1)] = e;      // a serial is unique: a re-initialised object gets a new one
+    if (e->ok && e->mem && e->d.samples <= 1 && e->d.target != NVN_TEXTURE_TARGET_BUFFER) share_add(e);
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -511,6 +549,19 @@ static void read_storage(const tex_t *t, unsigned level, unsigned layer, int z0,
 // Debugging: how many registered textures hold any non-zero byte in their level 0 (read as the title wrote them); prints a summary by format
 long nvn_vk_debug_lit(uint64_t serial, size_t *total, const char *ppm);
 void nvn_vk_debug_texstats(void) {
+    {   // the texture formats the title uses, by NVN format: how many textures, how many bytes of storage, how many the host made as an image (NX_FRAME_DUMP at frame 1000)
+        static struct { unsigned fmt, n, ok; unsigned long long bytes; } h[64]; unsigned nh = 0;
+        pthread_mutex_lock(&g_mu);
+        for (int b = 0; b < NB; b++) for (vktex_t *e = g_bucket[b]; e; e = e->next) {
+            unsigned i = 0; while (i < nh && h[i].fmt != e->d.format) i++;
+            if (i == nh) { if (nh == 64) continue; h[nh].fmt = e->d.format; h[nh].n = 0; h[nh].ok = 0; h[nh].bytes = 0; nh++; }
+            h[i].n++; h[i].ok += e->ok; h[i].bytes += e->L.size;
+        }
+        pthread_mutex_unlock(&g_mu);
+        for (unsigned a = 0; a < nh; a++) for (unsigned c2 = a + 1; c2 < nh; c2++) if (h[c2].bytes > h[a].bytes) { typeof(h[0]) t = h[a]; h[a] = h[c2]; h[c2] = t; }
+        for (unsigned a = 0; a < nh && a < 14; a++) fprintf(stderr, "[dm] [nvn] texture formats: NVN format %#x: %u textures (%u with an image), %llu MB of storage%s\n", h[a].fmt, h[a].n, h[a].ok, h[a].bytes >> 20,
+            h[a].fmt >= 0x79 && h[a].fmt <= 0x94 ? " (ASTC)" : h[a].fmt >= 0x49 && h[a].fmt <= 0x78 ? " (BC)" : "");
+    }
     unsigned total = 0, empty = 0, big = 0, shown = 0; uint64_t sers[4096]; unsigned ns = 0;
     pthread_mutex_lock(&g_mu);
     for (int b = 0; b < NB; b++) for (vktex_t *e = g_bucket[b]; e && ns < 4096; e = e->next) sers[ns++] = e->serial;
@@ -544,6 +595,8 @@ void nvn_vk_debug_texstats(void) {
 }
 // Debugging: the share of a texture's bytes (first mip, one layer) that are not zero, by serial; -1 when the host has no such texture
 long nvn_vk_debug_lit(uint64_t serial, size_t *total, const char *ppm);
+int nvn_vk_debug_info(uint64_t serial, unsigned *fmt, unsigned *w, unsigned *h, unsigned *levels, unsigned *dead) { vktex_t *e = find(serial); if (!e) return 0; *fmt = e->d.format; *w = e->d.width; *h = e->d.height; *levels = e->levels; *dead = (unsigned)e->dead; return 1; }
+int nvn_vk_debug_mem(uint64_t serial, uint64_t *mem, uint64_t *size) { vktex_t *e = find(serial); if (!e) return 0; *mem = (uint64_t)(uintptr_t)e->mem; *size = e->L.size; return 1; }   // where the storage of a texture lies (the host address of its pool memory)
 long nvn_vk_debug_lit(uint64_t serial, size_t *total, const char *ppm) {
     vktex_t *e = find(serial); if (!e) return -1;
     tex_t t; memset(&t, 0, sizeof t); t.serial = serial; t.d = e->d; t.L = e->L; t.mem = e->mem;
