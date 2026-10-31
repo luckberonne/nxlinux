@@ -173,6 +173,23 @@ made an image per object, so the shadow map and the light buffers the materials 
 `mtl_tex_init` now makes an object over the storage and description of an existing one an alias of its image (`NX_NO_TEX_SHARE=1` restores one image per object); an image is not freed while an
 alias names it. Found by dumping every target and every texture a draw reads at the end of one frame (`NX_DRAW_TRACE`) and comparing storage addresses.
 
+## Where the time goes (race, Radeon 660M, about 19 ms a frame)
+
+Measured with the host's own sampling profiler (`NX_PROF`, `tools/prof_report.py`; guest program counters too, with `--log`). What was tried, and what it did to the median frame time of the race:
+
+| Change | Frame time |
+|---|---|
+| Start of the day (RTX 2050, everything by default) | 118 ms |
+| Host-cached read-back buffer, reused (present was 50 ms of it) | 78 ms |
+| Empty render-target storage cleared instead of de-swizzled; dead textures evicted in one ordered pass; `recheck` without hashing | 62 -> 41 ms |
+| No cutting of the submission by default (`NX_CUT=0`): every submit costs the driver a walk over its memory objects | 41 -> 29.7 ms |
+| Asynchronous presentation (the game waits for the frame before, not for the GPU) | 29.7 -> 20 ms |
+| One condition variable per core in the thread scheduler | `core_acquire` 4.7 -> 1.7 % of the CPU |
+| Image memory from shared blocks | about 1.7 ms |
+
+No gain, and left as they were: inline exclusive accesses (`fastmem_exclusive_access`), fewer Jits in the pool (`NX_JITS` 3 and 4 against 8). The guest's own code is about 39 % of the CPU and is spread over the whole of `main` (no block above 0.7 %); the one
+hot spot, 6 % of the guest, is the SDK's mutex code (`TryLock` failing in a polling loop, `sdk+0x96f80`).
+
 ## Debugging aids
 
 All are environment variables; nothing costs anything when unset.
@@ -183,6 +200,8 @@ All are environment variables; nothing costs anything when unset.
 | `NX_DRAW_TRACE=<n>` (+ `NX_DRAW_TRACE_DETAIL=1`, `NX_FRAME_DUMP=<prefix>`) | one line per draw of the frame whose draws run with `n` presents behind (3599 is the 3600th), with its targets, state, program keys, vertex attributes, texture handles and serials; with a dump prefix, every target it drew into and every texture a small or large draw read go to `<prefix>.<n+1>.rt<serial>.ppm` (RGBA8 and RGBA16F), with format, share of non-zero bytes and storage address; `trace dispatch` / `trace copy` lines list compute and copies |
 | `NX_DRAW_SKIP=<a>-<b>` | with `NX_DRAW_TRACE`, the draws of that frame numbered `a` to `b` are made ready but not drawn |
 | `NX_CUT=<n>` | draws between the segments the recorded work is sent to the GPU in (default 0 = one submission per frame; 64 helps only a GPU the host leaves idle: it cost 10 ms on the Radeon) |
+| `NX_PRESENT_SYNC=1`, `NX_PRESENT_ASYNC=1` | the window texture is read back synchronously / asynchronously (default: asynchronous for the window, synchronous for the memory sink and whenever `NX_FRAME_DUMP` is set) |
+| `NX_MEM_DEDICATED=1` | every image gets its own device memory instead of a piece of a shared 64 MB block (about 1.7 ms slower in the race) |
 | `NX_PROF=<us>` | a sampling profiler (`src/host/prof.c`): every period the running threads are interrupted and their stacks kept; `kill -USR2 <pid>` writes `NX_PROF_OUT` (default `nx_prof.txt`), `tools/prof_report.py FILE nxlinux` reads it |
 | `NX_PRESENT_STATS=1` | every 300 presents: GPU read-back, BGRA to RGBA and window wait, per frame |
 | `NX_NO_TEX_SHARE=1`, `NX_NO_INVARIANT=1`, `NX_DEPTH_EQUAL_LEQUAL=1`, `NX_DEAD_MB=<n>` | switches off image sharing / the Invariant decoration of vertex positions; tests depth-equal as less-or-equal; the VRAM budget of finalized textures (default 1536) |

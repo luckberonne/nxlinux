@@ -185,7 +185,7 @@ static std::unique_ptr<jitenv> make_env(unsigned id) {
     cfg.fastmem_pointer = 0;                    // guest address == host address
     cfg.fastmem_address_space_bits = 48;
     cfg.silently_mirror_fastmem = false;
-    cfg.fastmem_exclusive_access = false;       // exclusives go through MemoryWriteExclusive* (compare-exchange)
+    cfg.fastmem_exclusive_access = false;       // exclusives go through MemoryWriteExclusive* (compare-exchange). Inline ones (true) were measured in the race: no faster (19.7-20.5 ms against 18.7-20.6), and dynarmic warns that they do not reproduce ABA
     cfg.tpidr_el0 = &e->tpidr;
     cfg.tpidrro_el0 = &e->tpidrro;
     cfg.wall_clock_cntpct = true;
@@ -221,9 +221,18 @@ static void release(cpu *c, jitenv *e) {
     e->jit->ClearHalt(HaltReason::UserDefined1);
     e->jit->ClearHalt(HaltReason::UserDefined2);
     e->jit->ClearHalt(HaltReason::UserDefined3);
+    e->jit->ClearHalt(HaltReason::UserDefined4);
     e->cur = nullptr;
     g_free.push_back(e);
     g_cv.notify_one();
+}
+
+extern "C" __attribute__((weak)) void nx_prof_guest(uint64_t pc, uint64_t lr);          // the profiler (prof.c) is not linked into every test
+extern "C" __attribute__((weak)) int nx_prof_guest_on(void);
+extern "C" void cpu_prof_poke(void) {                  // the profiler's thread: every Jit that runs a guest thread stops at the end of its block, and cpu_run notes the program counter
+    if (!nx_prof_guest_on || !nx_prof_guest_on()) return;
+    std::lock_guard<std::mutex> lk(g_mu);
+    for (auto &e : g_envs) if (e->cur) e->jit->HaltExecution(HaltReason::UserDefined4);
 }
 
 static cpu *C(cpu_t *c) { return reinterpret_cast<cpu *>(c); }
@@ -296,6 +305,10 @@ int cpu_run(cpu_t *cp) {
         HaltReason r = e->jit->Run();
         store(e, c->s);
         release(c, e);
+        if (static_cast<uint32_t>(r) & static_cast<uint32_t>(HaltReason::UserDefined4)) {      // a profiler sample, not a stop of the guest
+            if (nx_prof_guest) nx_prof_guest(c->s.pc, c->s.x[30]);
+            if (!c->watch_hit && !c->faulted && !c->svc_pending && !c->halt_req) continue;
+        }
         if (c->watch_hit) {
             c->watch_hit = false;
             fprintf(stderr, "[watch] write of %#llx to %#llx: pc=%#llx lr=%#llx sp=%#llx x0=%#llx x1=%#llx x2=%#llx x3=%#llx x19=%#llx\n", (unsigned long long)c->watch_value, (unsigned long long)g_watch, (unsigned long long)c->s.pc,

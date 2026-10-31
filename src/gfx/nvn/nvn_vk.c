@@ -286,7 +286,8 @@ struct vkmem_sub *nvn_vk_mem_alloc(const VkMemoryRequirements *mr, uint32_t mt) 
     VkDeviceSize size = (mr->size + 255) & ~(VkDeviceSize)255, align = mr->alignment ? mr->alignment : 256;
     pthread_mutex_lock(&g_mem_mu);
     vkmem_blk_t *b = NULL; VkDeviceSize off = 0;
-    if (size >= MEM_BIG) { b = mem_block_new(mt, size, 1); if (b) { b->used = size; off = 0; } }
+    static int dedicated_all = -1; if (dedicated_all < 0) dedicated_all = getenv("NX_MEM_DEDICATED") != NULL;       // NX_MEM_DEDICATED=1: every image keeps a block of its own, as before the shared blocks
+    if (size >= MEM_BIG || dedicated_all) { b = mem_block_new(mt, size, 1); if (b) { b->used = size; off = 0; } }
     else {
         for (b = g_mblk; b; b = b->next) if (!b->dedicated && b->mt == mt && mem_carve(b, size, align, &off)) break;
         if (!b && (b = mem_block_new(mt, MEM_BLOCK, 0)) && !mem_carve(b, size, align, &off)) b = NULL;

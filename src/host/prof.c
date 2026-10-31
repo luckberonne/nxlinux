@@ -6,6 +6,7 @@
 #include <execinfo.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,12 @@ enum { NF = 12, NSAMP = 1 << 18 };
 static struct { int tid, n; void *f[NF]; } *g_s;
 static _Atomic unsigned g_n;
 static volatile sig_atomic_t g_dump;
+// The guest's own program counters: every period the sampler asks each running Jit to stop at its next block (cpu_prof_poke); cpu_run notes where the guest was (nx_prof_guest) and goes on.
+enum { NGUEST = 1 << 17 };
+static struct { int tid; uint64_t pc, lr; } *g_g; static _Atomic unsigned g_ng;
+void cpu_prof_poke(void) __attribute__((weak));
+void nx_prof_guest(uint64_t pc, uint64_t lr) { if (!g_g) return; unsigned i = atomic_fetch_add(&g_ng, 1); if (i < NGUEST) { g_g[i].tid = (int)syscall(SYS_gettid); g_g[i].pc = pc; g_g[i].lr = lr; } }
+int nx_prof_guest_on(void) { return g_g != NULL; }
 static int g_period = 4000;
 
 static void on_prof(int sig, siginfo_t *si, void *ucv) {
@@ -46,6 +53,9 @@ static void dump(void) {
     for (struct dirent *e; d && (e = readdir(d));) if (e->d_name[0] != '.') { char p[96], c[64] = ""; snprintf(p, sizeof p, "/proc/self/task/%s/comm", e->d_name); FILE *f = fopen(p, "r"); if (f) { if (fgets(c, sizeof c, f)) c[strcspn(c, "\n")] = 0; fclose(f); } fprintf(o, "T %s %s\n", e->d_name, c); }
     if (d) closedir(d);
     unsigned n = atomic_load(&g_n); if (n > NSAMP) n = NSAMP;
+    unsigned ng = atomic_load(&g_ng); if (ng > NGUEST) ng = NGUEST;
+    for (unsigned i = 0; i < ng; i++) fprintf(o, "G %d %lx %lx\n", g_g[i].tid, (unsigned long)g_g[i].pc, (unsigned long)g_g[i].lr);
+    atomic_store(&g_ng, 0);
     for (unsigned i = 0; i < n; i++) { fprintf(o, "S %d", g_s[i].tid); for (int k = 0; k < g_s[i].n; k++) fprintf(o, " %lx", (unsigned long)g_s[i].f[k]); fprintf(o, "\n"); }
     fclose(o);
     atomic_store(&g_n, 0);
@@ -59,6 +69,7 @@ static void *sampler(void *arg) {
     for (;;) {
         usleep((useconds_t)g_period);
         if (g_dump) { g_dump = 0; dump(); continue; }
+        if (cpu_prof_poke) cpu_prof_poke();                                      // the guest side: where each running guest thread is
         DIR *d = opendir("/proc/self/task"); if (!d) continue;
         for (struct dirent *e; (e = readdir(d));) {
             if (e->d_name[0] == '.') continue;
@@ -78,6 +89,7 @@ void nx_prof_init(void) {
     const char *e = getenv("NX_PROF"); if (!e) return;
     if (atoi(e) > 0) g_period = atoi(e);
     g_s = calloc(NSAMP, sizeof *g_s); if (!g_s) return;
+    g_g = calloc(NGUEST, sizeof *g_g);
     void *warm[4]; backtrace(warm, 4);                                                // the first call loads the unwinder: not from a signal handler
     struct sigaction sa = {0}; sa.sa_sigaction = on_prof; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask); sigaction(SIGPROF, &sa, NULL);
     struct sigaction su = {0}; su.sa_handler = on_usr2; su.sa_flags = SA_RESTART; sigemptyset(&su.sa_mask); sigaction(SIGUSR2, &su, NULL);

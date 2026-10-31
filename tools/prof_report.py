@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Turns the file NX_PROF writes (kill -USR2 <pid>) into tables: where the samples are by thread, by module and by function of the host binary, and which callers lead to the hottest functions.
 
-  prof_report.py nx_prof.txt [path/to/nxlinux] [--top N] [--stack FUNC]
+  prof_report.py nx_prof.txt [path/to/nxlinux] [--top N] [--stack FUNC] [--log RUN.log]
+
+With --log (the log of the same run, which names where each guest module was loaded) the program counters of the guest threads are listed too: the hottest 64-byte blocks of each module.
 
 Samples at addresses outside the binary are named by the module that maps them; anonymous executable memory is the guest's JIT-compiled code (dynarmic)."""
 import bisect, collections, re, subprocess, sys
@@ -9,18 +11,20 @@ from pathlib import Path
 
 
 def main(argv):
-    args = [a for a in argv[1:] if not a.startswith('--')]
+    logf = argv[argv.index('--log') + 1] if '--log' in argv else None
+    args = [a for a in argv[1:] if not a.startswith('--') and a != logf and not (a.isdigit() and argv[argv.index(a) - 1] == '--top') and a != (argv[argv.index('--stack') + 1] if '--stack' in argv else None)]
     top = int(argv[argv.index('--top') + 1]) if '--top' in argv else 25
     stack = argv[argv.index('--stack') + 1] if '--stack' in argv else None
     if not args: sys.exit(__doc__)
     exe = args[1] if len(args) > 1 else 'build-claude/nxlinux'
-    base = 0; maps = []; comm = {}; samples = []
+    base = 0; maps = []; comm = {}; samples = []; guest = []
     for ln in Path(args[0]).read_text().splitlines():
         w = ln.split(None, 4)
         if ln.startswith('base '): base = int(w[1], 16)
         elif ln.startswith('M '): maps.append((int(w[1], 16), int(w[2], 16), w[4].strip() if len(w) > 4 else 'anon', int(w[3], 16)))
         elif ln.startswith('T '): comm[int(w[1])] = w[2] if len(w) > 2 else ''
         elif ln.startswith('S '): samples.append((int(w[1]), [int(x, 16) for x in ln.split()[2:]]))
+        elif ln.startswith('G '): guest.append((int(w[1]), int(w[2], 16), int(w[3], 16)))
     syms = []
     out = subprocess.run(['nm', '-n', '-C', '--defined-only', exe], capture_output=True, text=True).stdout
     for ln in out.splitlines():
@@ -88,6 +92,26 @@ def main(argv):
             for i, k in enumerate(names):
                 if stack in k: cc[' <- '.join(x[:48] for x in names[i:i + 4])] += 1; break
         for k, c in cc.most_common(10): print(f'  {c:5d}  {k}')
+    if guest:
+        mods = []
+        if logf:
+            for ln in Path(logf).read_text().splitlines():
+                m = re.match(r'\[dm\] module (\S+)\s+base (0x[0-9a-f]+) size (0x[0-9a-f]+)', ln)
+                if m: mods.append((int(m.group(2), 16), int(m.group(2), 16) + int(m.group(3), 16), m.group(1)))
+        def gname(a):
+            for lo, hi, nm in mods:
+                if lo <= a < hi: return f'{nm}+{a - lo:#x}'
+            return f'{a:#x}'
+        ng = len(guest)
+        print(f'\n{ng} guest samples; by thread:')
+        for t, c in collections.Counter(t for t, _, _ in guest).most_common(6): print(f'  {t} {comm.get(t, "?")}: {c} ({100 * c / ng:.1f}%)')
+        print(f'\nthe {top} hottest 64-byte blocks of guest code (module + offset):')
+        blk = collections.Counter(gname(pc & ~63) for _, pc, _ in guest)
+        for k, c in blk.most_common(top):
+            callers = collections.Counter(gname(lr) for _, pc, lr in guest if gname(pc & ~63) == k).most_common(2)
+            print(f'  {100 * c / ng:5.1f}%  {c:6d}  {k}   called from {", ".join(a for a, _ in callers)}')
+        print('\nby module:')
+        for k, c in collections.Counter(gname(pc).split('+')[0] for _, pc, _ in guest).most_common(6): print(f'  {k}: {c} ({100 * c / ng:.1f}%)')
 
 
 main(sys.argv)
