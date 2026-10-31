@@ -81,7 +81,7 @@ int vkctx_create(vkctx_t *c) {
     VkPhysicalDeviceFeatures ef = {.geometryShader = f->geometryShader, .tessellationShader = f->tessellationShader, .dualSrcBlend = f->dualSrcBlend,
         .independentBlend = f->independentBlend, .shaderInt64 = f->shaderInt64, .shaderFloat64 = f->shaderFloat64, .shaderImageGatherExtended = f->shaderImageGatherExtended,
         .shaderStorageImageReadWithoutFormat = f->shaderStorageImageReadWithoutFormat, .samplerAnisotropy = f->samplerAnisotropy,
-        .fragmentStoresAndAtomics = f->fragmentStoresAndAtomics, .textureCompressionBC = 1, .depthClamp = f->depthClamp, .fillModeNonSolid = f->fillModeNonSolid,
+        .fragmentStoresAndAtomics = f->fragmentStoresAndAtomics, .vertexPipelineStoresAndAtomics = f->vertexPipelineStoresAndAtomics, .textureCompressionBC = 1, .depthClamp = f->depthClamp, .fillModeNonSolid = f->fillModeNonSolid,
         .multiDrawIndirect = f->multiDrawIndirect, .imageCubeArray = f->imageCubeArray, .shaderStorageImageWriteWithoutFormat = f->shaderStorageImageWriteWithoutFormat,
         .drawIndirectFirstInstance = f->drawIndirectFirstInstance, .logicOp = f->logicOp};
     e11.pNext = &e12; e12.pNext = &e13; e13.pNext = &edcc;

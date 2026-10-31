@@ -123,6 +123,38 @@ static int dummy_get(vkctx_t *c, int code, VkDescriptorImageInfo *out) {
     return 1;
 }
 
+// What an empty slot reads for a shader that samples a depth texture with a comparison (2D): a 1x1 depth of 1.0 through a comparing sampler, so that the draw goes ahead and finds the
+// point lit. (On the hardware an unregistered descriptor reads zeros; the title binds handle 0 there for a shadow it does not use, and a draw skipped is worse than one lit.)
+static struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkSampler smp; int made; } g_shadow;
+static int shadow_dummy_get(vkctx_t *c, VkDescriptorImageInfo *out) {
+    pthread_mutex_lock(&g_mu);
+    if (!g_shadow.made) {
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_D32_SFLOAT, .extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        VkMemoryRequirements mr; VkCommandBuffer cb;
+        if (vkCreateImage(c->dev, &ii, NULL, &g_shadow.img)) { pthread_mutex_unlock(&g_mu); return 0; }
+        vkGetImageMemoryRequirements(c->dev, g_shadow.img, &mr);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vkctx_memtype(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_shadow.img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = ii.format, .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1}};
+        VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .compareEnable = VK_TRUE, .compareOp = VK_COMPARE_OP_LESS_OR_EQUAL};
+        if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(c->dev, &ai, NULL, &g_shadow.mem) || vkBindImageMemory(c->dev, g_shadow.img, g_shadow.mem, 0) ||
+            vkCreateImageView(c->dev, &vi, NULL, &g_shadow.view) || vkCreateSampler(c->dev, &si, NULL, &g_shadow.smp) || !(cb = vkctx_begin(c))) { pthread_mutex_unlock(&g_mu); return 0; }
+        vk_barrier_image_all(cb, g_shadow.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+        VkClearDepthStencilValue one = {1.0f, 0}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        vkCmdClearDepthStencilImage(cb, g_shadow.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &one, 1, &rg);
+        vk_barrier_image_all(cb, g_shadow.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+        vkctx_end(c, cb);
+        g_shadow.made = 1;
+    }
+    *out = (VkDescriptorImageInfo){g_shadow.smp, g_shadow.view, VK_IMAGE_LAYOUT_GENERAL};
+    pthread_mutex_unlock(&g_mu);
+    return 1;
+}
+
 // A bound handle's texture and sampler as a descriptor; `want` is the SamplerType the shader declares for the binding (the shadow bit, 1024, is the sampler's business).
 // 1 = filled; 0 = the texture or sampler cannot be used and there is no stand-in for this type; 3 = the texture is not of the type the shader samples.
 // A texture id or sampler id that is not registered reads as an empty slot (zeros through a nearest sampler), as it does on the hardware.
@@ -141,7 +173,7 @@ int nvn_vk_desc_sampled(uint32_t handle, int want, VkDescriptorImageInfo *out) {
     VkSampler smp = sd ? sd->s : VK_NULL_HANDLE;
     pthread_mutex_unlock(&g_mu);
     if (!td.used && !shadow) { static _Atomic unsigned nun; unsigned k = atomic_fetch_add(&nun, 1) + 1; if (k <= 8 || !(k & (k - 1))) fprintf(stderr, "[dm] [nvn] stand-in #%u: texture id %u is not registered (the shader samples type %#x, sampler %u)\n", k, tid, want, sid); }
-    if (!td.used) { if (!shadow) { int r = dummy_get(c, want, out); if (!r) { static _Atomic int nn; if (atomic_fetch_add(&nn, 1) < 6) fprintf(stderr, "[dm] [nvn] sampled: texture id %u is not registered and there is no stand-in for sampler type %#x\n", tid, want); } return r; } return 0; }
+    if (!td.used) { if (!shadow) { int r = dummy_get(c, want, out); if (!r) { static _Atomic int nn; if (atomic_fetch_add(&nn, 1) < 6) fprintf(stderr, "[dm] [nvn] sampled: texture id %u is not registered and there is no stand-in for sampler type %#x\n", tid, want); } return r; } return want == 3 ? shadow_dummy_get(c, out) : 0; }
     VkImageView iv; int code = want;
     if (!nvn_vk_tex_sampled(td.serial, &td.v, td.has_view, td.set_swz, td.swz, &iv, &code)) {
         if (shadow) return 0;
