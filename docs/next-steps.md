@@ -21,7 +21,7 @@ Still worth measuring before touching code (`NX_PROF`, the recipe in mk8d-bringu
 
 1. **Submission, 3.9 ms**: fewer render passes (55) and barriers (129) a frame.
 2. **Texture churn**: 5 019 live, 30 711 dead and 150 742 swept textures at frame 5100; what `mtl_tex_init` and the sweeps cost a frame.
-3. **The long frames in the guest** (frame 395, 2920, 3232: 450 ms with a quiet host): which guest code runs then (`NX_PROF` guest sampling at those frames) and whether the RomFS reads (`NX_FS_LOG`, 512 KB each) or the Yaz0 decompression are the cost.
+3. **The long frames in the guest** (frame 395, 2920, 3232: 450 ms with a quiet host) are asset loading: the profile windows of one second (`NX_PROF=2000`, `kill -USR2` every second, `tools/prof_report.py --log`) put the hottest guest blocks of the spike in `main+0xa88780..0xa889c0`, the game's streaming **Yaz0** decompressor, on a loader thread that exists only in the loading windows. Over a 22 s run that function takes 8 % of the guest samples (about 0.8 s of CPU), none of it in the race. A native replacement (an HLE hook of that function, which keeps its state in the struct at `x0`) would shorten the menu stalls but not the race; the function is byte-by-byte code through the JIT, so it is the kind of code a hook speeds up by tens of times. Risky (a stateful, resumable decoder: it must keep the struct's layout), so only if the menu stalls matter.
 4. The SDK mutex `TryLock` polling (about 6 % of the guest, 0.7 ms at most): last, it is risky for the gain.
 
 Not worth doing yet: ASTC decoding on the GPU (no cost showed in the frame breakdown).
