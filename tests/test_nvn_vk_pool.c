@@ -19,7 +19,8 @@ int main(void) {
     printf("device: %s\n", nvn_gpu_name());
     uint8_t *a = alloc_pool(), *b = alloc_pool(), *c = alloc_pool();
     mtl_pool_add(a, POOL); mtl_pool_add(b, POOL); mtl_pool_add(c, POOL);
-    CHECK(nvn_gpu_pools() == 3);
+    CHECK(nvn_gpu_pools() == 0);                                       // a pool's memory is imported when the GPU first needs it, not when the pool is made
+    { void *b0; uint64_t o0; CHECK(mtl_addr((uint64_t)a + 8, 4, NULL, &o0) && nvn_gpu_pools() == 0); (void)b0; }   // asking only whether an address is in a pool imports nothing
 
     // Address lookup: GPU address == CPU address, resolved to (pool buffer, offset)
     void *buf; uint64_t off;
