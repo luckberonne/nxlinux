@@ -231,7 +231,8 @@ void mtl_tex_init(const tex_t *t) {
     e->levels = t->d.levels ? (t->d.levels < maxl ? t->d.levels : maxl) : 1;
     e->nsub = e->is3d ? 1 : e->layers;
     e->st = calloc((size_t)e->levels * e->nsub, 1);
-    if (e->mem && !getenv("NX_TEX_CLEAN")) memset(e->st, F_DIRTY, (size_t)e->levels * e->nsub);       // the storage is the truth until the GPU writes the texture: a title that fills it from the CPU after creating it (no packaged data, no flush) gets it uploaded at first use, as nxnative does
+    static int tex_clean = -1; if (tex_clean < 0) tex_clean = getenv("NX_TEX_CLEAN") != NULL;
+    if (e->mem && !tex_clean) memset(e->st, F_DIRTY, (size_t)e->levels * e->nsub);       // the storage is the truth until the GPU writes the texture: a title that fills it from the CPU after creating it (no packaged data, no flush) gets it uploaded at first use, as nxnative does
     int kind = nvn_fmt_to_vk(t->d.format, &e->fmt, NULL);
     if (kind && t->d.format >= 0x79 && t->d.format <= 0x94 && !nvn_fmt_vk_supported(c->pd, e->fmt)) {    // ASTC, which this GPU lacks: RGBA8, decoded on upload
         e->astc = 1; e->fmt = t->d.format < 0x87 ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8G8B8A8_SRGB;

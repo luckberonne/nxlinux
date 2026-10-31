@@ -484,7 +484,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     }
     int ll = atomic_load(&g_origin_ll);
     k.cull = S.poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : S.poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : S.poly.cull == NVN_FACE_FRONT_AND_BACK ? VK_CULL_MODE_FRONT_AND_BACK : 0;
-    if (getenv("NX_NO_CULL")) k.cull = 0;       // a test: draw both faces
+    { static int no_cull = -1; if (no_cull < 0) no_cull = getenv("NX_NO_CULL") != NULL; if (no_cull) k.cull = 0; }       // a test: draw both faces
     k.front_ccw = (S.poly.front == NVN_FRONT_FACE_CCW) ^ (ll != 0);       // see the conventions at the top
     k.polymode = S.poly.mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : S.poly.mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     if (k.polymode != VK_POLYGON_MODE_FILL && !c->enabled.fillModeNonSolid) k.polymode = VK_POLYGON_MODE_FILL;
@@ -692,7 +692,8 @@ void nvn_dispatch(const p_dispatch *d) {
 static void draw_note(uint32_t count) {
     g_since_cut++;
     uint64_t n = atomic_fetch_add(&g_ndraw, 1) + 1;
-    if (getenv("NX_DRAW_DETAIL") && n >= 6000 && n < 6024) { const blend_st *bl = &S.blend[0]; fprintf(stderr, "[dm] [nvn] draw %llu: target %llu chmask %#x blend_en %#x src_rgb %u dst_rgb %u eq %u alpha_func %u keys %02x%02x/%02x%02x\n", (unsigned long long)n, (unsigned long long)g_rt.cser[0], S.chmask.mask & 0xf, S.color.blend_en, (unsigned)bl->src_rgb, (unsigned)bl->dst_rgb, (unsigned)bl->eq_rgb, S.color.alpha_func, S.keys[0][0], S.keys[0][1], S.keys[1][0], S.keys[1][1]); }
+    static int dd = -1; if (dd < 0) dd = getenv("NX_DRAW_DETAIL") != NULL;
+    if (dd && n >= 6000 && n < 6024) { const blend_st *bl = &S.blend[0]; fprintf(stderr, "[dm] [nvn] draw %llu: target %llu chmask %#x blend_en %#x src_rgb %u dst_rgb %u eq %u alpha_func %u keys %02x%02x/%02x%02x\n", (unsigned long long)n, (unsigned long long)g_rt.cser[0], S.chmask.mask & 0xf, S.color.blend_en, (unsigned)bl->src_rgb, (unsigned)bl->dst_rgb, (unsigned)bl->eq_rgb, S.color.alpha_func, S.keys[0][0], S.keys[0][1], S.keys[1][0], S.keys[1][1]); }
     if (g_rt.n && g_rt.cser[0] > 100) atomic_store(&g_main_target, g_rt.cser[0]);       // the last offscreen colour target (the window textures have small serials)
     { static int per = -1; if (per < 0) per = getenv("NX_DRAW_LOG") != NULL;        // draws per colour target serial, listed every 4000 draws
       if (per) { static uint64_t ser[16]; static uint64_t cnt[16]; static int ns; int k = 0; for (; k < ns; k++) if (ser[k] == g_rt.cser[0]) break;

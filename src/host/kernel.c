@@ -356,8 +356,8 @@ static void on_fault(cpu_t *c, uint64_t pc, int kind, void *user) {
 
 static void on_svc(cpu_t *c, uint32_t swi, void *user) {
     (void)user;
-    if (!cpu_is_aarch32()) { static int tr = -1; static _Atomic int n; if (tr < 0) tr = getenv("NX_TRACE_SVC") != NULL;       // NX_TRACE_SVC for an AArch64 title: the first 3000 SVCs
-        const char *tf = getenv("NX_TRACE_SVC"); int match = tf && tf[0] && strcmp(tf, "1") && swi >= 0x1000 && hle_stub_name(swi) && strstr(hle_stub_name(swi), tf);       // NX_TRACE_SVC=<name part>: only hooks whose name has it
+    if (!cpu_is_aarch32()) { static int tr = -1; static const char *tf; static _Atomic int n; if (tr < 0) { tf = getenv("NX_TRACE_SVC"); tr = tf != NULL; }       // NX_TRACE_SVC for an AArch64 title: the first 3000 SVCs (read once: this runs on every SVC)
+        int match = tf && tf[0] && strcmp(tf, "1") && swi >= 0x1000 && hle_stub_name(swi) && strstr(hle_stub_name(swi), tf);       // NX_TRACE_SVC=<name part>: only hooks whose name has it
         if (match || (tr && (!tf || !strcmp(tf, "1")) && n++ < 3000)) fprintf(stderr, "[svc] %#x%s%s x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx\n", swi, swi >= 0x1000 && hle_stub_name(swi) ? " " : "", swi >= 0x1000 && hle_stub_name(swi) ? hle_stub_name(swi) : "", (unsigned long long)cpu_get_x(c, 0), (unsigned long long)cpu_get_x(c, 1), (unsigned long long)cpu_get_x(c, 2), (unsigned long long)cpu_get_x(c, 3), (unsigned long long)cpu_get_x(c, 30)); }
     { thr_t *me = pthread_getspecific(g_keythr); if (me && atomic_load(&g_nwant)) { pthread_mutex_lock(&G); core_yield(me); pthread_mutex_unlock(&G); } }   // a yield point of the core scheduler
     static int errs = -1; if (errs < 0) errs = getenv("NX_SVC_ERRORS") != NULL;       // NX_SVC_ERRORS=1: every distinct (svc, non-zero result) once, with its arguments
