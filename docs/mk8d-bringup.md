@@ -23,7 +23,8 @@ With the movie decoder replaced, A goes through single player, Grand Prix, 50cc,
 the kart drives, overtakes, collects coins, the anti-gravity section and the stands are drawn. What it took on the NVN side: room for 16384 memory pools (a course
 makes more than a thousand), finalized textures kept alive (the scene's HDR target, 1920x1080 R11G11B10F, is finalized right after it is made and used every frame;
 other textures alias its memory), colour targets that are slices of a 3D texture (an 8x8x8 colour LUT), and the shaders captured during a race (2839 in the
-library). Still wrong: parts of the road are black, about 90 ms per frame (11 fps), and some draws skip for render targets that never existed in the host.
+library). Since then the ground is drawn too (see "Why the ground was black"): the race shows the asphalt, markings, countdown, karts and the stands. Frame time in the race is
+about 70 ms (14 fps) on the Radeon 660M and 78 ms on the RTX 2050, which this machine holds at 607 MHz (power cap); it is CPU bound now (replay and the guest's own code).
 
 ## Movies
 
@@ -141,6 +142,37 @@ The base is an AArch32 process (`main.npdm` flag): `cpu32.cpp` (dynarmic A32 wit
 GPUs without ASTC. It runs rtld and the SDK, answers about twenty services and loads the game's assets; it is unchanged since the 64-bit update became the
 target. Run it with `--arch32` (`run_title.py` detects it) and `NX_NVN_API=52.32`.
 
+## The shader library
+
+The host looks every draw's shaders up in a library of translated SPIR-V (`--shaders`; `tools/run_mk8d.sh` loads `work/run/mk8d_u/mk8d.nxsl`). Capturing shaders while the game runs
+never converges (every run reaches programs the earlier ones did not), so the library is built from every shader in the game files, the way nxnative does it:
+
+```
+nx_extract work/keys/prod.keys "base.nsp" work/run/mk8d/upd/update.nsp work/run/mk8d_u/romfs_dir          # the RomFS as a directory (12 GB)
+DM_GAME=0100152000022000 .venv/bin/python /path/to/nxnative/dm/gfx/tools/shader_split.py \
+    work/run/mk8d_u/romfs_dir/RomFS work/run/mk8d_u/romfs_dir/ExeFS/main work/run/mk8d_u/pkg pkg_map.tsv pkg_facts.tsv   # 29,651 shaders, a minute
+python3 tools/shader_pkg_to_dump.py work/run/mk8d_u/pkg work/run/mk8d_u/shd_pkg
+python3 tools/shader_capture_build.py work/run/mk8d_u/shd_pkg work/run/mk8d_u/mk8d.nxsl --alt-only                      # translate and pack, about 10 minutes
+```
+
+- **The program key is not stable.** The host key (SHA-256 of the control section and the code) changes from run to run: control bytes at +0x778 and from +0x7d8 differ. The library is keyed by
+  the hash of the code alone, and the host looks a shader up by it when the program key misses (`prog_alt_key`), then aliases the program key (`nvn_shader_alias`).
+- **Translator failures are silent in the summary.** `translated: N ok, M failed` hides the reason; run `dotnet work/dmsh_xlate/dmsh_xlate.dll jobs.json out` on the failures (`DMSH_STACK=1` for the stack).
+  Nine shaders, among them the vertex shader of the track (it reads a texture), failed with an `InvalidCastException` in Ryujinx's SPIR-V back end: the optimizer replaced the temporary that
+  carries a call argument by its expression. Fixed in `third_party/ryujinx` (`AstOptimizer.IsCallArgument`).
+- **Storage buffers.** `cb_offset` of a reflected storage buffer is in words: `cb_offset * 4` is a byte offset in driver segment c[0], and the slot is read off it (0x310 + 0x10 slot for
+  compute; 0x210 + 0x10 slot is a uniform slot the shader reads as storage, `NVN_SB_SBUF_UBO`). A shader the packer cannot resolve gets `needs` set and the host skips it: a compute dispatch
+  that ignored `needs` hung the GPU (a page fault, `ring gfx_0.0.0 timeout`).
+- MK8D's compute code has no header (instructions from +0) and its thread group is 32x1x1 (control +0x748), not the 64x1x1 the builder used to assume.
+
+## Why the ground was black
+
+The frame is a light pre-pass renderer: a shadow pass (depth only), a G-buffer pass (5 targets), light accumulation into transient targets, and a second pass over the same meshes (depth
+EQUAL) that reads the light. The title makes new texture objects every frame over the same pool memory and draws into one while reading another: on the hardware it is one image. The host
+made an image per object, so the shadow map and the light buffers the materials read were empty and everything that depends on them was black (signs and the stands barely do).
+`mtl_tex_init` now makes an object over the storage and description of an existing one an alias of its image (`NX_NO_TEX_SHARE=1` restores one image per object); an image is not freed while an
+alias names it. Found by dumping every target and every texture a draw reads at the end of one frame (`NX_DRAW_TRACE`) and comparing storage addresses.
+
 ## Debugging aids
 
 All are environment variables; nothing costs anything when unset.
@@ -148,6 +180,11 @@ All are environment variables; nothing costs anything when unset.
 | Variable | Does |
 |---|---|
 | `NX_NVN_API=<maj.min>` | the NVN API version the device reports (53.313 for the update, 52.32 for the base) |
+| `NX_DRAW_TRACE=<n>` (+ `NX_DRAW_TRACE_DETAIL=1`, `NX_FRAME_DUMP=<prefix>`) | one line per draw of the frame whose draws run with `n` presents behind (3599 is the 3600th), with its targets, state, program keys, vertex attributes, texture handles and serials; with a dump prefix, every target it drew into and every texture a small or large draw read go to `<prefix>.<n+1>.rt<serial>.ppm` (RGBA8 and RGBA16F), with format, share of non-zero bytes and storage address; `trace dispatch` / `trace copy` lines list compute and copies |
+| `NX_DRAW_SKIP=<a>-<b>` | with `NX_DRAW_TRACE`, the draws of that frame numbered `a` to `b` are made ready but not drawn |
+| `NX_CUT=<n>` | draws between the segments the recorded work is sent to the GPU in (default 64, 0 = one submission per frame) |
+| `NX_PRESENT_STATS=1` | every 300 presents: GPU read-back, BGRA to RGBA and window wait, per frame |
+| `NX_NO_TEX_SHARE=1`, `NX_NO_INVARIANT=1`, `NX_DEPTH_EQUAL_LEQUAL=1`, `NX_DEAD_MB=<n>` | switches off image sharing / the Invariant decoration of vertex positions; tests depth-equal as less-or-equal; the VRAM budget of finalized textures (default 1536) |
 | `NX_PRESENT=null` | run without a window |
 | `NX_SHADER_DUMP=<dir>` | write every shader the game binds, once per key (see above) |
 | `NX_FRAME_DUMP=<prefix>` | write presented frames 100, 400, 1000, 2500 and every 1500th to `<prefix>.<n>.ppm`, with the count of non-black pixels and statistics of the offscreen target |
