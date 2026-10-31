@@ -1,4 +1,27 @@
 #include "vkctx.h"
+int g_vk_nalloc;
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+static struct { VkDeviceMemory m; int site; } g_am[16384]; static int g_nam; static struct { const char *file; int line; int live; unsigned long long total; } g_site[32]; static int g_nsite;
+static pthread_mutex_t g_am_mu = PTHREAD_MUTEX_INITIALIZER;
+VkResult nx_vk_alloc_at(VkDevice d, const VkMemoryAllocateInfo *ai, VkDeviceMemory *m, const char *file, int line) {
+    VkResult r = vkAllocateMemory(d, ai, NULL, m); if (r) return r;
+    pthread_mutex_lock(&g_am_mu);
+    int si = 0; while (si < g_nsite && (g_site[si].line != line || g_site[si].file != file)) si++;
+    if (si == g_nsite && g_nsite < 32) { g_site[si].file = file; g_site[si].line = line; g_nsite++; }
+    g_site[si].live++; g_site[si].total++; if (g_nam < 16384) { g_am[g_nam].m = *m; g_am[g_nam].site = si; g_nam++; }
+    g_vk_nalloc++; pthread_mutex_unlock(&g_am_mu); return r;
+}
+void nx_vk_free(VkDevice d, VkDeviceMemory m) {
+    if (m) { pthread_mutex_lock(&g_am_mu); g_vk_nalloc--; for (int i = g_nam - 1; i >= 0; i--) if (g_am[i].m == m) { g_site[g_am[i].site].live--; g_am[i] = g_am[--g_nam]; break; } pthread_mutex_unlock(&g_am_mu); }
+    vkFreeMemory(d, m, NULL);
+}
+void nx_vk_alloc_report(void) {
+    pthread_mutex_lock(&g_am_mu);
+    for (int i = 0; i < g_nsite; i++) if (g_site[i].live > 0) { const char *f = strrchr(g_site[i].file, '/'); fprintf(stderr, "[dm] [nvn] device memory: %s:%d holds %d live allocations (%llu made)\n", f ? f + 1 : g_site[i].file, g_site[i].line, g_site[i].live, g_site[i].total); }
+    pthread_mutex_unlock(&g_am_mu);
+}
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,7 +165,7 @@ int vkbuf_create(vkctx_t *c, vkbuf_t *b, VkDeviceSize size, VkBufferUsageFlags u
     if (mt == UINT32_MAX) FAIL("no memory type for a %s buffer", host ? "host" : "device");
     VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) ? VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT : 0};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fi, mr.size, mt};
-    if (vkAllocateMemory(c->dev, &ai, NULL, &b->mem)) FAIL("vkAllocateMemory failed");
+    if (nx_vk_alloc(c->dev, &ai, &b->mem)) FAIL("vkAllocateMemory failed");
     vkBindBufferMemory(c->dev, b->buf, b->mem, 0);
     if (host && vkMapMemory(c->dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->map)) FAIL("vkMapMemory failed");
     if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
@@ -153,7 +176,7 @@ int vkbuf_create(vkctx_t *c, vkbuf_t *b, VkDeviceSize size, VkBufferUsageFlags u
 }
 void vkbuf_destroy(vkctx_t *c, vkbuf_t *b) {
     if (b->map) vkUnmapMemory(c->dev, b->mem);
-    vkDestroyBuffer(c->dev, b->buf, NULL); vkFreeMemory(c->dev, b->mem, NULL);
+    vkDestroyBuffer(c->dev, b->buf, NULL); nx_vk_free(c->dev, b->mem);
     memset(b, 0, sizeof *b);
 }
 
@@ -166,7 +189,7 @@ int vkimg_create2d(vkctx_t *c, vkimg_t *i, VkFormat fmt, uint32_t w, uint32_t h,
     uint32_t mt = vkctx_memtype(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mt == UINT32_MAX) FAIL("no device-local memory type for an image");
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, mt};
-    if (vkAllocateMemory(c->dev, &ai, NULL, &i->mem)) FAIL("vkAllocateMemory failed");
+    if (nx_vk_alloc(c->dev, &ai, &i->mem)) FAIL("vkAllocateMemory failed");
     vkBindImageMemory(c->dev, i->img, i->mem, 0);
     int depth = fmt == VK_FORMAT_D32_SFLOAT || fmt == VK_FORMAT_D16_UNORM || fmt == VK_FORMAT_D32_SFLOAT_S8_UINT;
     VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = i->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
@@ -175,7 +198,7 @@ int vkimg_create2d(vkctx_t *c, vkimg_t *i, VkFormat fmt, uint32_t w, uint32_t h,
     return 0;
 }
 void vkimg_destroy(vkctx_t *c, vkimg_t *i) {
-    vkDestroyImageView(c->dev, i->view, NULL); vkDestroyImage(c->dev, i->img, NULL); vkFreeMemory(c->dev, i->mem, NULL);
+    vkDestroyImageView(c->dev, i->view, NULL); vkDestroyImage(c->dev, i->img, NULL); nx_vk_free(c->dev, i->mem);
     memset(i, 0, sizeof *i);
 }
 

@@ -5,12 +5,12 @@ Where Mario Kart 8 Deluxe stands on nxlinux and what to do next. The debugging s
 ## State
 
 - The title, menus and a Grand Prix race in Mario Kart Stadium run and look right on the Radeon 660M (RADV) and the RTX 2050 (the RTX is power-limited and about twice as slow).
-- Race: about 20 ms a frame (50 fps) with `NX_PRESENT_ASYNC=1`, no dumps. About 17 ms of that is the frame's work: the guest (JIT) and the replay. In the replay, 638 draws, 55 render passes and 129 full barriers a frame cost 2.1 ms of replay and 3.9 ms of submission.
+- Race: about 16.5 ms a frame (60 fps; p95 20 ms) with `NX_PRESENT_ASYNC=1`, no dumps, since the memory pools are imported when first used. The frame's work is the guest (JIT) and the replay: 638 draws, 55 render passes and 129 full barriers a frame cost 2.1 ms of replay and 0.8 ms of submission.
 - Controls: keyboard (WASD, K/J/I/U, Q/E, 1/3, arrows, P/O) and a gamepad with a driving layout (README).
 
 ## Speed
 
-To reach 60 fps the race needs about 3.3 ms less a frame. Most of the frame is the guest's own code, which the JIT knobs did not shorten (inline exclusives, a smaller Jit pool: no gain).
+The race reaches 60 fps at the median. Most of the frame is the guest's own code, which the JIT knobs did not shorten (inline exclusives, a smaller Jit pool: no gain).
 
 Measured and ruled out:
 
@@ -19,7 +19,7 @@ Measured and ruled out:
 
 Still worth measuring before touching code (`NX_PROF`, the recipe in mk8d-bringup.md):
 
-1. **Submission, 3.9 ms**: fewer render passes (55) and barriers (129) a frame.
+1. **Submission: done for the pools** (2026-10-31): the cost of a submission grows with the live device memory allocations (1.7 us each); pools are imported when first used, 1 860 allocations became 570, submission 4.1 to 0.8 ms and the race 20 to 16.5 ms (p50). Left: the 280 pools in use, the 160 buffers of `vkbuf_create` (1 700 made in 5 100 frames), and render passes (55) and barriers (129) a frame.
 2. **Texture churn**: 5 019 live, 30 711 dead and 150 742 swept textures at frame 5100; what `mtl_tex_init` and the sweeps cost a frame.
 3. **The long frames in the guest** (frame 395, 2920, 3232: 450 ms with a quiet host) are asset loading: the profile windows of one second (`NX_PROF=2000`, `kill -USR2` every second, `tools/prof_report.py --log`) put the hottest guest blocks of the spike in `main+0xa88780..0xa889c0`, the game's streaming **Yaz0** decompressor, on a loader thread that exists only in the loading windows. Over a 22 s run that function takes 8 % of the guest samples (about 0.8 s of CPU), none of it in the race. A native replacement (an HLE hook of that function, which keeps its state in the struct at `x0`) would shorten the menu stalls but not the race; the function is byte-by-byte code through the JIT, so it is the kind of code a hook speeds up by tens of times. Risky (a stateful, resumable decoder: it must keep the struct's layout), so only if the menu stalls matter.
 4. The SDK mutex `TryLock` polling (about 6 % of the guest, 0.7 ms at most): last, it is risky for the gain.

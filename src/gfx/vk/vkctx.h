@@ -50,3 +50,10 @@ void vk_barrier_image(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkIma
 // The same over every mip level and array layer of the image
 void vk_barrier_image_all(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
                           VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access, VkImageAspectFlags aspect);
+
+// Device memory goes through these so that the number of live allocations (each is a buffer object the driver walks on every submission) can be reported, by the place that made them
+extern int g_vk_nalloc;
+VkResult nx_vk_alloc_at(VkDevice d, const VkMemoryAllocateInfo *ai, VkDeviceMemory *m, const char *file, int line);
+void nx_vk_free(VkDevice d, VkDeviceMemory m);
+#define nx_vk_alloc(d, ai, m) nx_vk_alloc_at((d), (ai), (m), __FILE__, __LINE__)
+void nx_vk_alloc_report(void);           // one line per site with live allocations

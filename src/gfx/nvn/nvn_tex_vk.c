@@ -168,7 +168,7 @@ static void free_tex(vktex_t *e) {
     for (int i = 0; i < e->nviews; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->views[i].v, VK_NULL_HANDLE);
     for (int i = 0; i < e->nsvs; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->svs[i].v, VK_NULL_HANDLE);
     if (e->img) nvn_vk_defer_image_sub(e->img, VK_NULL_HANDLE, e->sub);        // a submission in flight may still use it; the memory goes back to its block after it
-    if (e->has_alias) { vkctx_t *_c = nvn_vk_ctx(); if (_c) { vkDestroyImage(_c->dev, e->alias_img, NULL); vkFreeMemory(_c->dev, e->alias_vmem, NULL); } }
+    if (e->has_alias) { vkctx_t *_c = nvn_vk_ctx(); if (_c) { vkDestroyImage(_c->dev, e->alias_img, NULL); nx_vk_free(_c->dev, e->alias_vmem); } }
     free(e->st); free(e);
 }
 static void dead_push(vktex_t *e) {                                // caller holds g_mu
@@ -924,8 +924,8 @@ static void ensure_alias(vktex_t *e, vkctx_t *c) {
     uint32_t mt = vkctx_memtype(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mt == UINT32_MAX) { vkDestroyImage(c->dev, e->alias_img, NULL); e->alias_img = VK_NULL_HANDLE; return; }
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, mt};
-    if (vkAllocateMemory(c->dev, &ai, NULL, &e->alias_vmem)) { vkDestroyImage(c->dev, e->alias_img, NULL); e->alias_img = VK_NULL_HANDLE; return; }
-    if (vkBindImageMemory(c->dev, e->alias_img, e->alias_vmem, 0)) { vkFreeMemory(c->dev, e->alias_vmem, NULL); vkDestroyImage(c->dev, e->alias_img, NULL); e->alias_img = VK_NULL_HANDLE; e->alias_vmem = VK_NULL_HANDLE; return; }
+    if (nx_vk_alloc(c->dev, &ai, &e->alias_vmem)) { vkDestroyImage(c->dev, e->alias_img, NULL); e->alias_img = VK_NULL_HANDLE; return; }
+    if (vkBindImageMemory(c->dev, e->alias_img, e->alias_vmem, 0)) { nx_vk_free(c->dev, e->alias_vmem); vkDestroyImage(c->dev, e->alias_img, NULL); e->alias_img = VK_NULL_HANDLE; e->alias_vmem = VK_NULL_HANDLE; return; }
     e->has_alias = 1;
 }
 

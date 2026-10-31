@@ -103,7 +103,7 @@ static int dummy_get(vkctx_t *c, int code, VkDescriptorImageInfo *out) {
                            : cube ? (arr ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE) : (arr ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D);
         VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = d->img, .viewType = vt, .format = ii.format, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}};
         VkCommandBuffer cb;
-        if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(c->dev, &ai, NULL, &d->mem) || vkBindImageMemory(c->dev, d->img, d->mem, 0) || vkCreateImageView(c->dev, &vi, NULL, &d->view) ||
+        if (ai.memoryTypeIndex == UINT32_MAX || nx_vk_alloc(c->dev, &ai, &d->mem) || vkBindImageMemory(c->dev, d->img, d->mem, 0) || vkCreateImageView(c->dev, &vi, NULL, &d->view) ||
             !(cb = vkctx_begin(c))) { pthread_mutex_unlock(&g_mu); return 0; }
         vk_barrier_image_all(cb, d->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
         VkClearColorValue zero = {{0, 0, 0, 0}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
@@ -139,7 +139,7 @@ static int shadow_dummy_get(vkctx_t *c, VkDescriptorImageInfo *out) {
         VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_shadow.img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = ii.format, .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1}};
         VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
             .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .compareEnable = VK_TRUE, .compareOp = VK_COMPARE_OP_LESS_OR_EQUAL};
-        if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(c->dev, &ai, NULL, &g_shadow.mem) || vkBindImageMemory(c->dev, g_shadow.img, g_shadow.mem, 0) ||
+        if (ai.memoryTypeIndex == UINT32_MAX || nx_vk_alloc(c->dev, &ai, &g_shadow.mem) || vkBindImageMemory(c->dev, g_shadow.img, g_shadow.mem, 0) ||
             vkCreateImageView(c->dev, &vi, NULL, &g_shadow.view) || vkCreateSampler(c->dev, &si, NULL, &g_shadow.smp) || !(cb = vkctx_begin(c))) { pthread_mutex_unlock(&g_mu); return 0; }
         vk_barrier_image_all(cb, g_shadow.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                              VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);

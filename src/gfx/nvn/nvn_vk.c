@@ -34,6 +34,7 @@ typedef struct {
     uint64_t base, size;               // as the game gave it
     uint64_t abase, asize;             // widened to the import alignment: what Vulkan sees
     VkBuffer buf; VkDeviceMemory mem; VkDeviceAddress gpu;
+    int tried;                         // the memory is imported when the GPU first needs the pool, not when the game makes it (pool_ensure): most pools are never used by the GPU
 } gpool_t;
 
 static struct {
@@ -165,6 +166,7 @@ static void post_enqueue(uint64_t value) {      // the submission just committed
 
 // ---- memory pools
 static void pool_import(gpool_t *p) {
+    if (getenv("NX_POOL_LOG")) fprintf(stderr, "[dm] [nvn] pool import %#llx %#llx\n", (unsigned long long)p->base, (unsigned long long)p->size);     // NX_POOL_LOG=1: every pool the title makes (base, size)
     uint64_t al = G.c.host_import_align ? G.c.host_import_align : 4096;
     p->abase = p->base & ~(al - 1); p->asize = ((p->base + p->size + al - 1) & ~(al - 1)) - p->abase;
     void *host = (void *)(uintptr_t)p->abase;
@@ -182,7 +184,7 @@ static void pool_import(gpool_t *p) {
     VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     VkImportMemoryHostPointerInfoEXT imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, &fi, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, p->asize, mt};
-    if (mt == UINT32_MAX || vkAllocateMemory(G.c.dev, &ai, NULL, &p->mem) || vkBindBufferMemory(G.c.dev, p->buf, p->mem, 0)) {
+    if (mt == UINT32_MAX || nx_vk_alloc(G.c.dev, &ai, &p->mem) || vkBindBufferMemory(G.c.dev, p->buf, p->mem, 0)) {
         fprintf(stderr, "[dm] [RED] [nvn] pool %#llx+%#llx: importing the memory failed\n", (unsigned long long)p->base, (unsigned long long)p->size);
         vkDestroyBuffer(G.c.dev, p->buf, NULL); p->buf = VK_NULL_HANDLE; p->mem = VK_NULL_HANDLE; return;
     }
@@ -192,7 +194,7 @@ static void pool_import(gpool_t *p) {
 static void pool_release(gpool_t *p) {
     if (!p->buf) return;
     vkDeviceWaitIdle(G.c.dev);                            // the GPU may still read it: the guest is about to reuse or free this memory
-    vkDestroyBuffer(G.c.dev, p->buf, NULL); vkFreeMemory(G.c.dev, p->mem, NULL);
+    vkDestroyBuffer(G.c.dev, p->buf, NULL); nx_vk_free(G.c.dev, p->mem);
     p->buf = VK_NULL_HANDLE; p->mem = VK_NULL_HANDLE;
 }
 
@@ -212,7 +214,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     if (!same) { memmove(&G.pool[i + 1], &G.pool[i], (size_t)(G.npool - i) * sizeof G.pool[0]); G.npool++; }
     gpool_t *p = &G.pool[i];
     memset(p, 0, sizeof *p); p->base = base; p->size = size;
-    if (on) pool_import(p);
+    if (on && getenv("NX_POOL_EAGER")) { p->tried = 1; pool_import(p); }       // NX_POOL_EAGER=1: import at creation, as before
     pthread_mutex_unlock(&G.pool_mu);
 }
 void mtl_pool_del(const void *mem) {
@@ -228,13 +230,15 @@ void mtl_pool_del(const void *mem) {
 void mtl_alias_drop_pool(const void *pool) { (void)pool; }
 
 // The pool that holds [addr, addr+len): caller holds pool_mu. The returned pointer is valid until the table changes.
-static gpool_t *pool_find(uint64_t addr, uint64_t len) {
+static gpool_t *pool_find_raw(uint64_t addr, uint64_t len) {
     int i = pool_slot(addr + 1) - 1;                      // the last pool starting at or below addr (pools do not overlap)
     if (i < 0) return NULL;
     gpool_t *p = &G.pool[i];
     if (addr >= p->base && len <= p->size && addr - p->base <= p->size - len) return p;
     return NULL;
 }
+static void pool_ensure(gpool_t *p) { if (p && !p->tried) { p->tried = 1; if (gpu()) pool_import(p); } }     // caller holds pool_mu
+static gpool_t *pool_find(uint64_t addr, uint64_t len) { gpool_t *p = pool_find_raw(addr, len); pool_ensure(p); return p; }
 int nvn_vk_pool_buffer(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     pthread_mutex_lock(&G.pool_mu);
     gpool_t *p = pool_find(addr, len);
@@ -245,7 +249,8 @@ int nvn_vk_pool_buffer(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize 
 }
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     pthread_mutex_lock(&G.pool_mu);
-    gpool_t *p = pool_find(addr, len);
+    gpool_t *p = pool_find_raw(addr, len);
+    if (p && buf) pool_ensure(p);                         // asked only whether the range is in a pool: nothing to import
     if (p) { if (buf) *buf = (void *)(uintptr_t)p->buf; if (off) *off = addr - p->abase; }
     pthread_mutex_unlock(&G.pool_mu);
     return p != NULL;
@@ -261,7 +266,7 @@ enum { MEM_BLOCK = 64 << 20, MEM_BIG = 16 << 20 };
 static vkmem_blk_t *mem_block_new(uint32_t mt, VkDeviceSize size, int dedicated) {
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, size, mt};
     vkmem_blk_t *b = calloc(1, sizeof *b); if (!b) return NULL;
-    if (vkAllocateMemory(G.c.dev, &ai, NULL, &b->mem)) { free(b); return NULL; }
+    if (nx_vk_alloc(G.c.dev, &ai, &b->mem)) { free(b); return NULL; }
     b->mt = mt; b->size = size; b->dedicated = dedicated;
     if (!dedicated) { b->cfr = 64; b->fr = malloc((size_t)b->cfr * sizeof *b->fr); b->fr[0].off = 0; b->fr[0].size = size; b->nfr = 1; }
     b->next = g_mblk; g_mblk = b;
@@ -317,7 +322,7 @@ void nvn_vk_mem_free(struct vkmem_sub *s) {
     }
     if (release) {
         for (vkmem_blk_t **p = &g_mblk; *p; p = &(*p)->next) if (*p == b) { *p = b->next; break; }
-        vkFreeMemory(G.c.dev, b->mem, NULL); free(b->fr); free(b);
+        nx_vk_free(G.c.dev, b->mem); free(b->fr); free(b);
     }
     pthread_mutex_unlock(&g_mem_mu);
     free(s);
@@ -335,7 +340,7 @@ static void reap(void) {                                  // return command buff
     G.nflight = k;
     k = 0;
     for (int i = 0; i < G.ndead; i++) {
-        if (G.dead[i].value <= done) { vkDestroyImageView(G.c.dev, G.dead[i].view, NULL); vkDestroyImage(G.c.dev, G.dead[i].img, NULL); if (G.dead[i].sub) nvn_vk_mem_free(G.dead[i].sub); else vkFreeMemory(G.c.dev, G.dead[i].mem, NULL); }
+        if (G.dead[i].value <= done) { vkDestroyImageView(G.c.dev, G.dead[i].view, NULL); vkDestroyImage(G.c.dev, G.dead[i].img, NULL); if (G.dead[i].sub) nvn_vk_mem_free(G.dead[i].sub); else nx_vk_free(G.c.dev, G.dead[i].mem); }
         else G.dead[k++] = G.dead[i];
     }
     G.ndead = k;
@@ -361,7 +366,9 @@ VkCommandBuffer nvn_vk_oneshot_begin(void) {
     return cb;
 }
 // The same command buffer submitted without waiting: a fence says when it is done, nvn_vk_oneshot_wait blocks for it (no lock held) and nvn_vk_oneshot_release frees what it used
+_Atomic uint64_t g_oneshot_ns, g_oneshot_n;            // the time the one-shot submissions took (the present's window copy), for the per-frame statistics
 int nvn_vk_oneshot_submit(VkCommandBuffer cb, VkFence *fence) {
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     vkEndCommandBuffer(cb);
     VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
@@ -369,6 +376,7 @@ int nvn_vk_oneshot_submit(VkCommandBuffer cb, VkFence *fence) {
     VkResult r = vkCreateFence(G.c.dev, &fi, NULL, fence);
     if (!r) r = vkQueueSubmit(G.c.queue, 1, &si, *fence);
     pthread_mutex_unlock(&G.vk_mu);
+    { struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1); atomic_fetch_add(&g_oneshot_ns, (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec))); atomic_fetch_add(&g_oneshot_n, 1); }
     return r ? -1 : 0;
 }
 int nvn_vk_oneshot_wait(VkFence fence) { return vkWaitForFences(G.c.dev, 1, &fence, VK_TRUE, 10ull * 1000000000ull) == VK_SUCCESS ? 0 : -1; }

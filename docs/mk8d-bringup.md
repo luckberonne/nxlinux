@@ -220,6 +220,7 @@ All are environment variables; nothing costs anything when unset.
 | `NX_HID_TAP=<bit>[:<s>[:<ms>]]` | press that `NpadButton` bit (0 = A) for 150 ms (or `<ms>`) every `<s>` seconds (default 4), for runs nobody sits at; `0:4:3500` goes through every menu into a Grand Prix and keeps accelerating in the race |
 | `NX_TEX_TRACE=<serial>` | log when that texture is initialized and finalized, and at each upload the hash of its storage and how many of its 64 KB pages hold data |
 | `NX_TEX_RAW=<serial>` | with `NX_FRAME_DUMP`: at every dumped frame the GPU's own view of that texture (a blit to RGBA8) goes to `<prefix>.<n>.gpu_<serial>.ppm`, and at frame 1000 its level 0 de-swizzled as raw blocks (`<prefix>.raw_<serial>.bin`) and its storage as the title wrote it (`<prefix>.swz_<serial>.bin`); the trace lines of draws (`NX_DRAW_TRACE_DETAIL=1`) carry each texture's NVN format, size and levels |
+| `NX_POOL_LOG=1`, `NX_POOL_EAGER=1` | log each memory pool when the host imports it (base, size) / import every pool when the game makes it, as before, instead of when the GPU first needs it |
 | `NX_FS_LOG=1` | every read of the RomFS image: offset, length and the guest address it goes to |
 | `NX_SLOWMEM=1`, `NX_JIT_NOOPT=1` | the Jit without fast memory (every access goes through the callbacks) / without dynarmic's IR and dispatch optimizations: switches to tell an emulation fault from the title's own |
 | `NX_NO_CULL=1`, `NX_TEX_CLEAN=1`, `NX_NVN_ITEMS=1` | test switches: no culling, textures start clean, log each device-info item queried |
@@ -254,6 +255,12 @@ A guest access outside the window stops that thread and prints its registers and
   (the title screen, frame 900) showed that three small draws made the confetti of blocks in the main menu's art, not the big background texture the eye went to; their textures
   were ASTC. Then take the raw blocks (`NX_TEX_RAW`) and decode them with an independent decoder (a Python one in a throwaway venv will do) next to the host's: the host's ASTC decoder
   got the trit and quint values of most blocks wrong, and a fuzz of random blocks against the other decoder (`tests/test_astc.c` keeps a few) found nothing else.
+
+## The cost of a submission grows with the device memory allocations
+
+Every `vkAllocateMemory` is a buffer object the driver walks on each `vkQueueSubmit`: measured at about 1.7 us per allocation and per submission, so with 1 860 live allocations a submission took 3.1 ms and with 940, 1.4 ms. A frame makes two (the game's, and the copy of the window texture). The game makes some 2 300 NVN memory pools (1 600 of at most 64 KB, 850 MB in all), and the host imported each as soon as it was made; most are never used by the GPU. Importing a pool when the GPU first needs it (`pool_ensure` in `nvn_vk.c`) took the live allocations from 1 860 to 570, the submission from 4.1 to 0.8 ms and the race from 20 ms to 16.5 ms a frame (p50; p95 20 ms). The statistics line "one-shot submissions" and the lines "device memory: file:line holds N live allocations" (every 1 800 frames) show what is left: about 280 pools and 160 buffers made by `vkbuf_create`.
+
+Not done because it is not safe: sharing one import among neighbouring pools (81 windows of 16 MB would cover all pools). The guest memory is one mapping the host `madvise`s with `MADV_DONTNEED` when the game unmaps, so a window kept across pool lifetimes could keep the old pages.
 
 ## Frame time (Mario Kart 8 Deluxe, 1080p, dGPU)
 

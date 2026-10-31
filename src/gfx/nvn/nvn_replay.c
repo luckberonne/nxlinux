@@ -30,6 +30,8 @@ static _Atomic uint64_t g_seen[OP_COUNT_], g_pending[OP_COUNT_];
 // Per-frame averages since the last report of the ops replayed most, render passes begun, full barriers, where the host time goes (replay, driver submit, a
 // draw's prepare and its parts, barrier recording), pipeline lookups and the texture table (the timing line calls it)
 void nvn_replay_report(uint64_t frames) {
+    { extern _Atomic uint64_t g_oneshot_ns, g_oneshot_n; extern int g_vk_nalloc; static uint64_t ln, lns; uint64_t n = atomic_load(&g_oneshot_n), ns = atomic_load(&g_oneshot_ns);
+      if (frames && n > ln) fprintf(stderr, "[dm] [nvn] one-shot submissions (the window copy): %.2f a frame, %.2f ms each; %d live device memory allocations\n", (double)(n - ln) / (double)frames, (double)(ns - lns) / (double)(n - ln) / 1e6, g_vk_nalloc); ln = n; lns = ns; { extern void nx_vk_alloc_report(void); static unsigned rep; if (++rep % 6 == 0) nx_vk_alloc_report(); } }
     static uint64_t last[OP_COUNT_], lpass, lbar, lrep, lcom, llk, llast, lnew, lprep, lpipe, lbuf, lps, lbns;
     extern _Atomic uint64_t g_nvn_npass, g_nvn_nbarrier_emitted;
     if (!frames) return;
