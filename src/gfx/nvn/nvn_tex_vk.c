@@ -30,7 +30,7 @@ typedef struct vktex {
     nvn_texdesc d; nvn_texlayout L; const uint8_t *mem;       // the description and storage at TextureInitialize
     int bw, bh, bpb, is3d;
     VkFormat fmt; VkImageAspectFlags aspect;
-    VkImage img; VkDeviceMemory vmem;
+    VkImage img; struct vkmem_sub *sub;                         // the image and the piece of a shared block of device memory it lives in
     VkImage alias_img; VkDeviceMemory alias_vmem; int has_alias;   // for compressed textures written through an integer view (BC3 as R32G32B32A32_UINT): a second image sharing the storage, with a compatible format
     int alias_dirty;                                            // the alias was written; the compressed image needs re-uploading before sampling
     uint32_t layers, levels;
@@ -167,7 +167,7 @@ static int gone_why(uint64_t serial, uint64_t *age) {              // the reason
 static void free_tex(vktex_t *e) {
     for (int i = 0; i < e->nviews; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->views[i].v, VK_NULL_HANDLE);
     for (int i = 0; i < e->nsvs; i++) nvn_vk_defer_image(VK_NULL_HANDLE, e->svs[i].v, VK_NULL_HANDLE);
-    if (e->img) nvn_vk_defer_image(e->img, VK_NULL_HANDLE, e->vmem);           // a submission in flight may still use it
+    if (e->img) nvn_vk_defer_image_sub(e->img, VK_NULL_HANDLE, e->sub);        // a submission in flight may still use it; the memory goes back to its block after it
     if (e->has_alias) { vkctx_t *_c = nvn_vk_ctx(); if (_c) { vkDestroyImage(_c->dev, e->alias_img, NULL); vkFreeMemory(_c->dev, e->alias_vmem, NULL); } }
     free(e->st); free(e);
 }
@@ -261,9 +261,9 @@ void mtl_tex_init(const tex_t *t) {
         if (vkCreateImage(c->dev, &ii, NULL, &e->img)) { red_once(&bad_img, "vkCreateImage failed", t->d.format); e->img = VK_NULL_HANDLE; goto keep; }
         vkGetImageMemoryRequirements(c->dev, e->img, &mr);
         uint32_t mt = vkctx_memtype(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, mt};
-        if (mt == UINT32_MAX || vkAllocateMemory(c->dev, &ai, NULL, &e->vmem) || vkBindImageMemory(c->dev, e->img, e->vmem, 0)) {
-            red_once(&bad_img, "no memory for the image", t->d.format); vkDestroyImage(c->dev, e->img, NULL); e->img = VK_NULL_HANDLE; e->vmem = VK_NULL_HANDLE; goto keep;
+        e->sub = mt == UINT32_MAX ? NULL : nvn_vk_mem_alloc(&mr, mt);
+        if (!e->sub || vkBindImageMemory(c->dev, e->img, nvn_vk_mem_handle(e->sub), nvn_vk_mem_offset(e->sub))) {
+            red_once(&bad_img, "no memory for the image", t->d.format); if (e->sub) nvn_vk_mem_free(e->sub); e->sub = NULL; vkDestroyImage(c->dev, e->img, NULL); e->img = VK_NULL_HANDLE; goto keep;
         }
         e->ok = 1;
     }

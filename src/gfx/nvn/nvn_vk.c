@@ -47,7 +47,7 @@ static struct {
     post_op *ops; int nops, capops; vkbuf_t *stg; int nstg, capstg;
     // submissions waiting for the GPU, oldest first; the completion thread and any waiter drain it
     pthread_mutex_t vk_mu;                              // the queue and the command pool are externally synchronized: submit, one-shot readbacks and command buffer recycling take it
-    struct { VkImage img; VkImageView view; VkDeviceMemory mem; uint64_t value; } dead[256]; int ndead;   // images to destroy once the timeline passes `value`
+    struct dead_ent { VkImage img; VkImageView view; VkDeviceMemory mem; struct vkmem_sub *sub; uint64_t value; } *dead; int ndead, cdead;   // images to destroy once the timeline passes `value`
     pthread_mutex_t q_mu; pthread_cond_t q_cv; sub_rec *q; size_t qhead, qn, qcap; pthread_t thread; int thread_up;
 } G = {.once = PTHREAD_ONCE_INIT, .pool_mu = PTHREAD_MUTEX_INITIALIZER, .vk_mu = PTHREAD_MUTEX_INITIALIZER, .q_mu = PTHREAD_MUTEX_INITIALIZER, .q_cv = PTHREAD_COND_INITIALIZER};
 
@@ -252,6 +252,77 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
 }
 
 // ---- submissions
+// ---- device memory for images, given out in pieces of blocks: every vkAllocateMemory is a buffer object the driver checks at each submission (the cost of a submission grew with the number of
+// textures: 0.03 ms with 800, over 3 ms with 5000), so images share 64 MB blocks, with a free list per block; an image of 16 MB or more keeps a block of its own
+typedef struct vkmem_blk { VkDeviceMemory mem; uint32_t mt; VkDeviceSize size, used; struct { VkDeviceSize off, size; } *fr; int nfr, cfr; int dedicated; struct vkmem_blk *next; } vkmem_blk_t;
+struct vkmem_sub { VkDeviceMemory mem; VkDeviceSize off, size; vkmem_blk_t *blk; };
+static vkmem_blk_t *g_mblk; static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
+enum { MEM_BLOCK = 64 << 20, MEM_BIG = 16 << 20 };
+static vkmem_blk_t *mem_block_new(uint32_t mt, VkDeviceSize size, int dedicated) {
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, size, mt};
+    vkmem_blk_t *b = calloc(1, sizeof *b); if (!b) return NULL;
+    if (vkAllocateMemory(G.c.dev, &ai, NULL, &b->mem)) { free(b); return NULL; }
+    b->mt = mt; b->size = size; b->dedicated = dedicated;
+    if (!dedicated) { b->cfr = 64; b->fr = malloc((size_t)b->cfr * sizeof *b->fr); b->fr[0].off = 0; b->fr[0].size = size; b->nfr = 1; }
+    b->next = g_mblk; g_mblk = b;
+    return b;
+}
+static int mem_carve(vkmem_blk_t *b, VkDeviceSize size, VkDeviceSize align, VkDeviceSize *off_out) {     // first fit in the block; caller holds g_mem_mu
+    for (int i = 0; i < b->nfr; i++) {
+        VkDeviceSize o = b->fr[i].off, e = o + b->fr[i].size, a = (o + align - 1) & ~(align - 1);
+        if (a + size > e) continue;
+        int pre = a > o, post = a + size < e;
+        if (pre && post) { if (b->nfr == b->cfr) { b->cfr *= 2; b->fr = realloc(b->fr, (size_t)b->cfr * sizeof *b->fr); } memmove(&b->fr[i + 1], &b->fr[i], (size_t)(b->nfr - i) * sizeof *b->fr); b->nfr++; b->fr[i].size = a - o; b->fr[i + 1].off = a + size; b->fr[i + 1].size = e - a - size; }
+        else if (pre) b->fr[i].size = a - o;
+        else if (post) { b->fr[i].off = a + size; b->fr[i].size = e - a - size; }
+        else { memmove(&b->fr[i], &b->fr[i + 1], (size_t)(b->nfr - i - 1) * sizeof *b->fr); b->nfr--; }
+        b->used += size; *off_out = a; return 1;
+    }
+    return 0;
+}
+struct vkmem_sub *nvn_vk_mem_alloc(const VkMemoryRequirements *mr, uint32_t mt) {
+    if (!gpu()) return NULL;
+    struct vkmem_sub *s = malloc(sizeof *s); if (!s) return NULL;
+    VkDeviceSize size = (mr->size + 255) & ~(VkDeviceSize)255, align = mr->alignment ? mr->alignment : 256;
+    pthread_mutex_lock(&g_mem_mu);
+    vkmem_blk_t *b = NULL; VkDeviceSize off = 0;
+    if (size >= MEM_BIG) { b = mem_block_new(mt, size, 1); if (b) { b->used = size; off = 0; } }
+    else {
+        for (b = g_mblk; b; b = b->next) if (!b->dedicated && b->mt == mt && mem_carve(b, size, align, &off)) break;
+        if (!b && (b = mem_block_new(mt, MEM_BLOCK, 0)) && !mem_carve(b, size, align, &off)) b = NULL;
+        if (!b) { b = mem_block_new(mt, size, 1); if (b) { b->used = size; off = 0; } }       // no room for a block: the image alone
+    }
+    pthread_mutex_unlock(&g_mem_mu);
+    if (!b) { free(s); return NULL; }
+    s->mem = b->mem; s->off = off; s->size = size; s->blk = b;
+    return s;
+}
+void nvn_vk_mem_free(struct vkmem_sub *s) {
+    if (!s) return;
+    vkmem_blk_t *b = s->blk;
+    pthread_mutex_lock(&g_mem_mu);
+    b->used -= s->size;
+    int release = b->dedicated;
+    if (!b->dedicated) {                                                           // the range goes back in order and joins its neighbours
+        int i = 0; while (i < b->nfr && b->fr[i].off < s->off) i++;
+        if (b->nfr == b->cfr) { b->cfr *= 2; b->fr = realloc(b->fr, (size_t)b->cfr * sizeof *b->fr); }
+        memmove(&b->fr[i + 1], &b->fr[i], (size_t)(b->nfr - i) * sizeof *b->fr); b->nfr++; b->fr[i].off = s->off; b->fr[i].size = s->size;
+        if (i + 1 < b->nfr && b->fr[i].off + b->fr[i].size == b->fr[i + 1].off) { b->fr[i].size += b->fr[i + 1].size; memmove(&b->fr[i + 1], &b->fr[i + 2], (size_t)(b->nfr - i - 2) * sizeof *b->fr); b->nfr--; }
+        if (i > 0 && b->fr[i - 1].off + b->fr[i - 1].size == b->fr[i].off) { b->fr[i - 1].size += b->fr[i].size; memmove(&b->fr[i], &b->fr[i + 1], (size_t)(b->nfr - i - 1) * sizeof *b->fr); b->nfr--; }
+        if (b->used == 0) {                                                        // an empty block goes back to the driver, unless it is the only empty one of its type (kept for the next images)
+            int other_empty = 0; for (vkmem_blk_t *o = g_mblk; o; o = o->next) if (o != b && !o->dedicated && o->mt == b->mt && o->used == 0) other_empty = 1;
+            release = other_empty;
+        }
+    }
+    if (release) {
+        for (vkmem_blk_t **p = &g_mblk; *p; p = &(*p)->next) if (*p == b) { *p = b->next; break; }
+        vkFreeMemory(G.c.dev, b->mem, NULL); free(b->fr); free(b);
+    }
+    pthread_mutex_unlock(&g_mem_mu);
+    free(s);
+}
+VkDeviceMemory nvn_vk_mem_handle(const struct vkmem_sub *s) { return s->mem; }
+VkDeviceSize nvn_vk_mem_offset(const struct vkmem_sub *s) { return s->off; }
 static void reap(void) {                                  // return command buffers and images the GPU has finished with
     uint64_t done = nvn_gpu_completed();
     pthread_mutex_lock(&G.vk_mu);
@@ -263,21 +334,23 @@ static void reap(void) {                                  // return command buff
     G.nflight = k;
     k = 0;
     for (int i = 0; i < G.ndead; i++) {
-        if (G.dead[i].value <= done) { vkDestroyImageView(G.c.dev, G.dead[i].view, NULL); vkDestroyImage(G.c.dev, G.dead[i].img, NULL); vkFreeMemory(G.c.dev, G.dead[i].mem, NULL); }
+        if (G.dead[i].value <= done) { vkDestroyImageView(G.c.dev, G.dead[i].view, NULL); vkDestroyImage(G.c.dev, G.dead[i].img, NULL); if (G.dead[i].sub) nvn_vk_mem_free(G.dead[i].sub); else vkFreeMemory(G.c.dev, G.dead[i].mem, NULL); }
         else G.dead[k++] = G.dead[i];
     }
     G.ndead = k;
     pthread_mutex_unlock(&G.vk_mu);
 }
 // An image the game released: destroyed once every submission that may still use it has completed
-void nvn_vk_defer_image(VkImage img, VkImageView view, VkDeviceMemory mem) {
+static void defer_push(VkImage img, VkImageView view, VkDeviceMemory mem, struct vkmem_sub *sub) {
     if (!gpu()) return;
     pthread_mutex_lock(&G.vk_mu);
     uint64_t v = atomic_load(&G.submitted) + (G.cur ? 1 : 0);          // the submission being recorded counts: it may already mention the image
-    if (G.ndead == 256) { vkDeviceWaitIdle(G.c.dev); for (int i = 0; i < G.ndead; i++) { vkDestroyImageView(G.c.dev, G.dead[i].view, NULL); vkDestroyImage(G.c.dev, G.dead[i].img, NULL); vkFreeMemory(G.c.dev, G.dead[i].mem, NULL); } G.ndead = 0; }
-    G.dead[G.ndead].img = img; G.dead[G.ndead].view = view; G.dead[G.ndead].mem = mem; G.dead[G.ndead++].value = v;
+    if (G.ndead == G.cdead) { G.cdead = G.cdead ? G.cdead * 2 : 512; G.dead = realloc(G.dead, (size_t)G.cdead * sizeof *G.dead); }   // a batch of evictions makes hundreds at once: no waiting for the GPU to be idle
+    G.dead[G.ndead++] = (struct dead_ent){img, view, mem, sub, v};
     pthread_mutex_unlock(&G.vk_mu);
 }
+void nvn_vk_defer_image(VkImage img, VkImageView view, VkDeviceMemory mem) { defer_push(img, view, mem, NULL); }
+void nvn_vk_defer_image_sub(VkImage img, VkImageView view, struct vkmem_sub *sub) { defer_push(img, view, VK_NULL_HANDLE, sub); }
 // A command buffer of its own, submitted and waited for at once: for readbacks that cannot wait for a fence the game has not asked for
 VkCommandBuffer nvn_vk_oneshot_begin(void) {
     if (!gpu()) return NULL;

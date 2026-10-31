@@ -18,6 +18,12 @@ typedef struct { int slot; VkCommandBuffer cb; VkFence fence; uint32_t w, h; } m
 int mtl_read_async_begin(const tex_t *t, const NVNcopyRegion *r, mtl_rb_t *job);   // 0, or -1 when the texture is not one the GPU owns whole (read it with mtl_read_texels)
 const uint8_t *mtl_read_async_wait(const mtl_rb_t *job);
 void mtl_read_async_done(mtl_rb_t *job);
+// Device memory for images in pieces of shared blocks (nvn_vk.c); the pieces of an image are given back with it
+struct vkmem_sub;
+struct vkmem_sub *nvn_vk_mem_alloc(const VkMemoryRequirements *mr, uint32_t memtype);       // NULL when there is none
+void nvn_vk_mem_free(struct vkmem_sub *s);
+VkDeviceMemory nvn_vk_mem_handle(const struct vkmem_sub *s); VkDeviceSize nvn_vk_mem_offset(const struct vkmem_sub *s);
+void nvn_vk_defer_image_sub(VkImage img, VkImageView view, struct vkmem_sub *sub);          // destroy once the GPU has passed the submission being recorded, then give the memory back
 int nvn_vk_oneshot_submit(VkCommandBuffer cb, VkFence *fence);   // submit a one-shot command buffer without waiting for it
 int nvn_vk_oneshot_wait(VkFence fence);                          // 0 when it has completed
 void nvn_vk_oneshot_release(VkCommandBuffer cb, VkFence fence);  // free the command buffer and the fence once it has
