@@ -286,6 +286,24 @@ VkCommandBuffer nvn_vk_oneshot_begin(void) {
     pthread_mutex_unlock(&G.vk_mu);
     return cb;
 }
+// The same command buffer submitted without waiting: a fence says when it is done, nvn_vk_oneshot_wait blocks for it (no lock held) and nvn_vk_oneshot_release frees what it used
+int nvn_vk_oneshot_submit(VkCommandBuffer cb, VkFence *fence) {
+    vkEndCommandBuffer(cb);
+    VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    pthread_mutex_lock(&G.vk_mu);
+    VkResult r = vkCreateFence(G.c.dev, &fi, NULL, fence);
+    if (!r) r = vkQueueSubmit(G.c.queue, 1, &si, *fence);
+    pthread_mutex_unlock(&G.vk_mu);
+    return r ? -1 : 0;
+}
+int nvn_vk_oneshot_wait(VkFence fence) { return vkWaitForFences(G.c.dev, 1, &fence, VK_TRUE, 10ull * 1000000000ull) == VK_SUCCESS ? 0 : -1; }
+void nvn_vk_oneshot_release(VkCommandBuffer cb, VkFence fence) {
+    pthread_mutex_lock(&G.vk_mu);
+    if (fence) vkDestroyFence(G.c.dev, fence, NULL);
+    if (cb) vkFreeCommandBuffers(G.c.dev, G.c.pool, 1, &cb);
+    pthread_mutex_unlock(&G.vk_mu);
+}
 int nvn_vk_oneshot_end(VkCommandBuffer cb) {
     pthread_mutex_lock(&G.vk_mu);
     int r = vkctx_end(&G.c, cb);                          // ends, submits, waits on a fence, frees

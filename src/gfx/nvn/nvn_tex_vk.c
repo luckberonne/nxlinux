@@ -667,6 +667,35 @@ static vkbuf_t *rb_get(vkctx_t *c, size_t n) {                     // caller hol
     if (vkbuf_create(c, &g_rb, n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) return NULL;
     g_rb_size = n; return &g_rb;
 }
+// A readback that does not wait: the copy of a GPU-owned texture (the window's) into a host-cached buffer is submitted and a fence says when it is done. The caller (the presenter's thread)
+// waits for the fence and reads the pixels, tightly packed; the buffer is its until it releases the job. Returns -1 when the texture is not one the GPU owns whole, and the caller reads it as usual.
+static struct { vkbuf_t b; size_t cap; int busy; } g_arb[4]; static pthread_mutex_t g_arb_mu = PTHREAD_MUTEX_INITIALIZER;
+int mtl_read_async_begin(const tex_t *t, const NVNcopyRegion *r, mtl_rb_t *job) {
+    vkctx_t *c = nvn_vk_ctx(); vktex_t *e = find(t->serial);
+    if (!c || !e || !e->ok || e->is3d || e->bpb != 4 || e->astc || !(e->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || bc_block_size(e->fmt)) return -1;
+    if (!(__atomic_load_n(&SUB(e, 0, 0), __ATOMIC_ACQUIRE) & F_GPU)) return -1;
+    size_t bytes = (size_t)r->width * r->height * 4; int slot = -1;
+    pthread_mutex_lock(&g_arb_mu);
+    for (int i = 0; i < 4 && slot < 0; i++) if (!g_arb[i].busy) {
+        if (g_arb[i].cap < bytes) { if (g_arb[i].cap) vkbuf_destroy(c, &g_arb[i].b); g_arb[i].cap = 0; if (vkbuf_create(c, &g_arb[i].b, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) continue; g_arb[i].cap = bytes; }
+        g_arb[i].busy = 1; slot = i;
+    }
+    pthread_mutex_unlock(&g_arb_mu);
+    if (slot < 0) return -1;
+    VkCommandBuffer cb = nvn_vk_oneshot_begin();
+    if (!cb) { pthread_mutex_lock(&g_arb_mu); g_arb[slot].busy = 0; pthread_mutex_unlock(&g_arb_mu); return -1; }
+    nvn_vk_barrier_all(cb);
+    VkBufferImageCopy rg = {.bufferRowLength = (uint32_t)r->width, .bufferImageHeight = (uint32_t)r->height, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .imageOffset = {r->xoffset, r->yoffset, 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}};
+    vkCmdCopyImageToBuffer(cb, e->img, VK_IMAGE_LAYOUT_GENERAL, g_arb[slot].b.buf, 1, &rg);
+    VkFence f = VK_NULL_HANDLE;
+    if (nvn_vk_oneshot_submit(cb, &f)) { nvn_vk_oneshot_release(cb, f); pthread_mutex_lock(&g_arb_mu); g_arb[slot].busy = 0; pthread_mutex_unlock(&g_arb_mu); return -1; }
+    job->slot = slot; job->cb = cb; job->fence = f; job->w = (uint32_t)r->width; job->h = (uint32_t)r->height;
+    return 0;
+}
+const uint8_t *mtl_read_async_wait(const mtl_rb_t *job) { return nvn_vk_oneshot_wait(job->fence) ? NULL : (const uint8_t *)g_arb[job->slot].b.map; }
+void mtl_read_async_done(mtl_rb_t *job) { nvn_vk_oneshot_release(job->cb, job->fence); pthread_mutex_lock(&g_arb_mu); g_arb[job->slot].busy = 0; pthread_mutex_unlock(&g_arb_mu); }
+
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     vktex_t *e = find(t->serial);
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);

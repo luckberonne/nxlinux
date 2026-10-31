@@ -19,7 +19,7 @@
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint8_t *g_frame; static uint32_t g_fw, g_fh; static size_t g_fcap;      // the latest frame, RGBA8, tightly packed
-static uint64_t g_ticket, g_shown;                                              // tickets handed out / frames fully handled by the sink
+static uint64_t g_ticket, g_shown, g_pub;                                      // tickets handed out / frames fully handled by the sink / frames whose pixels are in g_frame
 static double g_last_time;
 static int g_sink_sdl, g_sink_init, g_quit;
 static _Atomic uint64_t g_count;
@@ -65,11 +65,11 @@ static void *sdl_thread(void *arg) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "[dm] [RED] [nvn] SDL video could not start (%s): frames go to memory only\n", SDL_GetError()); goto fail; }
     for (;;) {
         pthread_mutex_lock(&g_mu);
-        while (g_shown + 0 >= g_ticket && !g_quit) {                 // nothing new: wake up now and then to keep the window alive
+        while (g_shown + 0 >= g_pub && !g_quit) {                 // nothing new: wake up now and then to keep the window alive
             struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 16 * 1000 * 1000; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             if (pthread_cond_timedwait(&g_cv, &g_mu, &ts)) break;
         }
-        uint64_t upto = g_ticket; uint32_t w = g_fw, h = g_fh; uint8_t *copy = NULL;
+        uint64_t upto = g_pub; uint32_t w = g_fw, h = g_fh; uint8_t *copy = NULL;
         if (upto > seen && g_frame && w && h) { copy = malloc((size_t)w * h * 4); memcpy(copy, g_frame, (size_t)w * h * 4); }
         pthread_mutex_unlock(&g_mu);
         if (copy) {
@@ -121,14 +121,58 @@ static void sink_init(void) {
 // ---- the NVN layer's entry points
 static inline uint64_t present_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static _Atomic uint64_t g_pt_read, g_pt_swap, g_pt_wait, g_pt_n;   // where a present spends its time (reported every 300 presents: NX_PRESENT_STATS=1)
+// The presentation that does not make the game wait for the GPU: the copy of the window texture is submitted without waiting and a thread of its own picks the pixels up once the GPU has
+// finished the frame, puts them in g_frame and tells the sink. The game's wait for the display is relaxed to the frame before (one frame of latency, as nxnative's present snapshots), so
+// the frame limit stays. On for the window sink (and with NX_PRESENT_ASYNC for the memory sink); off for NX_PRESENT_SYNC and for the frame dumps, which need the pixels at once.
+typedef struct { uint64_t tk; mtl_rb_t rb; int swap; } pjob_t;
+static pjob_t g_jq[3]; static int g_jn, g_jbusy, g_worker_started, g_async_on;
+static pthread_cond_t g_jcv = PTHREAD_COND_INITIALIZER;                         // the job queue changed
+static int use_async(void) {
+    static int v = -1; if (v >= 0) return v;
+    v = (getenv("NX_PRESENT_SYNC") || getenv("NX_FRAME_DUMP")) ? 0 : (g_sink_sdl || getenv("NX_PRESENT_ASYNC")) ? 1 : 0;
+    return v;
+}
+static void *present_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_mu);
+        while (g_jn == 0) pthread_cond_wait(&g_jcv, &g_mu);
+        pjob_t j = g_jq[0]; g_jbusy = 1;
+        pthread_mutex_unlock(&g_mu);
+        const uint8_t *src = mtl_read_async_wait(&j.rb);                       // the GPU is done with the frame
+        pthread_mutex_lock(&g_mu);
+        size_t n = (size_t)j.rb.w * j.rb.h;
+        if (src && n * 4 > g_fcap) { free(g_frame); g_frame = malloc(n * 4); g_fcap = n * 4; }
+        if (src && g_frame) {
+            if (j.swap) { uint8_t *d = g_frame; for (size_t i = 0; i < n; i++) { d[i * 4] = src[i * 4 + 2]; d[i * 4 + 1] = src[i * 4 + 1]; d[i * 4 + 2] = src[i * 4]; d[i * 4 + 3] = src[i * 4 + 3]; } }
+            else memcpy(g_frame, src, n * 4);
+            g_fw = j.rb.w; g_fh = j.rb.h;
+        }
+        if (j.tk > g_pub) g_pub = j.tk;
+        if (!g_sink_sdl) g_shown = g_pub;
+        for (int i = 1; i < g_jn; i++) g_jq[i - 1] = g_jq[i];
+        g_jn--; g_jbusy = 0;
+        pthread_cond_broadcast(&g_cv); pthread_cond_broadcast(&g_jcv);
+        pthread_mutex_unlock(&g_mu);
+        mtl_read_async_done(&j.rb);
+    }
+    return NULL;
+}
+static void drain_jobs(void) {                                                  // before anything that publishes a frame itself: the order of the frames must hold
+    pthread_mutex_lock(&g_mu);
+    while (g_jn || g_jbusy) pthread_cond_wait(&g_jcv, &g_mu);
+    pthread_mutex_unlock(&g_mu);
+}
+
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     static int bad_fmt;
     (void)period_s;
+    pthread_mutex_lock(&g_mu); sink_init(); pthread_mutex_unlock(&g_mu);
     int fmt = (int)t->d.format;
     int swap = fmt == NVN_FORMAT_BGRA8 || fmt == NVN_FORMAT_BGRA8_SRGB;
     if (!(swap || fmt == NVN_FORMAT_RGBA8 || fmt == NVN_FORMAT_RGBA8_SRGB)) {
         if (!__atomic_exchange_n(&bad_fmt, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[dm] [RED] [nvn] present: the window texture has NVN format %#x; only RGBA8 and BGRA8 can be shown\n", fmt);
-        pthread_mutex_lock(&g_mu); uint64_t tk = ++g_ticket; if (!g_sink_sdl) g_shown = g_ticket; pthread_mutex_unlock(&g_mu);
+        pthread_mutex_lock(&g_mu); uint64_t tk = ++g_ticket; if (tk > g_pub) g_pub = tk; if (!g_sink_sdl) g_shown = g_ticket; pthread_mutex_unlock(&g_mu);
         return tk;
     }
     if (crop && !crop[2] && !crop[3]) crop = NULL;                    // an unset crop (all zeros) is the whole texture
@@ -137,9 +181,24 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (x + w > (int)t->d.width) w = (int)t->d.width - x;
     if (y + h > (int)t->d.height) h = (int)t->d.height - y;
     uint64_t tk;
-    if (w <= 0 || h <= 0) { pthread_mutex_lock(&g_mu); tk = ++g_ticket; if (!g_sink_sdl) g_shown = g_ticket; pthread_mutex_unlock(&g_mu); return tk; }
-    uint8_t *px = malloc((size_t)w * h * 4);
+    if (w <= 0 || h <= 0) { pthread_mutex_lock(&g_mu); tk = ++g_ticket; if (tk > g_pub) g_pub = tk; if (!g_sink_sdl) g_shown = g_ticket; pthread_mutex_unlock(&g_mu); return tk; }
     NVNcopyRegion r = {x, y, 0, w, h, 1};
+    if (use_async()) {                                                          // the copy is submitted and the frame is published by the worker once the GPU is done
+        pthread_mutex_lock(&g_mu); while (g_jn == 3) pthread_cond_wait(&g_jcv, &g_mu); pthread_mutex_unlock(&g_mu);
+        mtl_rb_t rb;
+        if (mtl_read_async_begin(t, &r, &rb) == 0) {
+            pthread_mutex_lock(&g_mu);
+            tk = ++g_ticket; g_last_time = now_s(); g_async_on = 1;
+            g_jq[g_jn].tk = tk; g_jq[g_jn].rb = rb; g_jq[g_jn].swap = swap; g_jn++;
+            if (!g_worker_started) { g_worker_started = 1; pthread_t th; if (pthread_create(&th, NULL, present_worker, NULL) == 0) pthread_detach(th); }
+            atomic_fetch_add(&g_count, 1);
+            pthread_cond_broadcast(&g_jcv);
+            pthread_mutex_unlock(&g_mu);
+            return tk;
+        }
+    }
+    drain_jobs();
+    uint8_t *px = malloc((size_t)w * h * 4);
     uint64_t pt0 = present_ns();
     mtl_read_texels(t, 0, 0, &r, px, (size_t)w * 4, (size_t)w * h * 4);
     uint64_t pt1 = present_ns();
@@ -173,7 +232,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     sink_init();
     if ((size_t)w * h * 4 > g_fcap) { free(g_frame); g_frame = malloc((size_t)w * h * 4); g_fcap = (size_t)w * h * 4; }
     memcpy(g_frame, px, (size_t)w * h * 4); g_fw = (uint32_t)w; g_fh = (uint32_t)h;
-    tk = ++g_ticket; g_last_time = now_s();
+    tk = ++g_ticket; if (tk > g_pub) g_pub = tk; g_last_time = now_s();
     if (!g_sink_sdl) g_shown = g_ticket;
     atomic_fetch_add(&g_count, 1);
     pthread_cond_broadcast(&g_cv);
@@ -185,7 +244,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
 void mtl_present_wait(uint64_t ticket) {
     uint64_t t0 = present_ns();
     pthread_mutex_lock(&g_mu);
-    while (g_shown < ticket && g_sink_sdl) pthread_cond_wait(&g_cv, &g_mu);
+    uint64_t slack = g_async_on ? 1 : 0;                                       // asynchronous frames: the frame before this one being shown is enough
+    while (g_shown + slack < ticket && g_sink_sdl) pthread_cond_wait(&g_cv, &g_mu);
     pthread_mutex_unlock(&g_mu);
     atomic_fetch_add(&g_pt_wait, present_ns() - t0);
     static int on = -1; if (on < 0) on = getenv("NX_PRESENT_STATS") != NULL;
@@ -193,7 +253,13 @@ void mtl_present_wait(uint64_t ticket) {
     if (on && n % 300 == 0) fprintf(stderr, "[dm] [nvn] present per frame over the last 300: GPU read-back %.2f ms, BGRA->RGBA %.2f ms, wait for the window %.2f ms\n",
         (double)atomic_exchange(&g_pt_read, 0) / 300e6, (double)atomic_exchange(&g_pt_swap, 0) / 300e6, (double)atomic_exchange(&g_pt_wait, 0) / 300e6);
 }
-void mtl_present_flush(void) { pthread_mutex_lock(&g_mu); uint64_t t = g_ticket; pthread_mutex_unlock(&g_mu); mtl_present_wait(t); }
+void mtl_present_flush(void) {
+    pthread_mutex_lock(&g_mu);
+    while (g_pub < g_ticket) pthread_cond_wait(&g_cv, &g_mu);                  // every frame handed out has its pixels in place
+    uint64_t t = g_ticket;
+    while (g_shown < t && g_sink_sdl) pthread_cond_wait(&g_cv, &g_mu);
+    pthread_mutex_unlock(&g_mu);
+}
 int mtl_has_window(void) { return g_sink_sdl; }
 int mtl_display_hz(void) { return 60; }
 double mtl_presented_time(uint64_t n) { pthread_mutex_lock(&g_mu); double t = n == g_ticket ? g_last_time : 0.0; pthread_mutex_unlock(&g_mu); return t; }

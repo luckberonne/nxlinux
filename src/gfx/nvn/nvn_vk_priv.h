@@ -13,6 +13,14 @@ void nvn_vk_keep(const vkbuf_t *b);
 // Short-lived uniform data for the submission being recorded (driver segments, support buffers): a piece of a large host-visible buffer, reused once the
 // GPU has finished the submissions that read it. Returns 0 and fills *out and *map, or -1.
 int nvn_vk_transient(size_t size, VkDescriptorBufferInfo *out, void **map);
+// A texture readback that does not wait (nvn_tex_vk.c): begin submits the copy, wait blocks until the GPU has done it and gives the pixels (w * h * 4 bytes, tightly packed), done lets the buffer go
+typedef struct { int slot; VkCommandBuffer cb; VkFence fence; uint32_t w, h; } mtl_rb_t;
+int mtl_read_async_begin(const tex_t *t, const NVNcopyRegion *r, mtl_rb_t *job);   // 0, or -1 when the texture is not one the GPU owns whole (read it with mtl_read_texels)
+const uint8_t *mtl_read_async_wait(const mtl_rb_t *job);
+void mtl_read_async_done(mtl_rb_t *job);
+int nvn_vk_oneshot_submit(VkCommandBuffer cb, VkFence *fence);   // submit a one-shot command buffer without waiting for it
+int nvn_vk_oneshot_wait(VkFence fence);                          // 0 when it has completed
+void nvn_vk_oneshot_release(VkCommandBuffer cb, VkFence fence);  // free the command buffer and the fence once it has
 void nvn_vk_barrier_all(VkCommandBuffer cb);   // immediate full barrier (used by OP_BARRIER and OP_UPDATE_UB)
 void nvn_vk_barrier_mark(void);                // deferred mark: a full barrier is needed before the next read
 void nvn_vk_barrier_flush(VkCommandBuffer cb);  // emits one full barrier if a deferred one is pending (many marks collapse into a single)
