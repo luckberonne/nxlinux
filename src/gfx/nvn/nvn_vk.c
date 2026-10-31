@@ -325,6 +325,13 @@ uint64_t mtl_sub_commit(void) {
     post_enqueue(value);
     return value;
 }
+// Hands what has been recorded so far to the GPU and goes on in a new command buffer: the GPU starts the frame's first passes while the host is still translating the rest, instead of
+// waiting for the whole frame. The fences of the segments are in queue order, so the frame's own (the last) still completes last. Called between two passes.
+void mtl_sub_cut(void) {
+    if (!gpu() || !G.cur) return;
+    mtl_sub_commit();
+    mtl_sub_begin();
+}
 uint64_t mtl_last_fence(void) { return gpu() ? atomic_load(&G.submitted) : 0; }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     if (!gpu() || !fence) return 1;

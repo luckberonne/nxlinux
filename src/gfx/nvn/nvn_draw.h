@@ -12,6 +12,7 @@ int nvn_draw_pass_active(void);                 // 1 while a render pass is open
 void nvn_draw_new_submission(void);              // a new command buffer: nothing is bound in it yet
 int nvn_draw_state_op(uint32_t op, const void *payload);    // state records the draw reads; 1 if consumed
 void nvn_draw(const p_draw *d);
+void nvn_dispatch(const p_dispatch *d);        // compute: runs the compute program bound, outside any render pass
 void nvn_draw_idx(const p_draw_idx *d);
 
 uint64_t nvn_draw_count(void);                   // draws recorded into command buffers

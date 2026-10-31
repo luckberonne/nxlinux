@@ -110,8 +110,10 @@ void mtl_exec(const uint8_t *p) {
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); update_ub(d, n, a + 16); break; }
         case OP_BARRIER: { VkCommandBuffer cb = nvn_vk_cmd_raw(); if (!cb) break; if (nvn_draw_pass_active()) nvn_vk_barrier_mark(); else { nvn_vk_barrier_flush(cb); nvn_vk_barrier_all(cb); } break; }   // a full barrier covers every combination of the game's bits; inside a pass it cannot be recorded, so it waits for the pass to end
         case OP_COPY_STRIDE: { const p_copy_stride *cs = (const p_copy_stride *)a; if (cs->image) g_copy_img = (uint64_t)cs->stride; else g_copy_row = (uint64_t)cs->stride; break; }
-        case OP_COPY_B2T: nvn_vk_copy_b2t((const p_copy_b2t *)a, g_copy_row, g_copy_img); break;
-        case OP_COPY_T2B: nvn_vk_copy_t2b((const p_copy_b2t *)a, g_copy_row, g_copy_img); break;   // the record is a p_copy_b2t whose src is the destination buffer
+        case OP_COPY_B2T: { extern int nvn_trace_frame_now(void); if (nvn_trace_frame_now()) { const p_copy_b2t *q = (const p_copy_b2t *)a; fprintf(stderr, "[dm] [nvn] trace copy buffer->texture: serial %llu %dx%d at (%d,%d), source %#llx\n", q->tex ? (unsigned long long)q->tex->serial : 0ull, q->r.width, q->r.height, q->r.xoffset, q->r.yoffset, (unsigned long long)q->src); }
+            nvn_vk_copy_b2t((const p_copy_b2t *)a, g_copy_row, g_copy_img); break; }
+        case OP_COPY_T2B: { extern int nvn_trace_frame_now(void); if (nvn_trace_frame_now()) { const p_copy_b2t *q = (const p_copy_b2t *)a; fprintf(stderr, "[dm] [nvn] trace copy texture->buffer: serial %llu %dx%d, destination %#llx\n", q->tex ? (unsigned long long)q->tex->serial : 0ull, q->r.width, q->r.height, (unsigned long long)q->src); }
+            nvn_vk_copy_t2b((const p_copy_b2t *)a, g_copy_row, g_copy_img); break; }   // the record is a p_copy_b2t whose src is the destination buffer
         case OP_SET_RT: {
             const p_set_rt *r = (const p_set_rt *)a;
             memset(&g_rt, 0, sizeof g_rt); g_rt.n = r->n > 8 ? 8 : r->n;
@@ -121,6 +123,7 @@ void mtl_exec(const uint8_t *p) {
         case OP_SCISSOR: { const p_scissor *sc = (const p_scissor *)a; g_sc.has = 1; g_sc.r[0] = sc->x; g_sc.r[1] = sc->y; g_sc.r[2] = sc->w; g_sc.r[3] = sc->h; break; }
         case OP_DRAW: { p_draw t; nvn_draw(draw_rec(a, h.size, &t)); break; }
         case OP_DRAW_IDX: { p_draw_idx t; nvn_draw_idx(draw_idx_rec(a, h.size, &t)); break; }
+        case OP_DISPATCH: { p_dispatch t; memset(&t, 0, sizeof t); memcpy(&t, a, h.size < sizeof t ? h.size : sizeof t); nvn_dispatch(&t); break; }
         case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SSBO:
         case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_STENCIL: case OP_PRIM_RESTART: case OP_RAST_DISCARD:
             nvn_draw_state_op(h.op, a); break;
@@ -135,6 +138,7 @@ void mtl_exec(const uint8_t *p) {
             nvn_vk_clear_ds(g_rt.dser, &g_rt.dview, g_rt.has_dview, cd->depth, cd->depth_mask, cd->stencil, cd->stencil_mask, g_sc.has ? g_sc.r : NULL);
             break; }
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;                        // descriptor pool state: only a draw or a dispatch reads it
+        case OP_CLEAR_TEX: { extern int nvn_trace_frame_now(void); if (nvn_trace_frame_now()) { const p_clear_tex *q = (const p_clear_tex *)a; fprintf(stderr, "[dm] [nvn] trace clear texture (not executed): serial %llu %dx%d\n", q->tex ? (unsigned long long)q->tex->serial : 0ull, q->r.width, q->r.height); } pending(h.op); break; }
         default:
             if (h.op < OP_COUNT_) pending(h.op);
             else fprintf(stderr, "[dm] [RED] [nvn] replay: unknown command record %u\n", h.op);

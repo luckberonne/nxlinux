@@ -159,6 +159,16 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             fprintf(stderr, "[dm] [nvn] frame %u written to %s: %zu of %zu pixels are not black (texture serial %llu)\n", nth, fn, lit, (size_t)w * h, (unsigned long long)t->serial);
         }
     }
+    {   // NX_DRAW_TRACE=<n> with NX_FRAME_DUMP: every target the traced frame drew into goes to <prefix>.<n>.rt<serial>.ppm (RGBA8 and RGBA16F), with its format and how much of it is not zero
+        static long tf = -2; if (tf == -2) tf = getenv("NX_DRAW_TRACE") ? atol(getenv("NX_DRAW_TRACE")) : -1;
+        if (tf >= 0 && getenv("NX_FRAME_DUMP") && (long)atomic_load(&g_count) == tf) {
+            extern int nvn_draw_trace_targets(uint64_t *, int); extern int nvn_vk_debug_info(uint64_t, unsigned *, unsigned *, unsigned *, unsigned *, unsigned *); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *);
+            uint64_t ser[600]; int ns = nvn_draw_trace_targets(ser, 600);
+            for (int i = 0; i < ns; i++) { unsigned f = 0, tw = 0, th = 0, lv = 0, dd = 0; if (!nvn_vk_debug_info(ser[i], &f, &tw, &th, &lv, &dd)) { fprintf(stderr, "[dm] [nvn] trace target serial %llu: not in the table\n", (unsigned long long)ser[i]); continue; }
+                char fn[640]; snprintf(fn, sizeof fn, "%s.%ld.rt%llu.ppm", getenv("NX_FRAME_DUMP"), tf + 1, (unsigned long long)ser[i]); size_t tot = 0; long lit = nvn_vk_debug_lit(ser[i], &tot, fn);
+                { extern int nvn_vk_debug_mem(uint64_t, uint64_t *, uint64_t *); uint64_t mm = 0, ms = 0; nvn_vk_debug_mem(ser[i], &mm, &ms); fprintf(stderr, "[dm] [nvn] trace target serial %llu: %ux%u format %#x levels %u%s, %ld of %zu bytes not zero, storage %#llx +%#llx\n", (unsigned long long)ser[i], tw, th, f, lv, dd ? " (finalized)" : "", lit, tot, (unsigned long long)mm, (unsigned long long)ms); } }
+        }
+    }
     pthread_mutex_lock(&g_mu);
     sink_init();
     if ((size_t)w * h * 4 > g_fcap) { free(g_frame); g_frame = malloc((size_t)w * h * 4); g_fcap = (size_t)w * h * 4; }

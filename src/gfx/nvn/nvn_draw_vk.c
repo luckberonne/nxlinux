@@ -34,6 +34,7 @@ VkDescriptorBufferInfo nvn_shader_c1(const nvn_shader *s);       // the shader's
 VkShaderModule nvn_shader_module(nvn_shader *s);
 
 nvn_rt_t g_rt;
+int nvn_trace_frame_now(void);                   // 1 while the frame NX_DRAW_TRACE names is being replayed
 struct nvn_scissor_state g_sc;
 static _Atomic uint64_t g_ndraw, g_nskip, g_npipe;
 uint64_t nvn_draw_main_target(void);
@@ -47,6 +48,7 @@ enum { NTEXSLOT = 256 };                        // DMSH_C2_TEX_SLOTS combined sl
 static struct {
     int init;
     const prog_t *prog; int nkeys; uint8_t keys[6][8];
+    const prog_t *cprog;                        // the compute program (bound apart from the graphics one)
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
     uint32_t attr[16]; int nattr; vs_st stream[16]; int nstream; NVNbufferRange vbuf[16];
     p_bind_buf ubo[6][16], ssbo[6][16];
@@ -83,6 +85,7 @@ int nvn_draw_state_op(uint32_t op, const void *a) {
     case OP_BIND_PROGRAM: {
         const p_bind_program *b = a;
         if (b->stages & 0x1f) { S.prog = b->prog; S.nkeys = b->prog ? nvn_prog_keys(b->prog, S.keys) : 0; }
+        if (b->stages & 0x20) S.cprog = b->prog;
         return 1; }
     case OP_BIND_STATE: {
         const p_bind_state *b = a; blend_st bs;
@@ -181,6 +184,7 @@ static pipe_entry *g_pipes;
 enum { PIPE_BUCKETS = 4096 };                             // a course builds thousands of pipelines, and every draw looks one up: a chain of four at most, not a walk over all of them
 static pipe_entry *g_pbuck[PIPE_BUCKETS];
 static pthread_mutex_t g_pmu = PTHREAD_MUTEX_INITIALIZER;
+static unsigned g_since_cut;                                                   // draws made since the last cut of the submission
 static _Atomic uint64_t g_nplook, g_nplast, g_npnew;      // lookups, answered by the last-key cache, built (for the per-frame statistics)
 void nvn_draw_pipe_stats(uint64_t *look, uint64_t *last, uint64_t *made) {
     *look = atomic_load(&g_nplook); *last = atomic_load(&g_nplast); *made = atomic_load(&g_npnew);
@@ -317,6 +321,7 @@ static VkBuffer zero_buffer(vkctx_t *c) {                         // what an unb
 enum { SUPPORT_SIZE = 1392 };                                         // the translator's SupportBuffer (std140: alpha test 0, is_bgra 16, viewport inverse 144, size 160, frag scale count 176, render scale 192)
 static void put_f(uint8_t *b, size_t off, float v) { memcpy(b + off, &v, 4); }
 static void put_u(uint8_t *b, size_t off, uint32_t v) { memcpy(b + off, &v, 4); }
+static int32_t g_disp_dim[3];                                     // the dispatch being prepared: c[0] carries its group counts for the shaders (DMSH_C0_DISPATCH)
 static VkDescriptorBufferInfo driver_buffer(vkctx_t *c, int kind, int stage, float vw, float vh) {
     size_t size = kind == NVN_SB_SUPPORT ? SUPPORT_SIZE : DMSH_DRV_SIZE;
     vkbuf_t b = {0}; VkDescriptorBufferInfo r; void *mp;
@@ -332,7 +337,8 @@ static VkDescriptorBufferInfo driver_buffer(vkctx_t *c, int kind, int stage, flo
         float ps = c->props.limits.pointSizeRange[1]; if (ps > 64.0f) ps = 64.0f;
         put_f(m, DMSH_C0_POINT_SIZE, ps);                                                // the largest point size GLSLC clamps to; 64 on every device that has at least that
         put_u(m, DMSH_C0_BASE_INSTANCE, (uint32_t)g_base_instance);
-        size_t tbl = stage == 0 ? DMSH_C0_SSBO_VS : DMSH_C0_SSBO_PS;                     // the stage's storage buffers: address and size, 0x10 per slot
+        if (stage == 5) for (int q = 0; q < 3; q++) put_u(m, DMSH_C0_DISPATCH + 4 * q, (uint32_t)g_disp_dim[q]);
+        size_t tbl = stage == 0 ? DMSH_C0_SSBO_VS : stage == 5 ? DMSH_C0_SSBO_CS : DMSH_C0_SSBO_PS;                     // the stage's storage buffers: address and size, 0x10 per slot
         for (int r = 0; r < DMSH_C0_SSBO_SLOTS; r++) {
             memcpy(m + tbl + (size_t)r * DMSH_C0_ROW, &S.ssbo[stage][r].addr, 8);
             put_u(m, tbl + (size_t)r * DMSH_C0_ROW + 8, (uint32_t)S.ssbo[stage][r].size);
@@ -376,6 +382,11 @@ static int vertex_fmt(int f, VkFormat *vf) {
 static int prepare(unsigned prim, pipe_entry **pe_out) {
     static int f_ntex, f_tex, f_needs, f_noprog, f_noshader, f_prim, f_vbuf, f_vattr, f_nort, f_pipe, f_fmt, f_off;
     state_init();
+    {   // NX_CUT=<n> (default 64, 0 = off): after n draws, before a new render pass, the recorded work goes to the GPU (mtl_sub_cut), so GPU and host overlap
+        static int cut = -1; if (cut < 0) cut = getenv("NX_CUT") ? atoi(getenv("NX_CUT")) : 64;
+        extern void mtl_sub_cut(void);
+        if (cut > 0 && g_since_cut >= (unsigned)cut && (!P.active || !rt_same(&P.rt, &g_rt))) { mtl_sub_cut(); g_since_cut = 0; }
+    }
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd_raw();
     if (!c || !cb) return 0;
     if (!P.active) nvn_vk_barrier_flush(cb);                      // never inside an open pass
@@ -482,7 +493,8 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     k.discard = S.rast_discard != 0;
     k.neg1 = !atomic_load(&g_depth_zero);
     int has_depth = k.dfmt != VK_FORMAT_UNDEFINED, has_stencil = k.sfmt != VK_FORMAT_UNDEFINED;
-    k.dt = S.ds.dt && has_depth; k.dw = S.ds.dw && has_depth; k.dfunc = (uint8_t)cmp(S.ds.df); k.st_en = S.ds.st && has_stencil;
+    k.dt = S.ds.dt && has_depth; k.dw = S.ds.dw && has_depth; k.dfunc = (uint8_t)cmp(S.ds.df); { static int eq = -1; if (eq < 0) eq = getenv("NX_DEPTH_EQUAL_LEQUAL") != NULL; if (eq && k.dfunc == VK_COMPARE_OP_EQUAL) k.dfunc = VK_COMPARE_OP_LESS_OR_EQUAL; }   // NX_DEPTH_EQUAL_LEQUAL=1: a depth-equal colour pass tests less-or-equal (experiment)
+    k.st_en = S.ds.st && has_stencil;
     k.sf[0].func = (uint8_t)cmp(S.ds.sf_f); k.sf[0].fail = (uint8_t)sop(S.ds.fail_f); k.sf[0].zfail = (uint8_t)sop(S.ds.zfail_f); k.sf[0].zpass = (uint8_t)sop(S.ds.zpass_f);
     k.sf[1].func = (uint8_t)cmp(S.ds.sf_b); k.sf[1].fail = (uint8_t)sop(S.ds.fail_b); k.sf[1].zfail = (uint8_t)sop(S.ds.zfail_b); k.sf[1].zpass = (uint8_t)sop(S.ds.zpass_b);
     for (int i = 0; i < k.ncolor; i++) {
@@ -601,8 +613,84 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     return 1;
 }
 
+
+// ---- compute: a dispatch runs the compute program bound with the textures, uniform and storage buffers of stage 5. Its pipelines are kept by shader; the layout is a push descriptor set like a draw's.
+static struct cpipe { const nvn_shader *sh; VkPipeline pipe; VkPipelineLayout layout; } g_cp[128]; static int g_ncp;
+static struct cpipe *compute_pipeline(vkctx_t *c, const nvn_shader *sh) {
+    for (int i = 0; i < g_ncp; i++) if (g_cp[i].sh == sh) return &g_cp[i];
+    if (g_ncp == 128) return NULL;
+    VkDescriptorSetLayoutBinding lb[32]; int nb = 0; int n; const nvn_shbind *b = nvn_shader_binds(sh, &n);
+    for (int i = 0; i < n; i++) {
+        int j = 0; for (; j < nb; j++) if (lb[j].binding == b[i].binding) break;
+        if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].kind == NVN_SB_TEX ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : (b[i].kind == NVN_SB_SBUF || b[i].kind == NVN_SB_SBUF_UBO) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}; }
+    }
+    VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = (uint32_t)nb, .pBindings = lb};
+    VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe;
+    if (vkCreateDescriptorSetLayout(c->dev, &di, NULL, &dsl)) return NULL;
+    VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl};
+    if (vkCreatePipelineLayout(c->dev, &li, NULL, &pl)) return NULL;
+    VkShaderModule mod = nvn_shader_module((nvn_shader *)sh); if (!mod) return NULL;
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mod, .pName = "main"}, .layout = pl};
+    if (vkCreateComputePipelines(c->dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipe)) return NULL;
+    g_cp[g_ncp] = (struct cpipe){sh, pipe, pl};
+    return &g_cp[g_ncp++];
+}
+void nvn_dispatch(const p_dispatch *d) {
+    static int f_ind, f_noprog, f_nosh, f_pipe, f_tex, f_cs;
+    state_init();
+    vkctx_t *c = nvn_vk_ctx(); if (!c) return;
+    static _Atomic unsigned ndisp; unsigned k = atomic_fetch_add(&ndisp, 1) + 1;
+    if (d->ind) { skip("indirect dispatches are not supported yet", &f_ind); return; }
+    if (!S.cprog) { skip("a dispatch with no compute program bound", &f_noprog); return; }
+    uint8_t keys[6][8]; int nk = nvn_prog_keys(S.cprog, keys);
+    const nvn_shader *sh = nk ? nvn_shader_find(keys[0]) : NULL;
+    if (!sh) { uint8_t ak[8]; if (prog_alt_key(S.cprog, 0, ak) && (sh = nvn_shader_find(ak)) && nk) nvn_shader_alias(keys[0], sh); }
+    if (!sh) { skip("the compute program is not in the shader library", &f_nosh); return; }
+    if (nvn_shader_stage(sh) != NVN_STAGE_COMPUTE) { skip("the program bound for compute is not a compute shader", &f_cs); return; }
+    if (nvn_shader_needs(sh)) { static int f_needs; char why[120]; snprintf(why, sizeof why, "a compute shader needs what the dispatch path cannot supply yet (needs %#x)", nvn_shader_needs(sh)); skip(why, &f_needs); return; }
+    g_disp_dim[0] = d->x; g_disp_dim[1] = d->y; g_disp_dim[2] = d->z;
+    VkCommandBuffer cb = nvn_vk_cmd();                                   // ends the render pass: a dispatch cannot run inside one
+    if (!cb) return;
+    VkDescriptorImageInfo ti[16]; uint32_t tbind[16]; int nt = 0;
+    int n; const nvn_shbind *b = nvn_shader_binds(sh, &n);
+    for (int i = 0; i < n; i++) {
+        if (b[i].kind != NVN_SB_TEX) continue;
+        if (b[i].reg >= NTEXSLOT || nt == 16) { skip("a compute shader samples more textures than the dispatch path binds", &f_tex); return; }
+        int r = nvn_vk_desc_sampled(S.tex[5][b[i].reg], (int)b[i].aux, &ti[nt]);
+        if (r != 1) { skip("a compute shader reads a texture that cannot be sampled", &f_tex); return; }
+        tbind[nt++] = b[i].binding;
+    }
+    struct cpipe *cp = compute_pipeline(c, sh);
+    if (!cp) { skip("the compute pipeline could not be built", &f_pipe); return; }
+    VkDescriptorBufferInfo bi[32]; VkWriteDescriptorSet wr[32]; int nw = 0;
+    for (int i = 0; i < n && nw < 32; i++) {
+        if (b[i].kind == NVN_SB_SUPPORT || b[i].kind == NVN_SB_DRV0 || b[i].kind == NVN_SB_DRV2) { bi[nw] = driver_buffer(c, (int)b[i].kind, 5, 0, 0); wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nw]}; nw++; continue; }
+        if (b[i].kind == NVN_SB_C1) { bi[nw] = nvn_shader_c1(sh); if (!bi[nw].buffer) bi[nw] = (VkDescriptorBufferInfo){zero_buffer(c), 0, 4096}; wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nw]}; nw++; continue; }
+        if (b[i].kind == NVN_SB_SBUF && b[i].reg < 16) {
+            const p_bind_buf *u = &S.ssbo[5][b[i].reg]; VkBuffer sbuf; VkDeviceSize soff;
+            if (u->addr && u->size && nvn_vk_pool_buffer(u->addr, u->size, &sbuf, &soff)) bi[nw] = (VkDescriptorBufferInfo){sbuf, soff, u->size}; else bi[nw] = (VkDescriptorBufferInfo){zero_storage(c), 0, 4096};
+            wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[nw]}; nw++; continue; }
+        if (b[i].kind == NVN_SB_SBUF_UBO && b[i].reg < 16) {                   // the game's uniform slot, bound as the storage buffer the shader reads it through
+            const p_bind_buf *u = &S.ubo[5][b[i].reg]; VkBuffer sbuf; VkDeviceSize soff;
+            if (u->addr && u->size && nvn_vk_pool_buffer(u->addr, u->size, &sbuf, &soff)) bi[nw] = (VkDescriptorBufferInfo){sbuf, soff, u->size}; else bi[nw] = (VkDescriptorBufferInfo){zero_storage(c), 0, 4096};
+            wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[nw]}; nw++; continue; }
+        if (b[i].kind != NVN_SB_CBUF || b[i].reg >= 16) continue;
+        const p_bind_buf *u = &S.ubo[5][b[i].reg]; VkBuffer ub; VkDeviceSize uoff;
+        if (u->addr && u->size && nvn_vk_pool_buffer(u->addr, u->size, &ub, &uoff)) bi[nw] = (VkDescriptorBufferInfo){ub, uoff, u->size}; else bi[nw] = (VkDescriptorBufferInfo){zero_buffer(c), 0, 4096};
+        wr[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b[i].binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[nw]}; nw++;
+    }
+    for (int i = 0; i < nt && nw < 32; i++) wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = tbind[i], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ti[i]};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
+    if (nw) c->CmdPushDescriptorSet(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->layout, 0, (uint32_t)nw, wr);
+    vkCmdDispatch(cb, d->x > 0 ? (uint32_t)d->x : 0, d->y > 0 ? (uint32_t)d->y : 0, d->z > 0 ? (uint32_t)d->z : 0);
+    nvn_vk_barrier_all(cb);                                              // what the dispatch wrote is visible to every later read, draw, copy or dispatch
+    if (nvn_trace_frame_now()) fprintf(stderr, "[dm] [nvn] trace dispatch: shader %02x%02x%02x%02x, %d x %d x %d groups, %d bindings, g-ssbo5: %llx/%llu %llx/%llu %llx/%llu\n", keys[0][0], keys[0][1], keys[0][2], keys[0][3], d->x, d->y, d->z, nw, (unsigned long long)S.ssbo[5][0].addr, (unsigned long long)S.ssbo[5][0].size, (unsigned long long)S.ssbo[5][1].addr, (unsigned long long)S.ssbo[5][1].size, (unsigned long long)S.ssbo[5][2].addr, (unsigned long long)S.ssbo[5][2].size);
+    if (k == 1 || (k < 20 && getenv("NX_SKIP_LOG"))) fprintf(stderr, "[dm] [nvn] dispatch #%u: compute shader key %02x%02x%02x%02x, %d x %d x %d groups, %d bindings\n", k, sh ? keys[0][0] : 0, keys[0][1], keys[0][2], keys[0][3], d->x, d->y, d->z, nw);
+}
+
 // NX_DRAW_LOG=1: the first draws made, then one line per 4000, with the totals and the render target they went to
 static void draw_note(uint32_t count) {
+    g_since_cut++;
     uint64_t n = atomic_fetch_add(&g_ndraw, 1) + 1;
     if (getenv("NX_DRAW_DETAIL") && n >= 6000 && n < 6024) { const blend_st *bl = &S.blend[0]; fprintf(stderr, "[dm] [nvn] draw %llu: target %llu chmask %#x blend_en %#x src_rgb %u dst_rgb %u eq %u alpha_func %u keys %02x%02x/%02x%02x\n", (unsigned long long)n, (unsigned long long)g_rt.cser[0], S.chmask.mask & 0xf, S.color.blend_en, (unsigned)bl->src_rgb, (unsigned)bl->dst_rgb, (unsigned)bl->eq_rgb, S.color.alpha_func, S.keys[0][0], S.keys[0][1], S.keys[1][0], S.keys[1][1]); }
     if (g_rt.n && g_rt.cser[0] > 100) atomic_store(&g_main_target, g_rt.cser[0]);       // the last offscreen colour target (the window textures have small serials)
@@ -614,11 +702,54 @@ static void draw_note(uint32_t count) {
     if (on && (n <= 5 || n % 4000 == 0)) fprintf(stderr, "[dm] [nvn] draw %llu made (%u vertices/indices), %llu skipped so far, render targets %d, depth-stencil %d, pass %ux%u, colour target serial %llu\n", (unsigned long long)n, count, (unsigned long long)atomic_load(&g_nskip), g_rt.n, g_rt.dser ? 1 : 0, P.w, P.h, (unsigned long long)g_rt.cser[0]);
 }
 
+// NX_DRAW_TRACE=<frame>: one line for each draw of that presented frame (its number counts the presents so far): the colour and depth targets, the depth and cull state, the keys of the program's
+// stages and the size. NX_DRAW_SKIP=<a>-<b>: the draws of that frame whose index lies in the range are made ready but not drawn, to see which of them paint a region (compare the two frames).
+static uint64_t g_trace_ser[600]; static int g_trace_n;                       // the colour and depth targets drawn into during the traced frame (dumped by the present)
+void nvn_draw_trace_note_target(uint64_t s) { for (int i = 0; i < g_trace_n; i++) if (g_trace_ser[i] == s) return; if (g_trace_n < 600) g_trace_ser[g_trace_n++] = s; }
+int nvn_draw_trace_targets(uint64_t *out, int max) { int n = g_trace_n < max ? g_trace_n : max; memcpy(out, g_trace_ser, (size_t)n * sizeof *out); return n; }
+extern uint64_t nvn_present_count(void);
+int nvn_trace_frame_now(void) {        // 1 while the frame NX_DRAW_TRACE names is being replayed
+    static long frame = -2; if (frame == -2) { const char *e = getenv("NX_DRAW_TRACE"); frame = e ? atol(e) : -1; }
+    return frame >= 0 && (long)nvn_present_count() == frame;
+}
+static int trace_draw(const char *what, uint32_t count, int *skip_it) {
+    static long frame = -2, sa = -1, sb = -1;
+    if (frame == -2) { const char *e = getenv("NX_DRAW_TRACE"); frame = e ? atol(e) : -1; const char *k = getenv("NX_DRAW_SKIP"); if (k) sscanf(k, "%ld-%ld", &sa, &sb); }
+    *skip_it = 0;
+    if (frame < 0 || (long)nvn_present_count() != frame) return 0;
+    static long idx = -1, seen_frame = -1; if (seen_frame != frame) { seen_frame = frame; idx = -1; }
+    idx++;
+    if (sa >= 0 && idx >= sa && idx <= sb) *skip_it = 1;
+    { extern void nvn_draw_trace_note_target(uint64_t); for (int i = 0; i < g_rt.n; i++) if (g_rt.cser[i]) nvn_draw_trace_note_target(g_rt.cser[i]); if (g_rt.dser) nvn_draw_trace_note_target(g_rt.dser); }
+    fprintf(stderr, "[dm] [nvn] trace draw %ld %s%s: count %u colour %llu depth %llu rts %d ds dt %d dw %d df %d cull %d front %d blend0 src %u dst %u keys", idx, what, *skip_it ? " (skipped)" : "", count,
+            (unsigned long long)g_rt.cser[0], (unsigned long long)g_rt.dser, g_rt.n, (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, (int)S.poly.cull, (int)S.poly.front, S.blend[0].src_rgb, S.blend[0].dst_rgb);
+    for (int i = 0; i < S.nkeys; i++) { fprintf(stderr, " "); for (int b = 0; b < 4; b++) fprintf(stderr, "%02x", S.keys[i][b]); }
+    fprintf(stderr, "\n");
+    if (getenv("NX_DRAW_TRACE_DETAIL")) {      // channel mask, blend enable, viewport and scissor of the draw
+        fprintf(stderr, "[dm] [nvn]   draw %ld state chmask %#x blend_en %#x logic %u has_vp %d vp0 %g %g %g %g depth %g %g scissor %d: %d %d %d %d\n", idx, (unsigned)S.chmask.mask, (unsigned)S.color.blend_en, (unsigned)S.color.logic_op, S.has_vp, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], S.vp[0][4], S.vp[0][5], g_sc.has, g_sc.r[0], g_sc.r[1], g_sc.r[2], g_sc.r[3]);
+    }
+    if (getenv("NX_DRAW_TRACE_DETAIL")) {      // the vertex attribute formats (NVN format numbers) and the texture handles of each stage
+        fprintf(stderr, "[dm] [nvn]   draw %ld attrs", idx);
+        for (int i = 0; i < S.nattr && i < 16; i++) { va_st a; memcpy(&a, &S.attr[i], sizeof a); fprintf(stderr, " %d:f%#x/s%u", i, (unsigned)a.fmt, (unsigned)a.stream); }
+        if (count <= 2000 || count >= 8000) { extern uint64_t nvn_vk_desc_serial(uint32_t); for (int st = 0; st < 6; st++) for (int sl = 0; sl < NTEXSLOT; sl++) if (S.tex[st][sl]) { uint64_t sr = nvn_vk_desc_serial(S.tex[st][sl]); if (sr) nvn_draw_trace_note_target(sr); } }   // the textures a small (lighting) draw reads are dumped too
+        fprintf(stderr, " | tex");
+        for (int st = 0; st < 6; st++) for (int sl = 0; sl < NTEXSLOT; sl++) if (S.tex[st][sl]) { extern uint64_t nvn_vk_desc_serial(uint32_t); fprintf(stderr, " s%d.%d=id%u/smp%u/ser%llu", st, sl, S.tex[st][sl] & 0xfffff, S.tex[st][sl] >> 20, (unsigned long long)nvn_vk_desc_serial(S.tex[st][sl])); }
+        fprintf(stderr, "\n");
+    }
+    if (count >= 10000) for (int st = 0; st < 6; st++) for (int sl = 0; sl < 16; sl++) {      // the uniform buffers a large draw reads: where they are and what they start with
+        const p_bind_buf *u = &S.ubo[st][sl]; if (!u->size) continue;
+        float f[8] = {0}; size_t n = u->size < sizeof f ? u->size : sizeof f; memcpy(f, (const void *)(uintptr_t)u->addr, n);
+        fprintf(stderr, "[dm] [nvn]   draw %ld stage %d ubo %d: addr %#llx size %llu: %g %g %g %g %g %g %g %g\n", idx, st, sl, (unsigned long long)u->addr, (unsigned long long)u->size, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+    }
+    return 1;
+}
+
 void nvn_draw(const p_draw *d) {
     pipe_entry *pe;
     if (d->ind) { static int f; skip("indirect draws are not supported yet", &f); return; }
     g_base_instance = d->base_instance;
     { uint64_t t0 = dnow(); int ok = prepare(d->prim, &pe); atomic_fetch_add(&g_draw_prepare_ns, dnow() - t0); if (!ok) return; }
+    { int sk; trace_draw("draw", (uint32_t)d->count, &sk); if (sk) return; }
     vkCmdDraw(nvn_vk_cmd_raw(), (uint32_t)d->count, d->instances ? (uint32_t)d->instances : 1, (uint32_t)d->first, (uint32_t)d->base_instance);
     draw_note(d->count);
 }
@@ -630,6 +761,7 @@ void nvn_draw_idx(const p_draw_idx *d) {
     if (d->itype == NVN_INDEX_TYPE_UNSIGNED_BYTE) { skip("8-bit indices need widening first", &f_byte); return; }
     g_base_instance = d->base_instance;
     { uint64_t t0 = dnow(); int ok = prepare(d->prim, &pe); atomic_fetch_add(&g_draw_prepare_ns, dnow() - t0); if (!ok) return; }
+    { int sk; trace_draw("indexed", (uint32_t)d->count, &sk); if (sk) return; }
     VkCommandBuffer cb = nvn_vk_cmd_raw(); VkBuffer ib; VkDeviceSize ioff;
     uint64_t isz = d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 4;
     if (!nvn_vk_pool_buffer(d->ibuf, isz * (uint64_t)d->count, &ib, &ioff)) { static int f; skip("the index buffer lies outside the memory pools", &f); return; }

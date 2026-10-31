@@ -83,12 +83,35 @@ VkDescriptorBufferInfo nvn_shader_c1(const nvn_shader *cs) {
     }
     return (VkDescriptorBufferInfo){s->c1buf.buf, 0, C1_SIZE};
 }
+// A title that draws a depth pass and then the colour pass with the depth test EQUAL (Mario Kart 8 Deluxe) needs the same vertex position from two different shaders, bit for bit. The hardware
+// computes it the same way in both; Vulkan only promises that for a position decorated Invariant. The translator does not decorate it, so the SPIR-V of a vertex shader is patched here:
+// every OpMemberDecorate <struct> <n> BuiltIn Position (and OpDecorate <var> BuiltIn Position) gets an Invariant decoration right after it.
+static uint32_t *spirv_invariant_position(const uint32_t *in, size_t bytes, size_t *outbytes) {
+    size_t nw = bytes / 4; *outbytes = bytes;
+    if (nw < 5 || in[0] != 0x07230203u) return NULL;
+    uint32_t *out = malloc((nw + 64) * sizeof *out); if (!out) return NULL;
+    size_t o = 0; memcpy(out, in, 5 * sizeof *out); o = 5;
+    for (size_t i = 5; i < nw;) {
+        uint32_t w = in[i], op = w & 0xffff, wc = w >> 16;
+        if (!wc || i + wc > nw) { free(out); return NULL; }
+        memcpy(out + o, in + i, wc * sizeof *out); o += wc;
+        if (op == 72 && wc == 5 && in[i + 3] == 11 && in[i + 4] == 0 && o + 4 <= nw + 64) { out[o++] = 4u << 16 | 72u; out[o++] = in[i + 1]; out[o++] = in[i + 2]; out[o++] = 18; }   // OpMemberDecorate %s n Invariant
+        else if (op == 71 && wc == 4 && in[i + 2] == 11 && in[i + 3] == 0 && o + 3 <= nw + 64) { out[o++] = 3u << 16 | 71u; out[o++] = in[i + 1]; out[o++] = 18; }                          // OpDecorate %v Invariant
+        i += wc;
+    }
+    *outbytes = o * sizeof *out;
+    return out;
+}
 VkShaderModule nvn_shader_module(nvn_shader *s) {
     pthread_mutex_lock(&g_mu);
     if (!s->module) {
         vkctx_t *c = nvn_vk_ctx();
-        VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = s->bytes, .pCode = s->spirv};
+        size_t pb = s->bytes; uint32_t *patched = NULL;
+        static int plain = -1; if (plain < 0) plain = getenv("NX_NO_INVARIANT") != NULL;     // NX_NO_INVARIANT=1: the translator's SPIR-V as it is
+        if (s->stage == NVN_STAGE_VERTEX && !plain) patched = spirv_invariant_position(s->spirv, s->bytes, &pb);
+        VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = pb, .pCode = patched ? patched : s->spirv};
         if (!c || vkCreateShaderModule(c->dev, &ci, NULL, &s->module)) s->module = VK_NULL_HANDLE;
+        free(patched);
     }
     VkShaderModule m = s->module;
     pthread_mutex_unlock(&g_mu);
