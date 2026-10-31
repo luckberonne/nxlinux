@@ -144,7 +144,9 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                         parent.Remove(block);
                     }
                 }
-                else if (isIf && parent.Type == AstBlockType.Else && parent.Count == (hasElse ? 2 : 1))
+                // An `else { if ... }` is left as it is: turned into an ElseIf block, the SPIR-V back end never jumps to it (the If before it branches to the merge block when its next block is not an Else),
+                // so the whole else branch became unreachable code and its shader drew with the wrong values
+                else if (false && isIf && parent.Type == AstBlockType.Else && parent.Count == (hasElse ? 2 : 1))
                 {
                     AstBlock parentOfParent = parent.Parent;
 

@@ -1,3 +1,4 @@
+#include <signal.h>
 // Draws on Vulkan. The replay hands state records (nvn_draw_state_op) and draws; a draw resolves the program's shaders from the registry, builds a pipeline
 // from the whole state (cached), opens a render pass over the current targets if none is open, binds the vertex buffers and pushes the uniform buffers.
 //
@@ -595,6 +596,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
                 }
                 if (b[i].kind != NVN_SB_CBUF || b[i].reg >= 16) continue;
                 const p_bind_buf *u = &S.ubo[si][b[i].reg];
+                { extern int nvn_trace_frame_now(void); if (nvn_trace_frame_now()) fprintf(stderr, "[dm] [nvn]   uniform block of stage %d: shader binding %u reads NVN binding %u: addr %#llx size %llu\n", si, (unsigned)b[i].binding, (unsigned)b[i].reg, (unsigned long long)u->addr, (unsigned long long)u->size); }
                 { static int dd = -1; static unsigned cnt; if (dd < 0) dd = getenv("NX_DRAW_DETAIL") != NULL;       // the first 30 uniform bindings: what is bound and its first four words
                   if (dd && cnt < 30) { cnt++; const float *f = (const float *)(uintptr_t)u->addr; if (si == 0 && cnt < 3) { fprintf(stderr, "[dm] [nvn] vertex UBO floats:"); for (int q = 0; q < 36 && q * 4 < (int)u->size; q++) fprintf(stderr, "%s%g", q % 4 ? " " : " |", ((const float *)(uintptr_t)u->addr)[q]); fprintf(stderr, "\n"); }
                   fprintf(stderr, "[dm] [nvn] UBO stage %d slot %u: addr %#llx size %llu%s %g %g %g %g\n", si, b[i].reg, (unsigned long long)u->addr, (unsigned long long)u->size, u->addr ? " data" : " (unbound)", u->addr ? f[0] : 0, u->addr ? f[1] : 0, u->addr ? f[2] : 0, u->addr ? f[3] : 0); } }
@@ -706,16 +708,27 @@ static void draw_note(uint32_t count) {
 // NX_DRAW_TRACE=<frame>: one line for each draw of that presented frame (its number counts the presents so far): the colour and depth targets, the depth and cull state, the keys of the program's
 // stages and the size. NX_DRAW_SKIP=<a>-<b>: the draws of that frame whose index lies in the range are made ready but not drawn, to see which of them paint a region (compare the two frames).
 static uint64_t g_trace_ser[600]; static int g_trace_n;                       // the colour and depth targets drawn into during the traced frame (dumped by the present)
+static uint64_t g_samp_ser[400]; static int g_samp_n;      // the textures the traced frame's draws sampled (its first draws up to 400 of them), dumped through the GPU's own decoded view
+static void trace_note_sampled(uint64_t s) { for (int i = 0; i < g_samp_n; i++) if (g_samp_ser[i] == s) return; if (g_samp_n < 400) g_samp_ser[g_samp_n++] = s; }
+int nvn_draw_trace_sampled(uint64_t *out, int max) { int n = g_samp_n < max ? g_samp_n : max; memcpy(out, g_samp_ser, (size_t)n * sizeof *out); return n; }
 void nvn_draw_trace_note_target(uint64_t s) { for (int i = 0; i < g_trace_n; i++) if (g_trace_ser[i] == s) return; if (g_trace_n < 600) g_trace_ser[g_trace_n++] = s; }
 int nvn_draw_trace_targets(uint64_t *out, int max) { int n = g_trace_n < max ? g_trace_n : max; memcpy(out, g_trace_ser, (size_t)n * sizeof *out); return n; }
 extern uint64_t nvn_present_count(void);
-int nvn_trace_frame_now(void) {        // 1 while the frame NX_DRAW_TRACE names is being replayed
-    static long frame = -2; if (frame == -2) { const char *e = getenv("NX_DRAW_TRACE"); frame = e ? atol(e) : -1; }
-    return frame >= 0 && (long)nvn_present_count() == frame;
+// A frame to trace asked for while the title runs (F12 in the window): the one two frames on, so that it is recorded whole
+static _Atomic long g_req_frame = -1; static _Atomic int g_req_n;
+int nvn_trace_request_count(void) { return atomic_load(&g_req_n); }
+long nvn_trace_request(void) { atomic_fetch_add(&g_req_n, 1); long f = (long)nvn_present_count() + 2; atomic_store(&g_req_frame, f); return f; }
+static void trace_signal(int sig) { (void)sig; nvn_trace_request(); }      // NX_TRACE_SIGNAL=1: kill -USR1 traces the frame two on, and with NX_FRAME_DUMP dumps its targets, at whatever screen the title is on
+long nvn_trace_target(void) { static long frame = -2; if (frame == -2) { const char *e = getenv("NX_DRAW_TRACE"); frame = e ? atol(e) : -1; if (getenv("NX_TRACE_SIGNAL")) signal(SIGUSR1, trace_signal); } return frame >= 0 ? frame : atomic_load(&g_req_frame); }
+static long trace_target(void) { return nvn_trace_target(); }
+static int trace_detail(void) { static int on = -1; if (on < 0) on = getenv("NX_DRAW_TRACE_DETAIL") != NULL; return on || atomic_load(&g_req_frame) >= 0; }
+int nvn_trace_frame_now(void) {        // 1 while the frame NX_DRAW_TRACE (or the F12 request) names is being replayed
+    long frame = trace_target(); return frame >= 0 && (long)nvn_present_count() == frame;
 }
 static int trace_draw(const char *what, uint32_t count, int *skip_it) {
-    static long frame = -2, sa = -1, sb = -1;
-    if (frame == -2) { const char *e = getenv("NX_DRAW_TRACE"); frame = e ? atol(e) : -1; const char *k = getenv("NX_DRAW_SKIP"); if (k) sscanf(k, "%ld-%ld", &sa, &sb); }
+    long frame = trace_target();
+    long sa = -1, sb = -1;      // NX_DRAW_SKIP=a-b skips those draws of the traced frame; a list "a-b;c-d;..." gives the k-th F12 / SIGUSR1 request its k-th range ("-" = none)
+    { const char *k = getenv("NX_DRAW_SKIP"); int want = getenv("NX_DRAW_TRACE") ? 0 : atomic_load(&g_req_n) - 1; while (k && want-- > 0) { k = strchr(k, ';'); if (k) k++; } if (k) sscanf(k, "%ld-%ld", &sa, &sb); }
     *skip_it = 0;
     if (frame < 0 || (long)nvn_present_count() != frame) return 0;
     static long idx = -1, seen_frame = -1; if (seen_frame != frame) { seen_frame = frame; idx = -1; }
@@ -726,21 +739,27 @@ static int trace_draw(const char *what, uint32_t count, int *skip_it) {
             (unsigned long long)g_rt.cser[0], (unsigned long long)g_rt.dser, g_rt.n, (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, (int)S.poly.cull, (int)S.poly.front, S.blend[0].src_rgb, S.blend[0].dst_rgb);
     for (int i = 0; i < S.nkeys; i++) { fprintf(stderr, " "); for (int b = 0; b < 4; b++) fprintf(stderr, "%02x", S.keys[i][b]); }
     fprintf(stderr, "\n");
-    if (getenv("NX_DRAW_TRACE_DETAIL")) {      // channel mask, blend enable, viewport and scissor of the draw
+    if (trace_detail()) {      // channel mask, blend enable, viewport and scissor of the draw
         fprintf(stderr, "[dm] [nvn]   draw %ld state chmask %#x blend_en %#x logic %u has_vp %d vp0 %g %g %g %g depth %g %g scissor %d: %d %d %d %d\n", idx, (unsigned)S.chmask.mask, (unsigned)S.color.blend_en, (unsigned)S.color.logic_op, S.has_vp, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], S.vp[0][4], S.vp[0][5], g_sc.has, g_sc.r[0], g_sc.r[1], g_sc.r[2], g_sc.r[3]);
     }
-    if (getenv("NX_DRAW_TRACE_DETAIL")) {      // the vertex attribute formats (NVN format numbers) and the texture handles of each stage
+    if (trace_detail()) {      // the vertex attribute formats (NVN format numbers) and the texture handles of each stage
         fprintf(stderr, "[dm] [nvn]   draw %ld attrs", idx);
-        for (int i = 0; i < S.nattr && i < 16; i++) { va_st a; memcpy(&a, &S.attr[i], sizeof a); fprintf(stderr, " %d:f%#x/s%u", i, (unsigned)a.fmt, (unsigned)a.stream); }
+        for (int i = 0; i < S.nattr && i < 16; i++) { va_st a; memcpy(&a, &S.attr[i], sizeof a); fprintf(stderr, " %d:f%#x/s%u+%u", i, (unsigned)a.fmt, (unsigned)a.stream, (unsigned)a.offset); }
         if (count <= 2000 || count >= 8000) { extern uint64_t nvn_vk_desc_serial(uint32_t); for (int st = 0; st < 6; st++) for (int sl = 0; sl < NTEXSLOT; sl++) if (S.tex[st][sl]) { uint64_t sr = nvn_vk_desc_serial(S.tex[st][sl]); if (sr) nvn_draw_trace_note_target(sr); } }   // the textures a small (lighting) draw reads are dumped too
         fprintf(stderr, " | tex");
         for (int st = 0; st < 6; st++) for (int sl = 0; sl < NTEXSLOT; sl++) if (S.tex[st][sl]) { extern uint64_t nvn_vk_desc_serial(uint32_t); extern int nvn_vk_debug_info(uint64_t, unsigned *, unsigned *, unsigned *, unsigned *, unsigned *);
-            uint64_t sr = nvn_vk_desc_serial(S.tex[st][sl]); unsigned tf = 0, tw = 0, th = 0, tl = 0, td = 0; int have = nvn_vk_debug_info(sr, &tf, &tw, &th, &tl, &td);
+            uint64_t sr = nvn_vk_desc_serial(S.tex[st][sl]); trace_note_sampled(sr); unsigned tf = 0, tw = 0, th = 0, tl = 0, td = 0; int have = nvn_vk_debug_info(sr, &tf, &tw, &th, &tl, &td);
             fprintf(stderr, " s%d.%d=id%u/smp%u/ser%llu", st, sl, S.tex[st][sl] & 0xfffff, S.tex[st][sl] >> 20, (unsigned long long)sr);
             if (have) fprintf(stderr, "[%#x %ux%u l%u]", tf, tw, th, tl); }
         fprintf(stderr, "\n");
     }
-    if (count >= 10000) for (int st = 0; st < 6; st++) for (int sl = 0; sl < 16; sl++) {      // the uniform buffers a large draw reads: where they are and what they start with
+    if (trace_detail() && count <= 64) for (int i = 0; i < S.nstream && i < 16; i++) if (S.vbuf[i].address) {      // the first vertices of a small draw (a quad): where its vertex stream is and what it holds
+        const float *f = (const float *)(uintptr_t)S.vbuf[i].address; size_t nf = S.vbuf[i].size / 4 < 24 ? S.vbuf[i].size / 4 : 24;
+        fprintf(stderr, "[dm] [nvn]   draw %ld stream %d: addr %#llx size %llu stride %u:", idx, i, (unsigned long long)S.vbuf[i].address, (unsigned long long)S.vbuf[i].size, S.stream[i].stride); for (size_t q = 0; q < nf; q++) fprintf(stderr, " %g", f[q]); fprintf(stderr, "\n"); }
+    if (trace_detail() && count <= 64) for (int st = 0; st < 2; st++) if (S.ubo[st][0].addr && S.ubo[st][0].size) {      // the whole uniform block 0 of the vertex and the fragment stage of a small draw (the per-draw constants), as floats
+        const float *w = (const float *)(uintptr_t)S.ubo[st][0].addr; size_t nw = S.ubo[st][0].size / 4;
+        fprintf(stderr, "[dm] [nvn]   draw %ld block0 of stage %d (%zu words):", idx, st, nw); for (size_t q = 0; q < nw; q++) fprintf(stderr, "%s%g", q % 4 ? " " : "\n[dm] [nvn]     ", w[q]); fprintf(stderr, "\n"); }
+    if (count >= 10000 || trace_detail()) for (int st = 0; st < 6; st++) for (int sl = 0; sl < 16; sl++) {      // the uniform buffers a large draw reads: where they are and what they start with
         const p_bind_buf *u = &S.ubo[st][sl]; if (!u->size) continue;
         float f[8] = {0}; size_t n = u->size < sizeof f ? u->size : sizeof f; memcpy(f, (const void *)(uintptr_t)u->addr, n);
         fprintf(stderr, "[dm] [nvn]   draw %ld stage %d ubo %d: addr %#llx size %llu: %g %g %g %g %g %g %g %g\n", idx, st, sl, (unsigned long long)u->addr, (unsigned long long)u->size, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);

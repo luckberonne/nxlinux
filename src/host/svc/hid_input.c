@@ -1,3 +1,4 @@
+#include <signal.h>
 // hid shared memory: player 1's npad is a Pro Controller that is always connected; its state ring is refilled at 120 Hz from the last hid_input_set.
 #include "hid_input.h"
 #include "../ipc.h"
@@ -25,6 +26,7 @@ void hid_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t
     pthread_mutex_lock(&g_mu); g_buttons = buttons; g_stick[0] = lx; g_stick[1] = ly; g_stick[2] = rx; g_stick[3] = ry; pthread_mutex_unlock(&g_mu);
 }
 
+static volatile int g_tap_off; static void tap_stop_handler(int sig) { (void)sig; g_tap_off = 1; }
 static void publish(uint8_t *mem) {
     uint8_t *e = mem + NPAD_BASE;
     uint64_t buttons; int32_t st[4];
@@ -42,7 +44,8 @@ static void publish(uint8_t *mem) {
         for (int i = 0; i < nscr; i++) if (ms - t_start >= scr[i].at && ms - t_start < (uint64_t)scr[i].at + scr[i].len) {
             buttons |= 1ull << scr[i].bit;
             if (!said[i]) { said[i] = 1; fprintf(stderr, "[dm] [hid] script: button bit %d at %.1f s\n", scr[i].bit, (ms - t_start) / 1000.0); } } }
-    if (tap >= 0) { struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); uint64_t ms = (uint64_t)t0.tv_sec * 1000 + (uint64_t)t0.tv_nsec / 1000000; if (ms % (period * 1000ull) < hold) buttons |= 1ull << tap; }
+    static int tap_sig = -1; if (tap_sig < 0) { tap_sig = getenv("NX_TAP_STOP_SIGNAL") != NULL; if (tap_sig) signal(SIGUSR2, tap_stop_handler); }      // NX_TAP_STOP_SIGNAL=1: SIGUSR2 stops the taps for good (the screen then stays where it is)
+    if (tap >= 0 && !g_tap_off) { struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); uint64_t ms = (uint64_t)t0.tv_sec * 1000 + (uint64_t)t0.tv_nsec / 1000000; if (ms % (period * 1000ull) < hold) buttons |= 1ull << tap; }
     uint64_t n = ++g_sample;
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t ticks = ((uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec) * 12 / 625;   // the 19.2 MHz system counter

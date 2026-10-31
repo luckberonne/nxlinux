@@ -160,6 +160,8 @@ python3 tools/shader_capture_build.py work/run/mk8d_u/shd_pkg work/run/mk8d_u/mk
 - **Translator failures are silent in the summary.** `translated: N ok, M failed` hides the reason; run `dotnet work/dmsh_xlate/dmsh_xlate.dll jobs.json out` on the failures (`DMSH_STACK=1` for the stack).
   Nine shaders, among them the vertex shader of the track (it reads a texture), failed with an `InvalidCastException` in Ryujinx's SPIR-V back end: the optimizer replaced the temporary that
   carries a call argument by its expression. Fixed in `third_party/ryujinx` (`AstOptimizer.IsCallArgument`).
+- **Unreachable else branches.** The translator turned `else { if ... }` into an `else if` block that the SPIR-V back end never jumped to, so about 7 % of the shaders (205 of 2,920 checked; the menu panels among them) had their else branch as dead code and drew with default values (the
+  course list drew black and blue bars where its panel is a grey gradient). `AstOptimizer` no longer flattens it; `python3 tools/spv_unreachable.py <out dir>` finds blocks nobody jumps to in a translated library (0 of 29,650 now). A library built before that fix must be rebuilt.
 - **Storage buffers.** `cb_offset` of a reflected storage buffer is in words: `cb_offset * 4` is a byte offset in driver segment c[0], and the slot is read off it (0x310 + 0x10 slot for
   compute; 0x210 + 0x10 slot is a uniform slot the shader reads as storage, `NVN_SB_SBUF_UBO`). A shader the packer cannot resolve gets `needs` set and the host skips it: a compute dispatch
   that ignored `needs` hung the GPU (a page fault, `ring gfx_0.0.0 timeout`).
@@ -218,6 +220,9 @@ All are environment variables; nothing costs anything when unset.
 | `NX_FRAME_EVERY=<n>` | with `NX_FRAME_DUMP`: also every n-th frame |
 | `NX_MOVIE_LOG=1` | the movie decoder takeover's calls (`hle_movie.c`) |
 | `NX_HID_TAP=<bit>[:<s>[:<ms>]]` | press that `NpadButton` bit (0 = A) for 150 ms (or `<ms>`) every `<s>` seconds (default 4), for runs nobody sits at; `0:4:3500` goes through every menu into a Grand Prix and keeps accelerating in the race |
+| `NX_TAP_STOP_SIGNAL=1` | `kill -USR2` stops the `NX_HID_TAP` presses for good, so a screen the run reached stays where it is |
+| `NX_TRACE_SIGNAL=1` | `kill -USR1` traces the frame two on like `NX_DRAW_TRACE` (with the detail lines) and, with `NX_FRAME_DUMP`, dumps its targets and the textures its draws sampled (`<prefix>.<n>.tex<serial>.ppm`) at whatever screen the title is on; with `NX_DRAW_SKIP="a-b;c-d;..."` the k-th request skips the k-th range of draws (`-` = none) |
+| `NX_SHOT_EVERY=<s>` (window) | the window writes the frame it shows to `NX_SHOT_DIR` (default `nx-shots`) every `<s>` seconds, up to `NX_SHOT_MAX` (80), and traces that frame's draws to the log; F9 or F12 or `kill -USR1` do it once |
 | `NX_TEX_TRACE=<serial>` | log when that texture is initialized and finalized, and at each upload the hash of its storage and how many of its 64 KB pages hold data |
 | `NX_TEX_RAW=<serial>` | with `NX_FRAME_DUMP`: at every dumped frame the GPU's own view of that texture (a blit to RGBA8) goes to `<prefix>.<n>.gpu_<serial>.ppm`, and at frame 1000 its level 0 de-swizzled as raw blocks (`<prefix>.raw_<serial>.bin`) and its storage as the title wrote it (`<prefix>.swz_<serial>.bin`); the trace lines of draws (`NX_DRAW_TRACE_DETAIL=1`) carry each texture's NVN format, size and levels |
 | `NX_POOL_LOG=1`, `NX_POOL_EAGER=1` | log each memory pool when the host imports it (base, size) / import every pool when the game makes it, as before, instead of when the GPU first needs it |

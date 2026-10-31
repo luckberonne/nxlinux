@@ -77,6 +77,7 @@ static void pending(unsigned op) {                                              
 
 static void update_ub(uint64_t dst, uint64_t n, const uint8_t *data) {          // OP_UPDATE_UB: the data was copied into the record at record time
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd();
+    { extern int nvn_trace_frame_now(void); if (nvn_trace_frame_now()) { float f[8] = {0}; memcpy(f, data, n < sizeof f ? n : sizeof f); fprintf(stderr, "[dm] [nvn] trace uniform update: %#llx %llu bytes: %g %g %g %g %g %g %g %g\n", (unsigned long long)dst, (unsigned long long)n, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]); } }
     if (!c || !cb || !n) return;
     VkBuffer b; VkDeviceSize off;
     if (!nvn_vk_pool_buffer(dst, n, &b, &off)) { fprintf(stderr, "[dm] [RED] [nvn] uniform update of %#llx (%#llx bytes) is outside the memory pools\n", (unsigned long long)dst, (unsigned long long)n); return; }

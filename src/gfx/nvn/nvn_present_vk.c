@@ -1,3 +1,5 @@
+#include <signal.h>
+#include <sys/stat.h>
 // Presentation on Vulkan, the plain way: the texture the game presents is read back into host memory as RGBA8 (waiting for the GPU to finish it), and the frame goes to a sink.
 // Two sinks. Memory keeps the last frame, for tests and for running without a display. SDL (NX_PRESENT=sdl, when built with SDL3) shows it in a window from its own thread, which also
 // pumps the window's events; closing the window sets a flag the host can poll. A swapchain that blits on the GPU is the faster way and replaces this when frames get big;
@@ -23,6 +25,8 @@ static uint64_t g_ticket, g_shown, g_pub;                                      /
 static double g_last_time;
 static int g_sink_sdl, g_sink_init, g_quit;
 static _Atomic uint64_t g_count;
+static _Atomic int g_shot_signal;
+static void shot_signal(int sig) { (void)sig; atomic_store(&g_shot_signal, 1); }
 
 static double now_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9; }
 
@@ -67,7 +71,7 @@ static void input_poll(SDL_Gamepad **pad) {
 static void *sdl_thread(void *arg) {
     (void)arg;
     SDL_Window *win = NULL; SDL_Renderer *rr = NULL; SDL_Texture *tx = NULL; uint32_t tw = 0, th = 0; uint64_t seen = 0;
-    SDL_Gamepad *pad = NULL;
+    SDL_Gamepad *pad = NULL; long shot_target = -1; unsigned shot_n = 0; int shot_now = 0;
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "[dm] [RED] [nvn] SDL video could not start (%s): frames go to memory only\n", SDL_GetError()); goto fail; }
     for (;;) {
         pthread_mutex_lock(&g_mu);
@@ -78,6 +82,12 @@ static void *sdl_thread(void *arg) {
         uint64_t upto = g_pub; uint32_t w = g_fw, h = g_fh; uint8_t *copy = NULL;
         if (upto > seen && g_frame && w && h) { copy = malloc((size_t)w * h * 4); memcpy(copy, g_frame, (size_t)w * h * 4); }
         pthread_mutex_unlock(&g_mu);
+        if (copy && shot_target >= 0 && (long)atomic_load(&g_count) > shot_target) {      // the traced frame has been presented: this copy is it (or a later, equal one on a still screen)
+            const char *dir = getenv("NX_SHOT_DIR"); char fn[700]; snprintf(fn, sizeof fn, "%s", dir ? dir : "nx-shots"); mkdir(fn, 0755);
+            snprintf(fn, sizeof fn, "%s/shot%u_frame%ld.ppm", dir ? dir : "nx-shots", shot_n, shot_target);
+            FILE *o = fopen(fn, "wb"); if (o) { fprintf(o, "P6\n%u %u\n255\n", w, h); for (size_t i = 0; i < (size_t)w * h; i++) fwrite(copy + i * 4, 1, 3, o); fclose(o); fprintf(stderr, "[dm] [nvn] shot: frame written to %s\n", fn); }
+            shot_target = -1;
+        }
         if (copy) {
             if (!win) {
                 win = SDL_CreateWindow("nxlinux", (int)w, (int)h, SDL_WINDOW_RESIZABLE);
@@ -102,8 +112,18 @@ static void *sdl_thread(void *arg) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) __atomic_store_n(&g_quit, 1, __ATOMIC_RELEASE);
+            else if (ev.type == SDL_EVENT_KEY_DOWN && (ev.key.key == SDLK_F12 || ev.key.key == SDLK_F9) && !ev.key.repeat) shot_now = 1;
+            else if (0) {      // F12: keep the frame shown (a PPM in NX_SHOT_DIR, default nx-shots) and trace the draws of that frame to the log
+                extern long nvn_trace_request(void); shot_target = nvn_trace_request(); shot_n++; fprintf(stderr, "[dm] [nvn] F12: shot %u will be frame %ld, its draws are traced to this log\n", shot_n, shot_target); }
             else if (ev.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(ev.gdevice.which);
             else if (ev.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == ev.gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; }
+        }
+        {   // a shot is asked for by F9 / F12, by SIGUSR1, or every NX_SHOT_EVERY seconds (at most NX_SHOT_MAX, default 80, in all)
+            static double every = -2, last; static unsigned maxn; if (every < -1) { const char *e = getenv("NX_SHOT_EVERY"); every = e ? atof(e) : 0; const char *m = getenv("NX_SHOT_MAX"); maxn = m ? (unsigned)atoi(m) : 80; signal(SIGUSR1, shot_signal); }
+            double nowt = now_s(); if (every > 0 && nowt - last >= every) { last = nowt; shot_now = 1; }
+            if (atomic_exchange(&g_shot_signal, 0)) shot_now = 1;
+            if (shot_now && shot_target < 0 && shot_n < maxn) { extern long nvn_trace_request(void); shot_target = nvn_trace_request(); shot_n++; fprintf(stderr, "[dm] [nvn] shot %u will be frame %ld, its draws are traced to this log\n", shot_n, shot_target); }
+            shot_now = 0;
         }
         input_poll(&pad);
         pthread_mutex_lock(&g_mu); if (upto > seen) seen = upto; g_shown = seen; pthread_cond_broadcast(&g_cv); int quit = g_quit; pthread_mutex_unlock(&g_mu);
@@ -236,9 +256,12 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         }
     }
     {   // NX_DRAW_TRACE=<n> with NX_FRAME_DUMP: every target the traced frame drew into goes to <prefix>.<n>.rt<serial>.ppm (RGBA8 and RGBA16F), with its format and how much of it is not zero
-        static long tf = -2; if (tf == -2) tf = getenv("NX_DRAW_TRACE") ? atol(getenv("NX_DRAW_TRACE")) : -1;
+        extern long nvn_trace_target(void); long tf = nvn_trace_target();
         if (tf >= 0 && getenv("NX_FRAME_DUMP") && (long)atomic_load(&g_count) == tf) {
             extern int nvn_draw_trace_targets(uint64_t *, int); extern int nvn_vk_debug_info(uint64_t, unsigned *, unsigned *, unsigned *, unsigned *, unsigned *); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *);
+            {   // the textures the traced draws sampled (not only the ones they drew into): the GPU's decoded view of each, <prefix>.<n+1>.tex<serial>.ppm
+                extern int nvn_trace_request_count(void); if (nvn_trace_request_count() <= 1) { extern int nvn_draw_trace_sampled(uint64_t *, int); extern int nvn_vk_debug_gpu_ppm(uint64_t, const char *); uint64_t ss[400]; int nsm = nvn_draw_trace_sampled(ss, 400);
+                for (int i = 0; i < nsm; i++) if (ss[i]) { char fn[640]; snprintf(fn, sizeof fn, "%s.%ld.tex%llu.ppm", getenv("NX_FRAME_DUMP"), tf + 1, (unsigned long long)ss[i]); nvn_vk_debug_gpu_ppm(ss[i], fn); } } }
             uint64_t ser[600]; int ns = nvn_draw_trace_targets(ser, 600);
             for (int i = 0; i < ns; i++) { unsigned f = 0, tw = 0, th = 0, lv = 0, dd = 0; if (!nvn_vk_debug_info(ser[i], &f, &tw, &th, &lv, &dd)) { fprintf(stderr, "[dm] [nvn] trace target serial %llu: not in the table\n", (unsigned long long)ser[i]); continue; }
                 char fn[640]; snprintf(fn, sizeof fn, "%s.%ld.rt%llu.ppm", getenv("NX_FRAME_DUMP"), tf + 1, (unsigned long long)ser[i]); size_t tot = 0; long lit = nvn_vk_debug_lit(ser[i], &tot, fn);
