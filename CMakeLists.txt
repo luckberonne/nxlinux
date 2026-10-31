@@ -41,7 +41,7 @@ add_executable(test_module tests/test_module.cpp)
 target_link_libraries(test_module PRIVATE nxhost pthread)
 add_dependencies(test_module mod_a_so)
 add_test(NAME module COMMAND test_module ${MOD_A})
-target_sources(nxhost PRIVATE src/host/kernel.c src/host/mem.c src/host/ipc.c)
+target_sources(nxhost PRIVATE src/host/kernel.c src/host/mem.c src/host/ipc.c src/host/prof.c)
 set(GUEST_THREADS ${CMAKE_BINARY_DIR}/threads.so)
 add_custom_command(OUTPUT ${GUEST_THREADS}
     COMMAND clang --target=aarch64-linux-gnu -O1 -fPIC -nostdlib -shared -fuse-ld=lld -o ${GUEST_THREADS} ${CMAKE_SOURCE_DIR}/tests/guest/threads.c

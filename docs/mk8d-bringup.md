@@ -182,7 +182,8 @@ All are environment variables; nothing costs anything when unset.
 | `NX_NVN_API=<maj.min>` | the NVN API version the device reports (53.313 for the update, 52.32 for the base) |
 | `NX_DRAW_TRACE=<n>` (+ `NX_DRAW_TRACE_DETAIL=1`, `NX_FRAME_DUMP=<prefix>`) | one line per draw of the frame whose draws run with `n` presents behind (3599 is the 3600th), with its targets, state, program keys, vertex attributes, texture handles and serials; with a dump prefix, every target it drew into and every texture a small or large draw read go to `<prefix>.<n+1>.rt<serial>.ppm` (RGBA8 and RGBA16F), with format, share of non-zero bytes and storage address; `trace dispatch` / `trace copy` lines list compute and copies |
 | `NX_DRAW_SKIP=<a>-<b>` | with `NX_DRAW_TRACE`, the draws of that frame numbered `a` to `b` are made ready but not drawn |
-| `NX_CUT=<n>` | draws between the segments the recorded work is sent to the GPU in (default 64, 0 = one submission per frame) |
+| `NX_CUT=<n>` | draws between the segments the recorded work is sent to the GPU in (default 0 = one submission per frame; 64 helps only a GPU the host leaves idle: it cost 10 ms on the Radeon) |
+| `NX_PROF=<us>` | a sampling profiler (`src/host/prof.c`): every period the running threads are interrupted and their stacks kept; `kill -USR2 <pid>` writes `NX_PROF_OUT` (default `nx_prof.txt`), `tools/prof_report.py FILE nxlinux` reads it |
 | `NX_PRESENT_STATS=1` | every 300 presents: GPU read-back, BGRA to RGBA and window wait, per frame |
 | `NX_NO_TEX_SHARE=1`, `NX_NO_INVARIANT=1`, `NX_DEPTH_EQUAL_LEQUAL=1`, `NX_DEAD_MB=<n>` | switches off image sharing / the Invariant decoration of vertex positions; tests depth-equal as less-or-equal; the VRAM budget of finalized textures (default 1536) |
 | `NX_PRESENT=null` | run without a window |

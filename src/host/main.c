@@ -30,6 +30,7 @@ static uint8_t *slurp(const char *path, size_t *n) {
 }
 
 int main(int argc, char **argv) {
+    { extern void nx_prof_init(void); nx_prof_init(); }          // NX_PROF=1: the sampling profiler (prof.c)
     const char *manifest = NULL, *entry_sym = NULL, *shaders = NULL; unsigned mem_mb = 4096; int arch32 = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--manifest") && i + 1 < argc) manifest = argv[++i];

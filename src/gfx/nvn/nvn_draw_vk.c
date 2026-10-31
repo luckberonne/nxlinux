@@ -382,8 +382,8 @@ static int vertex_fmt(int f, VkFormat *vf) {
 static int prepare(unsigned prim, pipe_entry **pe_out) {
     static int f_ntex, f_tex, f_needs, f_noprog, f_noshader, f_prim, f_vbuf, f_vattr, f_nort, f_pipe, f_fmt, f_off;
     state_init();
-    {   // NX_CUT=<n> (default 64, 0 = off): after n draws, before a new render pass, the recorded work goes to the GPU (mtl_sub_cut), so GPU and host overlap
-        static int cut = -1; if (cut < 0) cut = getenv("NX_CUT") ? atoi(getenv("NX_CUT")) : 64;
+    {   // NX_CUT=<n> (default 0 = off): after n draws, before a new render pass, the recorded work goes to the GPU (mtl_sub_cut), so GPU and host overlap. Every submission costs the driver a walk over all its memory objects: on the Radeon a cut of 64 made the race frame 40 ms against 30 without, on the RTX it changed the median little and the 95th percentile a lot (60 ms against 47)
+        static int cut = -1; if (cut < 0) cut = getenv("NX_CUT") ? atoi(getenv("NX_CUT")) : 0;
         extern void mtl_sub_cut(void);
         if (cut > 0 && g_since_cut >= (unsigned)cut && (!P.active || !rt_same(&P.rt, &g_rt))) { mtl_sub_cut(); g_since_cut = 0; }
     }

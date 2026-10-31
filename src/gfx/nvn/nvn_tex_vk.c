@@ -176,27 +176,34 @@ static void dead_push(vktex_t *e) {                                // caller hol
     if (g_ndead == g_cdead) { g_cdead = g_cdead ? g_cdead * 2 : 256; g_dead = realloc(g_dead, g_cdead * sizeof *g_dead); }
     g_dead[g_ndead++] = (struct dead){e}; g_dead_bytes += e->alias_of ? 0 : e->L.size;
 }
+typedef struct { uint64_t key; size_t idx; } evict_t;
+static int evict_cmp(const void *a, const void *b) { uint64_t x = ((const evict_t *)a)->key, y = ((const evict_t *)b)->key; return x < y ? -1 : x > y; }
+// Over its budget the dead pool is brought down to nine tenths of it in one pass: the entries are put in eviction order once (the ones that were used before the never-used, the oldest first; an
+// image another texture object still names stays) instead of searching the whole list again for every texture that goes
 static void sweep_dead(void) {                                    // caller holds g_mu
-    vktex_t *gone[64]; int ngone = 0;
-    while ((g_ndead > DEAD_MAX || g_dead_bytes > DEAD_BYTES) && ngone < 64) {
-        size_t lru = (size_t)-1;
-        for (size_t i = 0; i < g_ndead; i++) {
-            if (g_dead[i].e->nalias) continue;              // another texture object shares this image: it stays while they do
-            if (lru == (size_t)-1) { lru = i; continue; }
-            int lu = g_dead[lru].e->used, ui = g_dead[i].e->used;
-            if (ui && !lu) { lru = i; continue; }          // evict a used (touched) texture before a never-used one
-            if (ui == lu && g_dead[i].e->last_use < g_dead[lru].e->last_use) lru = i;
-        }
-        if (lru == (size_t)-1) break;                       // everything that is left is shared by a live object
-        vktex_t *e = g_dead[lru].e; g_dead[lru] = g_dead[--g_ndead]; g_dead_bytes -= e->alias_of ? 0 : e->L.size;
+    if (!(g_ndead > DEAD_MAX || g_dead_bytes > DEAD_BYTES)) return;
+    uint64_t want_bytes = DEAD_BYTES - DEAD_BYTES / 10; size_t want_n = DEAD_MAX - DEAD_MAX / 10;
+    evict_t *cand = malloc(g_ndead * sizeof *cand); if (!cand) return;
+    size_t nc = 0;
+    for (size_t i = 0; i < g_ndead; i++) {
+        const vktex_t *e = g_dead[i].e; if (e->nalias) continue;
+        cand[nc].key = (e->used ? 0ull : 1ull << 62) | e->last_use; cand[nc++].idx = i;
+    }
+    qsort(cand, nc, sizeof *cand, evict_cmp);
+    unsigned char *drop = calloc(g_ndead, 1); vktex_t **gone = malloc((nc ? nc : 1) * sizeof *gone); size_t ngone = 0, left = g_ndead; uint64_t bytes = g_dead_bytes;
+    for (size_t k = 0; k < nc && drop && gone && (bytes > want_bytes || left > want_n); k++) {
+        vktex_t *e = g_dead[cand[k].idx].e; drop[cand[k].idx] = 1; left--; bytes -= e->alias_of ? 0 : e->L.size;
         for (vktex_t **p = &g_bucket[e->serial & (NB - 1)]; *p; p = &(*p)->next) if (*p == e) { *p = e->next; break; }
         if (e->alias_of) e->alias_of->nalias--; else share_remove(e);
         gone_add(e->serial, GONE_SWEPT); g_nswept++; tomb_add(e);
         gone[ngone++] = e;
     }
-    if (!ngone) return;
+    if (drop && ngone) { size_t w = 0; for (size_t i = 0; i < g_ndead; i++) if (!drop[i]) g_dead[w++] = g_dead[i]; g_ndead = w; g_dead_bytes = bytes; }
+    free(cand); free(drop);
+    if (!ngone) { free(gone); return; }
     pthread_mutex_unlock(&g_mu);
-    for (int i = 0; i < ngone; i++) free_tex(gone[i]);
+    for (size_t i = 0; i < ngone; i++) free_tex(gone[i]);
+    free(gone);
     pthread_mutex_lock(&g_mu);
 }
 static long tex_trace(void) { static long s = -2; if (s == -2) s = getenv("NX_TEX_TRACE") ? atol(getenv("NX_TEX_TRACE")) : -1; return s; }   // NX_TEX_TRACE=<serial>: its creation and release
@@ -329,11 +336,25 @@ static void to_general(vktex_t *e, VkCommandBuffer cb) {
 }
 
 // De-swizzle the dirty subresources of the storage and copy them into the image
+static int bc_block_size(VkFormat f);
 static void upload(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
     static int skipped;
     if (!e->mem) return;
     if (e->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) { red_once(&skipped, "uploading a depth-stencil texture from storage is not supported yet", e->d.format); return; }
     if (e->d.samples > 1) return;
+    if (e->zero && !e->astc && !bc_block_size(e->fmt) && (e->aspect == VK_IMAGE_ASPECT_COLOR_BIT || e->aspect == VK_IMAGE_ASPECT_DEPTH_BIT)) {
+        // The storage held nothing when it was first looked at (a render target made over fresh pool memory): its dirty subresources are cleared to zero, which is what the upload would write
+        int any = 0;
+        for (unsigned lv = 0; lv < e->levels; lv++) for (unsigned ly = 0; ly < e->nsub; ly++) {
+            if (!(__atomic_fetch_and(&SUB(e, lv, ly), (uint8_t)~F_DIRTY, __ATOMIC_ACQ_REL) & F_DIRTY)) continue;
+            VkImageSubresourceRange rg = {e->aspect, lv, 1, ly, 1};
+            if (e->aspect == VK_IMAGE_ASPECT_COLOR_BIT) { VkClearColorValue z = {{0}}; vkCmdClearColorImage(cb, e->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg); }
+            else { VkClearDepthStencilValue z = {0.0f, 0}; vkCmdClearDepthStencilImage(cb, e->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg); }
+            any = 1;
+        }
+        if (any) nvn_vk_barrier_all(cb);
+        return;
+    }
     size_t nreg = (size_t)e->levels * e->nsub, total = 0, n = 0;
     VkBufferImageCopy *rg = calloc(nreg ? nreg : 1, sizeof *rg);
     size_t *off = calloc(nreg ? nreg : 1, sizeof *off), *pitch = calloc(nreg ? nreg : 1, sizeof *pitch);
@@ -431,6 +452,24 @@ static uint64_t storage_hash(const uint8_t *p, size_t n, int *allzero) {
     if (allzero) *allzero = any == 0;
     return h;
 }
+static int storage_zero(const uint8_t *p, size_t n) {              // every byte zero; stops at the first one that is not (a texture with data answers at once)
+    size_t i = 0; uint64_t w;
+    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); if (w) return 0; }
+    for (; i < n; i++) if (p[i]) return 0;
+    return 1;
+}
+static int storage_sampled_nonzero(const uint8_t *p, size_t n) {   // a few words spread over the storage: cheap enough to ask every 100 ms of a texture that was empty
+    uint64_t w;
+    for (size_t i = 0; i + 8 <= n; i += 4096) { memcpy(&w, p + i, 8); if (w) return 1; }
+    if (n >= 8) { memcpy(&w, p + n - 8, 8); if (w) return 1; }
+    return 0;
+}
+static void mark_cpu_dirty(vktex_t *e) {
+    for (size_t i = 0; i < (size_t)e->levels * e->nsub; i++) {
+        uint8_t f = __atomic_load_n(&e->st[i], __ATOMIC_ACQUIRE);
+        if (!(f & F_GPU)) __atomic_store_n(&e->st[i], (uint8_t)(f | F_DIRTY), __ATOMIC_RELEASE);
+    }
+}
 static void recheck(vktex_t *e) {
     static int off = -1; if (off < 0) off = getenv("NX_TEX_NO_RECHECK") != NULL;
     if (off || !e->mem || !e->L.size || e->L.size > (64u << 20)) return;
@@ -439,15 +478,17 @@ static void recheck(vktex_t *e) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
     uint64_t ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
     if (e->hash_ms && ms - e->hash_ms < 100) return;
-    e->hash_ms = ms;
+    int first_look = !e->hash_ms; e->hash_ms = ms;
+    if (first_look) { e->zero = storage_zero(e->mem, e->L.size); return; }       // the initial contents are uploaded by the F_DIRTY set at creation; all that is asked now is whether they are empty
+    if (e->zero) {                                                 // empty when first looked at: has the title filled it since?
+        if (!storage_sampled_nonzero(e->mem, e->L.size) || storage_zero(e->mem, e->L.size)) return;
+        e->zero = 0; mark_cpu_dirty(e); return;
+    }
     int z = 0; uint64_t h = storage_hash(e->mem, e->L.size, &z);
     if (h == e->hash) return;
-    int first = !e->hash; e->hash = h; e->zero = z;
-    if (first) return;                                             // the initial contents are uploaded by the F_DIRTY set at creation
-    for (size_t i = 0; i < (size_t)e->levels * e->nsub; i++) {
-        uint8_t f = __atomic_load_n(&e->st[i], __ATOMIC_ACQUIRE);
-        if (!(f & F_GPU)) __atomic_store_n(&e->st[i], (uint8_t)(f | F_DIRTY), __ATOMIC_RELEASE);
-    }
+    int first = !e->hash; e->hash = h;
+    if (first) return;                                             // the first hash is only the baseline
+    mark_cpu_dirty(e);
 }
 static int use(vktex_t *e, vkctx_t *c, VkCommandBuffer cb) {
     if (!e || !e->ok) return 0;
