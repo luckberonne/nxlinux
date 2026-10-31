@@ -27,6 +27,11 @@ def main(argv=None):
         stage = (code.with_suffix('.stage').read_text().strip() if code.with_suffix('.stage').is_file() else 'other')
         if stage == 'other': stage = 'cs'; other += 1
         path = code
+        if stage == 'cs':            # compute code the translator reads is instructions only: a header of 0x30 bytes (magic 0x12345679) and zero padding come first, the instructions start at +0x100 (nxnative dmsh_build)
+            cd0 = code.read_bytes()
+            if cd0[:4] == bytes.fromhex('79563412'):
+                if any(cd0[0x30:0x100]): sys.exit(f'[RED] {key}: compute code area +0x30..+0x100 is not all zero, so the instructions do not start at +0x100')
+                path = work / (key + '.cs'); path.write_bytes(cd0[0x100:])
         if stage != 'cs':            # a graphics code area starts with a 0x30-byte header (the 0x12345678 magic); the 0x50-byte SPH after it is read by the translator itself, as nxnative's dmsh_build does
             path = work / (key + '.gfx'); path.write_bytes(code.read_bytes()[0x30:])
         job = {'key': key, 'stage': stage, 'code': str(path), 'debug': False, 'orig': str(code)}
@@ -36,7 +41,9 @@ def main(argv=None):
             c1o, c1t = struct.unpack_from('<2I', ctl.read_bytes(), 0x700)
             if c1o <= c1t <= len(data): job['c1'] = data[c1o:c1t].hex()
         if 'c1' not in job and c1.is_file(): job['c1'] = c1.read_bytes().hex()
-        if stage == 'cs': job['local'] = [64, 1, 1]
+        if stage == 'cs':       # the thread group the shader was compiled for: control section +0x748 (three u32); 64x1x1 only when no control section was captured
+            cd = ctl.read_bytes() if ctl.is_file() else b''
+            job['local'] = list(struct.unpack_from('<3I', cd, 0x748)) if len(cd) >= 0x754 and all(struct.unpack_from('<3I', cd, 0x748)) else [64, 1, 1]
         jobs.append(job)
     if not jobs: sys.exit('[RED] no captured shaders in ' + str(dump))
     (work / 'jobs.json').write_text(json.dumps(jobs))

@@ -9,6 +9,7 @@ Library (little endian): "NXSL", u32 version (3), u32 count; per shader: key[8],
 instead of running it wrong:
   2 the shader's own constant segment c[1] when its contents were not captured (otherwise it is a kind 7 binding)   8 storage buffers   16 textures   32 images   64 a geometry shader's helper buffers
   (1 and 4, the driver segments c[0] and c[2], are bindings now: kinds 4 and 5, filled by the host per draw; so is the translator's support buffer, kind 3, when the module reads it)
+Storage buffers: kind 6 reg = the slot of the stage's table in c[0]; kind 8 (compute) reg = the uniform slot whose memory the shader reads as storage.
 Uniform buffers c[3 + reg] are plain bindings (kind 1 = cbuf, reg = the NVN uniform slot); a plain 2D texture read through a combined handle is kind 2 (reg = its c[2] slot,
 aux = the SamplerType).
 """
@@ -16,9 +17,10 @@ import json, struct, sys
 from pathlib import Path
 
 STAGE = {'vs': 0, 'ps': 1, 'cs': 5}          # NVN_STAGE_VERTEX, FRAGMENT, COMPUTE
-KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF, KIND_C1 = 1, 2, 3, 4, 5, 6, 7
+KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF, KIND_C1, KIND_SBUF_UBO = 1, 2, 3, 4, 5, 6, 7, 8
 C0_SSBO = {'vs': 0x110, 'cs': 0x310, 'gs': 0x410, 'ps': 0x510}      # the stage's storage buffer table in driver segment c[0] (src/gfx/nvn/dmsh_abi.h): 16 slots of 0x10 bytes
 C0_SSBO_SLOTS = 16
+C0_CS_UBO, C0_CS_UBO_SLOTS = 0x210, 16                                 # compute: uniform slot r's address and size at 0x210 + 0x10 r; a shader that reads the slot through global memory has a storage-buffer binding for it (KIND_SBUF_UBO)
 SAMPLER_TYPES = {1, 3, 4, 5}                 # the translator's SamplerType 1D, 2D, 3D and cube; Array (256) and Shadow (1024) may be added, Multisample (512) and buffers (2) may not
 C2_TEX, C2_SEPTEX = 0x20, 0x168               # byte offsets in driver segment c[2] (src/gfx/nvn/dmsh_abi.h): combined handles, and where the separate textures start
 
@@ -102,10 +104,13 @@ def entry(key_hex, spirv, res, c1=b''):
             elif slot == 2: binds.append((cb['binding'], KIND_DRV2, 0, 0))
             else: binds.append((cb['binding'], KIND_CBUF, slot - 3, 0))
     for sb in res.get('sbufs', []):
-        base = C0_SSBO.get(res['stage'])
-        if base is not None and sb['cb_slot'] == 0 and sb.get('cb_offset', 0) * 4 == base + 0x10 * sb['slot'] and sb['slot'] < C0_SSBO_SLOTS:
-            binds.append((sb['binding'], KIND_SBUF, sb['slot'], sb.get('flags', 0)))
-        else: needs |= NEEDS_SBUF                                         # an address kept elsewhere (the game's own uniform buffer)
+        # The slot is read off where the shader finds the address (control word offset * 4 in c[0]), as nxnative's dmsh_build does: the reflection's own `slot` is only the shader's local index
+        base = C0_SSBO.get(res['stage']); off = sb.get('cb_offset', 0) * 4
+        if base is not None and sb['cb_slot'] == 0 and 0 <= off - base < 0x10 * C0_SSBO_SLOTS and (off - base) % 0x10 == 0:
+            binds.append((sb['binding'], KIND_SBUF, (off - base) // 0x10, sb.get('flags', 0)))
+        elif res['stage'] == 'cs' and sb['cb_slot'] == 0 and 0 <= off - C0_CS_UBO < 0x10 * C0_CS_UBO_SLOTS and (off - C0_CS_UBO) % 0x10 == 0:
+            binds.append((sb['binding'], KIND_SBUF_UBO, (off - C0_CS_UBO) // 0x10, sb.get('flags', 0)))     # the game's own uniform slot, read as a storage buffer
+        else: needs |= NEEDS_SBUF                                         # an address kept elsewhere
     for t in res.get('textures', []):
         slot = combined_slot(t)
         if slot is None: needs |= NEEDS_TEX
