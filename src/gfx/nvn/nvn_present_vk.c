@@ -29,7 +29,7 @@ static double now_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &
 // ---- the SDL sink: a thread that owns the window
 #ifdef NX_HAVE_SDL3
 // Controller: the keyboard and the first gamepad become player 1's Pro Controller (the hid service in src/host/svc/hid_input.c publishes it).
-// Keys: arrows D-pad, WASD left stick, K/Return A, J/Backspace B, I X, U Y, Q L, E R, 1 ZL, 3 ZR, P plus, O minus. A gamepad keeps its physical layout (east = A).
+// Keys: arrows D-pad, WASD left stick, K/Return A, J/Backspace B, I X, U Y, Q L, E R, 1 ZL, 3 ZR, P plus, O minus. A gamepad's A is the button labelled A (south on Xbox, east on Nintendo layouts).
 void hid_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) __attribute__((weak));
 static int16_t axis_of(SDL_Gamepad *g, SDL_GamepadAxis a) { int v = SDL_GetGamepadAxis(g, a); return (int16_t)(v < -32767 ? -32767 : v); }
 static void input_poll(SDL_Gamepad **pad) {
@@ -44,8 +44,11 @@ static void input_poll(SDL_Gamepad **pad) {
     lx = (k[SDL_SCANCODE_D] - k[SDL_SCANCODE_A]) * 32767; ly = (k[SDL_SCANCODE_W] - k[SDL_SCANCODE_S]) * 32767;
     SDL_Gamepad *g = *pad;
     if (g) {
-        static const struct { SDL_GamepadButton gb; int bit; } gmap[] = {
-            {SDL_GAMEPAD_BUTTON_EAST, 0}, {SDL_GAMEPAD_BUTTON_SOUTH, 1}, {SDL_GAMEPAD_BUTTON_NORTH, 2}, {SDL_GAMEPAD_BUTTON_WEST, 3},
+        // The face buttons follow their labels, not their positions: a pad whose south button is labelled A (Xbox, generic) confirms with south; one whose east button is labelled A (Nintendo layout) confirms with east
+        SDL_GamepadButton fa = SDL_GAMEPAD_BUTTON_SOUTH, fb = SDL_GAMEPAD_BUTTON_EAST, fx = SDL_GAMEPAD_BUTTON_WEST, fy = SDL_GAMEPAD_BUTTON_NORTH;
+        if (SDL_GetGamepadButtonLabel(g, SDL_GAMEPAD_BUTTON_EAST) == SDL_GAMEPAD_BUTTON_LABEL_A) { fa = SDL_GAMEPAD_BUTTON_EAST; fb = SDL_GAMEPAD_BUTTON_SOUTH; fx = SDL_GAMEPAD_BUTTON_NORTH; fy = SDL_GAMEPAD_BUTTON_WEST; }
+        const struct { SDL_GamepadButton gb; int bit; } gmap[] = {
+            {fa, 0}, {fb, 1}, {fx, 2}, {fy, 3},
             {SDL_GAMEPAD_BUTTON_LEFT_STICK, 4}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, 5}, {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 6}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 7},
             {SDL_GAMEPAD_BUTTON_START, 10}, {SDL_GAMEPAD_BUTTON_BACK, 11}, {SDL_GAMEPAD_BUTTON_DPAD_LEFT, 12}, {SDL_GAMEPAD_BUTTON_DPAD_UP, 13},
             {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 14}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, 15}};
@@ -54,7 +57,8 @@ static void input_poll(SDL_Gamepad **pad) {
         if (axis_of(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000) b |= 1ull << 9;
         int32_t gx = axis_of(g, SDL_GAMEPAD_AXIS_LEFTX), gy = -axis_of(g, SDL_GAMEPAD_AXIS_LEFTY);
         if (gx * gx + gy * gy > 6000 * 6000) { lx = gx; ly = gy; }
-        rx = axis_of(g, SDL_GAMEPAD_AXIS_RIGHTX); ry = -axis_of(g, SDL_GAMEPAD_AXIS_RIGHTY);
+        int32_t sx = axis_of(g, SDL_GAMEPAD_AXIS_RIGHTX), sy = -axis_of(g, SDL_GAMEPAD_AXIS_RIGHTY);
+        if (sx * sx + sy * sy > 6000 * 6000) { rx = sx; ry = sy; }      // the same dead zone as the left stick: a worn pad does not drift the camera
     }
     hid_input_set(b, lx, ly, rx, ry);
 }
