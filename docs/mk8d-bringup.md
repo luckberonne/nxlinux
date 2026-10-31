@@ -38,7 +38,7 @@ With it, A goes through single player, Grand Prix, 50cc and into character selec
 
 The window is player 1's Pro Controller, always connected (`src/host/svc/hid_input.c` fills the `hid` shared memory: the npad entry of player 1 at +0x9A00, style set Pro Controller, a ring of 17 states, a new one every 8 ms; the SDL thread in `nvn_present_vk.c` feeds it).
 Keyboard: arrows = D-pad, WASD = left stick, K or Return = A, J or Backspace = B, I = X, U = Y, Q = L, E = R, 1 = ZL, 3 = ZR, P = Plus, O = Minus.
-A gamepad SDL knows works too, with its physical layout (the east button is A). `hid` commands 100/101 keep the style set the title asks for; 11, 66, 67, 120 to 128 are accepted; 203 returns an empty vibration device list.
+A gamepad SDL knows works too: its A and B follow the labels SDL gives the face buttons (bottom = A on Xbox and generic pads, right = A with the Nintendo layout); LB/RB are L/R, LT/RT are ZL/ZR, the right stick has the same 6000 dead zone as the left. The table is in the README. `hid` commands 100/101 keep the style set the title asks for; 11, 66, 67, 120 to 128 are accepted; 203 returns an empty vibration device list.
 
 ## Audio
 

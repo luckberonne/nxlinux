@@ -65,6 +65,32 @@ exist, `tools/run_mk8d.sh` starts the game.
 
 Keys, dumps, firmware and extracted game files are never committed. `work/`, `*.keys`, `*.nsp` and `*.nsz` are git-ignored.
 
+## Controls
+
+The window is player 1's Pro Controller, always connected. A keyboard and one gamepad can be used together.
+
+| Pro Controller | Keyboard | Xbox / generic gamepad |
+|---|---|---|
+| Left stick (steer, move) | W A S D | left stick |
+| Right stick | (none) | right stick |
+| A | K or Return | A (bottom button) |
+| B | J or Backspace | B (right button) |
+| X | I | X |
+| Y | U | Y |
+| L | Q | LB |
+| R | E | RB |
+| ZL | 1 | LT |
+| ZR | 3 | RT |
+| D-pad | arrow keys | D-pad |
+| Plus / Minus | P / O | Menu (Start) / View (Back) |
+
+A gamepad's A and B follow the labels SDL knows for it: on an Xbox or generic pad the bottom button is A, on a pad with the
+Nintendo layout the right button is A. Sticks have a dead zone of about 18 %; triggers count as pressed past 25 %.
+
+What each button does is the game's own scheme. In Mario Kart 8 Deluxe's default one, steer with the left stick, **A** accelerates,
+**B** brakes and reverses, **R** (RB) hops and drifts, and the item is thrown with **L**, **ZL** or **ZR** (LB, LT or RT);
+the rest (rear view, horn, camera) is in the game's controls menu.
+
 ## Tests
 
 ```sh
