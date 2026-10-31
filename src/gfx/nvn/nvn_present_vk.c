@@ -52,9 +52,16 @@ static void input_poll(SDL_Gamepad **pad) {
             {SDL_GAMEPAD_BUTTON_LEFT_STICK, 4}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, 5}, {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 6}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 7},
             {SDL_GAMEPAD_BUTTON_START, 10}, {SDL_GAMEPAD_BUTTON_BACK, 11}, {SDL_GAMEPAD_BUTTON_DPAD_LEFT, 12}, {SDL_GAMEPAD_BUTTON_DPAD_UP, 13},
             {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 14}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, 15}};
-        for (unsigned i = 0; i < sizeof gmap / sizeof *gmap; i++) if (SDL_GetGamepadButton(g, gmap[i].gb)) b |= 1ull << gmap[i].bit;
-        if (axis_of(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8000) b |= 1ull << 8;
-        if (axis_of(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000) b |= 1ull << 9;
+        // Driving layout (the default): the left shoulder and trigger hop and drift (the console's R), the right ones throw the item (ZR). NX_PAD_LAYOUT=pro keeps the physical Pro Controller layout (LB = L, RB = R, LT = ZL, RT = ZR)
+        static int kart = -1; if (kart < 0) { const char *l = getenv("NX_PAD_LAYOUT"); kart = !(l && !strcmp(l, "pro")); }
+        for (unsigned i = 0; i < sizeof gmap / sizeof *gmap; i++) if (SDL_GetGamepadButton(g, gmap[i].gb)) {
+            int bit = gmap[i].bit;
+            if (kart && bit == 6) bit = 7;                          // LB hops
+            else if (kart && bit == 7) bit = 9;                     // RB throws the item
+            b |= 1ull << bit;
+        }
+        if (axis_of(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8000) b |= 1ull << (kart ? 7 : 8);     // LT hops
+        if (axis_of(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000) b |= 1ull << 9;                  // RT throws the item
         int32_t gx = axis_of(g, SDL_GAMEPAD_AXIS_LEFTX), gy = -axis_of(g, SDL_GAMEPAD_AXIS_LEFTY);
         if (gx * gx + gy * gy > 6000 * 6000) { lx = gx; ly = gy; }
         int32_t sx = axis_of(g, SDL_GAMEPAD_AXIS_RIGHTX), sy = -axis_of(g, SDL_GAMEPAD_AXIS_RIGHTY);

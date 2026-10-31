@@ -77,19 +77,22 @@ The window is player 1's Pro Controller, always connected. A keyboard and one ga
 | B | J or Backspace | B (right button) |
 | X | I | X |
 | Y | U | Y |
-| L | Q | LB |
-| R | E | RB |
-| ZL | 1 | LT |
-| ZR | 3 | RT |
+| L | Q | (see below) |
+| R | E | LB or LT (hop, drift) |
+| ZL | 1 | (see below) |
+| ZR | 3 | RB or RT (throw the item) |
 | D-pad | arrow keys | D-pad |
 | Plus / Minus | P / O | Menu (Start) / View (Back) |
 
 A gamepad's A and B follow the labels SDL knows for it: on an Xbox or generic pad the bottom button is A, on a pad with the
 Nintendo layout the right button is A. Sticks have a dead zone of about 18 %; triggers count as pressed past 25 %.
 
-What each button does is the game's own scheme. In Mario Kart 8 Deluxe's default one, steer with the left stick, **A** accelerates,
-**B** brakes and reverses, **R** (RB) hops and drifts, and the item is thrown with **L**, **ZL** or **ZR** (LB, LT or RT);
-the rest (rear view, horn, camera) is in the game's controls menu.
+The gamepad uses a driving layout: **left stick** steers, **A** accelerates, **B** brakes and reverses, **LB or LT** hop and drift (the
+console's R), **RB or RT** throw the item (the console's ZR). That leaves the console's L and ZL off the pad, which the menus use for
+paging (the cup list); the keyboard still has them on Q and 1. `NX_PAD_LAYOUT=pro` gives the physical layout back (LB = L, RB = R,
+LT = ZL, RT = ZR).
+
+What each button does is the game's own scheme; for the rest (rear view, horn, camera) see the game's controls menu.
 
 ## Tests
 
