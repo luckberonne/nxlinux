@@ -81,7 +81,16 @@ static void *sdl_thread(void *arg) {
             }
             if (!tx || tw != w || th != h) { if (tx) SDL_DestroyTexture(tx); tx = SDL_CreateTexture(rr, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, (int)w, (int)h); tw = w; th = h;
                 if (tx) SDL_SetTextureBlendMode(tx, SDL_BLENDMODE_NONE); }       // the game's alpha is not a transparency of the window: with the default blending the translucent menu bars were drawn over black and looked grey
-            if (tx) { SDL_UpdateTexture(tx, NULL, copy, (int)w * 4); SDL_RenderClear(rr); SDL_RenderTexture(rr, tx, NULL, NULL); SDL_RenderPresent(rr); }
+            if (tx) { SDL_UpdateTexture(tx, NULL, copy, (int)w * 4); SDL_RenderClear(rr); SDL_RenderTexture(rr, tx, NULL, NULL);
+                static unsigned nshown; const char *rb = getenv("NX_SDL_READBACK");           // NX_SDL_READBACK=<prefix>: every NX_SDL_READBACK_EVERY (default 100) shown frame, what the renderer holds for the window, to <prefix>.<n>.ppm
+                static unsigned every_rb; if (!every_rb) every_rb = getenv("NX_SDL_READBACK_EVERY") ? (unsigned)atoi(getenv("NX_SDL_READBACK_EVERY")) : 100;
+                if (rb && ++nshown % every_rb == 0) {
+                    SDL_Surface *s0 = SDL_RenderReadPixels(rr, NULL), *s1 = s0 ? SDL_ConvertSurface(s0, SDL_PIXELFORMAT_RGB24) : NULL;
+                    if (s1) { char fn[600]; snprintf(fn, sizeof fn, "%s.%u.ppm", rb, nshown); FILE *o = fopen(fn, "wb");
+                        if (o) { fprintf(o, "P6\n%d %d\n255\n", s1->w, s1->h); for (int y = 0; y < s1->h; y++) fwrite((uint8_t *)s1->pixels + (size_t)y * s1->pitch, 1, (size_t)s1->w * 3, o); fclose(o); } }
+                    if (s1) SDL_DestroySurface(s1); if (s0) SDL_DestroySurface(s0);
+                }
+                SDL_RenderPresent(rr); }
             free(copy);
         }
         SDL_Event ev;
