@@ -68,6 +68,8 @@ static void ise_decode(const uint8_t *s, int pos, int n, int q, uint8_t *out) {
     }
 }
 
+// The value of an endpoint or a weight that holds a trit or a quint is the procedure of the format's specification, not a scaling of the index: with a = the lowest of the plain bits
+// replicated, b a constant made from the others and c a constant of the range, it is ((d * c + b) ^ a) >> 2 for d the trit or quint, then the top bit of a put back
 static int unq_color(int v, int q) {                                       // an endpoint value index → 0..255
     const quant_t *Q = &QUANT[q];
     if (Q->kind == 0) {
@@ -76,13 +78,28 @@ static int unq_color(int v, int q) {                                       // an
         case 5: return (v << 3) | (v >> 2); case 6: return (v << 2) | (v >> 4); case 7: return (v << 1) | (v >> 6); default: return v;
         }
     }
-    return (v * 255 + (Q->levels - 1) / 2) / (Q->levels - 1);
+    static const int TC[7] = {0, 204, 93, 44, 22, 11, 5}, QC[6] = {0, 113, 54, 26, 13, 6};
+    int nb = Q->bits, d = v >> nb, bits = v & ((1 << nb) - 1), a = (bits & 1) * 0x1ff, x = bits >> 1, b = 0, c;
+    if (Q->kind == 1) {
+        c = TC[nb];
+        switch (nb) { case 2: b = 0x116 * x; break; case 3: b = (x << 7) | (x << 2) | x; break; case 4: b = (x << 6) | x; break; case 5: b = (x << 5) | (x >> 2); break; case 6: b = (x << 4) | (x >> 4); break; default: break; }
+    } else {
+        c = QC[nb];
+        switch (nb) { case 2: b = 0x10c * x; break; case 3: b = (x << 7) | (x << 1) | (x >> 1); break; case 4: b = (x << 6) | (x >> 1); break; case 5: b = (x << 5) | (x >> 3); break; default: break; }
+    }
+    return (a & 0x80) | (((d * c + b) ^ a) >> 2);
 }
 static int unq_weight(int v, int q) {                                      // a weight index → 0..64
     const quant_t *Q = &QUANT[q]; int w;
     if (Q->kind == 0) {
         switch (Q->bits) { case 1: w = v * 63; break; case 2: w = v * 21; break; case 3: w = v * 9; break; case 4: w = (v << 2) | (v >> 2); break; default: w = (v << 1) | (v >> 4); }
-    } else w = (v * 63 + (Q->levels - 1) / 2) / (Q->levels - 1);
+        return w > 32 ? w + 1 : w;
+    }
+    int nb = Q->bits, d = v >> nb, bits = v & ((1 << nb) - 1);
+    if (nb == 0) return d * (Q->kind == 1 ? 32 : 16);                       // 3 or 5 levels: 0, 32, 64 and 0, 16, 32, 48, 64
+    if (Q->kind == 1) { w = nb == 1 ? d * 50 : nb == 2 ? d * 23 + ((bits & 2) ? 0x45 : 0) : d * 11 + (((bits << 4) | (bits >> 1)) & 0x63); }
+    else w = nb == 1 ? d * 28 : d * 13 + ((bits & 2) ? 0x42 : 0);
+    int a = (bits & 1) * 0x7f; w = (a & 0x20) | ((w ^ a) >> 2);
     return w > 32 ? w + 1 : w;
 }
 
@@ -116,8 +133,9 @@ static int endpoints(int cem, const int *v, int e0[4], int e1[4]) {
         int base[4] = {b[0], b[1], b[2], b[3]}, top[4] = {clamp255(b[0] + a[0]), clamp255(b[1] + a[1]), clamp255(b[2] + a[2]), cem == 13 ? clamp255(b[3] + a[3]) : 255};
         if (a[0] + a[1] + a[2] >= 0) { memcpy(e0, base, sizeof base); memcpy(e1, top, sizeof top); }
         else { int t0[4] = {b[0] + a[0], b[1] + a[1], b[2] + a[2], top[3]}, t1[4] = {b[0], b[1], b[2], base[3]};
+               contract(t0); contract(t1);                                    // the contraction sees the sums as they are, the clamp comes after it
                for (int i = 0; i < 3; i++) t0[i] = clamp255(t0[i]);
-               contract(t0); contract(t1); memcpy(e0, t0, sizeof t0); memcpy(e1, t1, sizeof t1); }
+               memcpy(e0, t0, sizeof t0); memcpy(e1, t1, sizeof t1); }
         return 1;
     }
     case 10: e0[0] = (v[0] * v[3]) >> 8; e0[1] = (v[1] * v[3]) >> 8; e0[2] = (v[2] * v[3]) >> 8; e0[3] = v[4]; e1[0] = v[0]; e1[1] = v[1]; e1[2] = v[2]; e1[3] = v[5]; return 1;
