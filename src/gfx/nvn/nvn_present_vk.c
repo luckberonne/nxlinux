@@ -79,7 +79,8 @@ static void *sdl_thread(void *arg) {
                 if (!rr) { fprintf(stderr, "[dm] [RED] [nvn] no SDL window or renderer (%s): frames go to memory only\n", SDL_GetError()); free(copy); goto fail; }
                 SDL_SetRenderVSync(rr, 1);
             }
-            if (!tx || tw != w || th != h) { if (tx) SDL_DestroyTexture(tx); tx = SDL_CreateTexture(rr, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, (int)w, (int)h); tw = w; th = h; }
+            if (!tx || tw != w || th != h) { if (tx) SDL_DestroyTexture(tx); tx = SDL_CreateTexture(rr, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, (int)w, (int)h); tw = w; th = h;
+                if (tx) SDL_SetTextureBlendMode(tx, SDL_BLENDMODE_NONE); }       // the game's alpha is not a transparency of the window: with the default blending the translucent menu bars were drawn over black and looked grey
             if (tx) { SDL_UpdateTexture(tx, NULL, copy, (int)w * 4); SDL_RenderClear(rr); SDL_RenderTexture(rr, tx, NULL, NULL); SDL_RenderPresent(rr); }
             free(copy);
         }
@@ -211,12 +212,12 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         if (dump && getenv("NX_TEX_RAW")) { extern void nvn_vk_debug_raw(unsigned); nvn_vk_debug_raw(nth); }
         static int every = -1; if (every < 0) every = getenv("NX_FRAME_EVERY") ? atoi(getenv("NX_FRAME_EVERY")) : 0;   // NX_FRAME_EVERY=<n>: also every n-th frame
         if (dump && (nth == 100 || nth == 400 || nth == 1000 || nth == 2500 || (nth > 2500 && nth % 1500 == 0) || (every > 0 && nth % (unsigned)every == 0))) {
-            size_t lit = 0; for (size_t i = 0; i < (size_t)w * h; i++) if (px[i * 4] | px[i * 4 + 1] | px[i * 4 + 2]) lit++;
+            size_t lit = 0, translucent = 0; for (size_t i = 0; i < (size_t)w * h; i++) { if (px[i * 4] | px[i * 4 + 1] | px[i * 4 + 2]) lit++; if (px[i * 4 + 3] != 255) translucent++; }
             char fn[600]; snprintf(fn, sizeof fn, "%s.%u.ppm", getenv("NX_FRAME_DUMP"), nth);
             FILE *o = fopen(fn, "wb"); if (o) { fprintf(o, "P6\n%d %d\n255\n", w, h); for (size_t i = 0; i < (size_t)w * h; i++) fwrite(px + i * 4, 1, 3, o); fclose(o); }
             { extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); extern uint64_t nvn_draw_main_target(void); size_t tot = 0; uint64_t ms = nvn_draw_main_target(); char pn[640]; snprintf(pn, sizeof pn, "%s.%u.offscreen.ppm", getenv("NX_FRAME_DUMP"), nth); long l = ms ? nvn_vk_debug_lit(ms, &tot, pn) : -1;
               fprintf(stderr, "[dm] [nvn] offscreen target serial %llu: %ld of %zu bytes are not zero\n", (unsigned long long)ms, l, tot); }
-            fprintf(stderr, "[dm] [nvn] frame %u written to %s: %zu of %zu pixels are not black (texture serial %llu)\n", nth, fn, lit, (size_t)w * h, (unsigned long long)t->serial);
+            fprintf(stderr, "[dm] [nvn] frame %u written to %s: %zu of %zu pixels are not black, %zu with alpha below 255 (texture serial %llu)\n", nth, fn, lit, (size_t)w * h, translucent, (unsigned long long)t->serial);
         }
     }
     {   // NX_DRAW_TRACE=<n> with NX_FRAME_DUMP: every target the traced frame drew into goes to <prefix>.<n>.rt<serial>.ppm (RGBA8 and RGBA16F), with its format and how much of it is not zero
