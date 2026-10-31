@@ -95,14 +95,16 @@ static void wake(thr_t *t, int64_t res) {
 // it again when it wakes. At every SVC a thread yields to a waiting thread of higher priority, and to one of equal priority only after a 10 ms slice. NX_NO_SCHED=1 turns this off.
 static int g_sched = -1;
 static thr_t *g_owner[4];
-static pthread_cond_t g_core_cv = PTHREAD_COND_INITIALIZER;
+// One condition variable per core: a core being freed wakes the threads that wait for that core, not every waiter of the four (each of which took G and walked the whole thread list to go back to sleep)
+static pthread_cond_t g_core_cv[4] = {PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
+static void core_wake_all(void) { for (int i = 0; i < 4; i++) pthread_cond_broadcast(&g_core_cv[i]); }      // a thread's core changed while it may wait on the old one (holding G)
 static uint64_t g_ticket;
 static _Atomic int g_nwant;
 static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 static int sched_on(void) { if (g_sched < 0) g_sched = getenv("NX_NO_SCHED") == NULL; return g_sched; }
 static void core_release(thr_t *t) {                    // holding G
     if (!sched_on()) return;
-    if (g_owner[t->core & 3] == t) { g_owner[t->core & 3] = NULL; pthread_cond_broadcast(&g_core_cv); }
+    if (g_owner[t->core & 3] == t) { g_owner[t->core & 3] = NULL; pthread_cond_broadcast(&g_core_cv[t->core & 3]); }
 }
 static int core_first(thr_t *t) {                       // t is the waiter that should get the core (holding G)
     for (thr_t *o = g_all; o; o = o->all)
@@ -113,7 +115,7 @@ static void core_acquire(thr_t *t) {                    // holding G
     if (!sched_on()) return;
     int c = t->core & 3;
     t->want = 1; t->ticket = ++g_ticket; atomic_fetch_add(&g_nwant, 1);
-    while (g_owner[c] || !core_first(t)) { pthread_cond_wait(&g_core_cv, &G); c = t->core & 3; }
+    while (g_owner[c] || !core_first(t)) { pthread_cond_wait(&g_core_cv[c], &G); c = t->core & 3; }
     g_owner[c] = t; t->want = 0; t->since_ns = mono_ns(); atomic_fetch_sub(&g_nwant, 1);
 }
 static void core_yield(thr_t *t) {                      // holding G
@@ -426,7 +428,8 @@ int kernel_svc(cpu_t *c, uint32_t num) {
         thr_t *t = h_peek((uint32_t)regs[0], O_THREAD);
         if (t) { int cc = (int)regs[1]; if (cc >= 0) t->core = cc; if (cc == -2) { t->core = 0; t->mask = 1; } else if (regs[2]) t->mask = regs[2];
             // The ideal core must be in the mask: move it to the lowest core of the mask, as Horizon does
-            if (t->mask && (t->core < 0 || !(t->mask >> t->core & 1))) t->core = __builtin_ctzll(t->mask); }
+            if (t->mask && (t->core < 0 || !(t->mask >> t->core & 1))) t->core = __builtin_ctzll(t->mask);
+            core_wake_all(); }
         pthread_mutex_unlock(&G);
         regs[0] = t ? 0 : R_BAD_HANDLE; break;
     }
