@@ -32,22 +32,29 @@ static double now_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &
 
 // ---- the SDL sink: a thread that owns the window
 #ifdef NX_HAVE_SDL3
-// Controller: the keyboard and the first gamepad become player 1's Pro Controller (the hid service in src/host/svc/hid_input.c publishes it).
+// Controller: the keyboard and the gamepads (up to 8, one player each) become Pro Controllers (the hid service in src/host/svc/hid_input.c publishes it).
 // Keys: arrows D-pad, WASD left stick, K/Return A, J/Backspace B, I X, U Y, Q L, E R, 1 ZL, 3 ZR, P plus, O minus. A gamepad's A is the button labelled A (south on Xbox, east on Nintendo layouts).
-void hid_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) __attribute__((weak));
+void hid_input_set_player(int p, int connected, uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) __attribute__((weak));
+#define NX_PADS 8
 static int16_t axis_of(SDL_Gamepad *g, SDL_GamepadAxis a) { int v = SDL_GetGamepadAxis(g, a); return (int16_t)(v < -32767 ? -32767 : v); }
-static void input_poll(SDL_Gamepad **pad) {
-    if (!hid_input_set) return;
+static void input_poll(SDL_Gamepad **pads) {
+    if (!hid_input_set_player) return;
     const bool *k = SDL_GetKeyboardState(NULL);
     static const struct { SDL_Scancode sc; int bit; } kmap[] = {
         {SDL_SCANCODE_K, 0}, {SDL_SCANCODE_RETURN, 0}, {SDL_SCANCODE_J, 1}, {SDL_SCANCODE_BACKSPACE, 1}, {SDL_SCANCODE_I, 2}, {SDL_SCANCODE_U, 3},
         {SDL_SCANCODE_Q, 6}, {SDL_SCANCODE_E, 7}, {SDL_SCANCODE_1, 8}, {SDL_SCANCODE_3, 9}, {SDL_SCANCODE_P, 10}, {SDL_SCANCODE_O, 11},
         {SDL_SCANCODE_LEFT, 12}, {SDL_SCANCODE_UP, 13}, {SDL_SCANCODE_RIGHT, 14}, {SDL_SCANCODE_DOWN, 15}};
-    uint64_t b = 0; int32_t lx = 0, ly = 0, rx = 0, ry = 0;
-    for (unsigned i = 0; i < sizeof kmap / sizeof *kmap; i++) if (k[kmap[i].sc]) b |= 1ull << kmap[i].bit;
-    lx = (k[SDL_SCANCODE_D] - k[SDL_SCANCODE_A]) * 32767; ly = (k[SDL_SCANCODE_W] - k[SDL_SCANCODE_S]) * 32767;
-    SDL_Gamepad *g = *pad;
-    if (g) {
+    // A gamepad takes the lowest free player number the first time it is used (a button, a stick or a trigger moved), not when it is plugged in: a receiver such as the
+    // Twin USB adapter shows two devices for its two ports even with one pad on it, and an empty port must not become a player. The keyboard is always player 1.
+    static int slot_of[NX_PADS]; static int init;
+    if (!init) { for (int i = 0; i < NX_PADS; i++) slot_of[i] = -1; init = 1; }
+    uint64_t pb[NX_PADS] = {0}; int32_t ps[NX_PADS][4] = {{0}}; int conn[NX_PADS] = {1};
+    for (unsigned i = 0; i < sizeof kmap / sizeof *kmap; i++) if (k[kmap[i].sc]) pb[0] |= 1ull << kmap[i].bit;
+    ps[0][0] = (k[SDL_SCANCODE_D] - k[SDL_SCANCODE_A]) * 32767; ps[0][1] = (k[SDL_SCANCODE_W] - k[SDL_SCANCODE_S]) * 32767;
+    for (int d = 0; d < NX_PADS; d++) {
+        SDL_Gamepad *g = pads[d];
+        if (!g) { slot_of[d] = -1; continue; }
+        uint64_t b = 0; int32_t lx = 0, ly = 0, rx = 0, ry = 0;
         // The face buttons follow their labels, not their positions: a pad whose south button is labelled A (Xbox, generic) confirms with south; one whose east button is labelled A (Nintendo layout) confirms with east
         SDL_GamepadButton fa = SDL_GAMEPAD_BUTTON_SOUTH, fb = SDL_GAMEPAD_BUTTON_EAST, fx = SDL_GAMEPAD_BUTTON_WEST, fy = SDL_GAMEPAD_BUTTON_NORTH;
         if (SDL_GetGamepadButtonLabel(g, SDL_GAMEPAD_BUTTON_EAST) == SDL_GAMEPAD_BUTTON_LABEL_A) { fa = SDL_GAMEPAD_BUTTON_EAST; fb = SDL_GAMEPAD_BUTTON_SOUTH; fx = SDL_GAMEPAD_BUTTON_NORTH; fy = SDL_GAMEPAD_BUTTON_WEST; }
@@ -65,13 +72,21 @@ static void input_poll(SDL_Gamepad **pad) {
         if (gx * gx + gy * gy > 6000 * 6000) { lx = gx; ly = gy; }
         int32_t sx = axis_of(g, SDL_GAMEPAD_AXIS_RIGHTX), sy = -axis_of(g, SDL_GAMEPAD_AXIS_RIGHTY);
         if (sx * sx + sy * sy > 6000 * 6000) { rx = sx; ry = sy; }      // the same dead zone as the left stick: a worn pad does not drift the camera
+        if (slot_of[d] < 0 && (b || lx || ly || rx || ry)) {
+            int used[NX_PADS] = {0}; for (int e = 0; e < NX_PADS; e++) if (slot_of[e] >= 0) used[slot_of[e]] = 1;
+            for (int s = 0; s < NX_PADS; s++) if (!used[s]) { slot_of[d] = s; fprintf(stderr, "[dm] [hid] '%s' joined as player %d\n", SDL_GetGamepadName(g), s + 1); break; }
+        }
+        int s = slot_of[d]; if (s < 0) continue;
+        conn[s] = 1; pb[s] |= b;
+        if (lx || ly) { ps[s][0] = lx; ps[s][1] = ly; }
+        ps[s][2] = rx; ps[s][3] = ry;
     }
-    hid_input_set(b, lx, ly, rx, ry);
+    for (int s = 0; s < NX_PADS; s++) hid_input_set_player(s, conn[s], pb[s], ps[s][0], ps[s][1], ps[s][2], ps[s][3]);
 }
 static void *sdl_thread(void *arg) {
     (void)arg;
     SDL_Window *win = NULL; SDL_Renderer *rr = NULL; SDL_Texture *tx = NULL; uint32_t tw = 0, th = 0; uint64_t seen = 0;
-    SDL_Gamepad *pad = NULL; long shot_target = -1; unsigned shot_n = 0; int shot_now = 0;
+    SDL_Gamepad *pads[NX_PADS] = {0}; long shot_target = -1; unsigned shot_n = 0; int shot_now = 0;
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "[dm] [RED] [nvn] SDL video could not start (%s): frames go to memory only\n", SDL_GetError()); goto fail; }
     for (;;) {
         pthread_mutex_lock(&g_mu);
@@ -93,7 +108,7 @@ static void *sdl_thread(void *arg) {
                 win = SDL_CreateWindow("nxlinux", (int)w, (int)h, SDL_WINDOW_RESIZABLE);
                 rr = win ? SDL_CreateRenderer(win, NULL) : NULL;
                 if (!rr) { fprintf(stderr, "[dm] [RED] [nvn] no SDL window or renderer (%s): frames go to memory only\n", SDL_GetError()); free(copy); goto fail; }
-                SDL_SetRenderVSync(rr, 1);
+                { const char *v = getenv("NX_SDL_VSYNC"); SDL_SetRenderVSync(rr, v && *v == '0' ? 0 : 1); }      // NX_SDL_VSYNC=0: present without waiting for the display
             }
             if (!tx || tw != w || th != h) { if (tx) SDL_DestroyTexture(tx); tx = SDL_CreateTexture(rr, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, (int)w, (int)h); tw = w; th = h;
                 if (tx) SDL_SetTextureBlendMode(tx, SDL_BLENDMODE_NONE); }       // the game's alpha is not a transparency of the window: with the default blending the translucent menu bars were drawn over black and looked grey
@@ -115,8 +130,9 @@ static void *sdl_thread(void *arg) {
             else if (ev.type == SDL_EVENT_KEY_DOWN && (ev.key.key == SDLK_F12 || ev.key.key == SDLK_F9) && !ev.key.repeat) shot_now = 1;
             else if (0) {      // F12: keep the frame shown (a PPM in NX_SHOT_DIR, default nx-shots) and trace the draws of that frame to the log
                 extern long nvn_trace_request(void); shot_target = nvn_trace_request(); shot_n++; fprintf(stderr, "[dm] [nvn] F12: shot %u will be frame %ld, its draws are traced to this log\n", shot_n, shot_target); }
-            else if (ev.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(ev.gdevice.which);
-            else if (ev.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == ev.gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; }
+            else if (ev.type == SDL_EVENT_GAMEPAD_ADDED) { static int maxp = -1; if (maxp < 0) { const char *m = getenv("NX_MAX_PADS"); maxp = m ? atoi(m) : NX_PADS; }      // NX_MAX_PADS=<n>: only the first n gamepads count
+                for (int i = 0; i < NX_PADS && i < maxp; i++) if (!pads[i]) { pads[i] = SDL_OpenGamepad(ev.gdevice.which); if (pads[i]) fprintf(stderr, "[dm] [hid] gamepad '%s' is device %d\n", SDL_GetGamepadName(pads[i]), i + 1); break; } }      // the n-th pad plugged in is player n; a freed slot is taken by the next one
+            else if (ev.type == SDL_EVENT_GAMEPAD_REMOVED) { for (int i = 0; i < NX_PADS; i++) if (pads[i] && SDL_GetGamepadID(pads[i]) == ev.gdevice.which) { SDL_CloseGamepad(pads[i]); pads[i] = NULL; } }
         }
         {   // a shot is asked for by F9 / F12, by SIGUSR1, or every NX_SHOT_EVERY seconds (at most NX_SHOT_MAX, default 80, in all)
             static double every = -2, last; static unsigned maxn; if (every < -1) { const char *e = getenv("NX_SHOT_EVERY"); every = e ? atof(e) : 0; const char *m = getenv("NX_SHOT_MAX"); maxn = m ? (unsigned)atoi(m) : 80; signal(SIGUSR1, shot_signal); }
@@ -125,7 +141,7 @@ static void *sdl_thread(void *arg) {
             if (shot_now && shot_target < 0 && shot_n < maxn) { extern long nvn_trace_request(void); shot_target = nvn_trace_request(); shot_n++; fprintf(stderr, "[dm] [nvn] shot %u will be frame %ld, its draws are traced to this log\n", shot_n, shot_target); }
             shot_now = 0;
         }
-        input_poll(&pad);
+        input_poll(pads);
         pthread_mutex_lock(&g_mu); if (upto > seen) seen = upto; g_shown = seen; pthread_cond_broadcast(&g_cv); int quit = g_quit; pthread_mutex_unlock(&g_mu);
         if (quit) break;
     }
