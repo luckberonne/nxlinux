@@ -11,6 +11,8 @@
 #include <sys/uio.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
+#include <semaphore.h>
 
 #define WAITERS_BIT   0x40000000u
 #define H_CUR_THREAD  0xFFFF8000u
@@ -114,6 +116,7 @@ static int core_first(thr_t *t) {                       // t is the waiter that 
 static void core_acquire(thr_t *t) {                    // holding G
     if (!sched_on()) return;
     int c = t->core & 3;
+    if (g_owner[c] == t) return;                         // already the owner (an IPC that blocked inside took the core back)
     t->want = 1; t->ticket = ++g_ticket; atomic_fetch_add(&g_nwant, 1);
     while (g_owner[c] || !core_first(t)) { pthread_cond_wait(&g_core_cv[c], &G); c = t->core & 3; }
     g_owner[c] = t; t->want = 0; t->since_ns = mono_ns(); atomic_fetch_sub(&g_nwant, 1);
@@ -274,32 +277,54 @@ static void *thread_main(void *p) {
     return NULL;
 }
 
-static void *threads_dump(void *unused) {            // NX_THREADS=<seconds>: what every guest thread is doing (blocked on what), repeated
+// What every guest thread is doing: priority, core, what it waits on, lr, and (stacks) the guest call stack. Taking G could itself hang if the freeze being looked at holds it, so it is
+// tried for two seconds and the dump goes on without it (said in the header line) when it stays taken: the thread list is only read.
+static void threads_dump_once(int stacks, int all, const char *why) {
+    int locked = 0; for (int i = 0; i < 200 && !(locked = pthread_mutex_trylock(&G) == 0); i++) usleep(10000);
+    fprintf(stderr, "[threads] --- %s%s\n", why, locked ? "" : " (the kernel lock is held by someone: reading without it)");
+    for (int c = 0; c < 4; c++) if (g_owner[c]) fprintf(stderr, "[threads] core %d is held by %#llx (%.1f s)\n", c, (unsigned long long)g_owner[c]->id, (double)(mono_ns() - g_owner[c]->since_ns) / 1e9);
+    for (thr_t *t = g_all; t; t = t->all)
+        fprintf(stderr, "[threads] id=%#llx h=%#x prio=%d core=%d %s%s wait=%s addr=%#llx lr=%#llx pc=%#llx r0=%#llx\n", (unsigned long long)t->id, t->handle, t->prio, t->core, t->exited ? "EXITED" : "alive", t->want ? " wants-core" : "",
+                (const char *[]){"none", "lock", "cond", "address", "sync"}[t->wkind >= 0 && t->wkind < 5 ? t->wkind : 0], (unsigned long long)t->waddr, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 30) : 0ull,
+                t->cpu ? (unsigned long long)cpu_get_pc(t->cpu) : 0ull, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 0) : 0ull);
+    if (stacks)
+        for (thr_t *t = g_all; t; t = t->all) if (t->cpu && !t->exited && (t->wkind == 0 || all)) {
+            uint64_t sp = cpu_get_sp(t->cpu); fprintf(stderr, "[threads]   %#llx stack:", (unsigned long long)t->id);
+            uint32_t buf[160]; struct iovec lo = {buf, sizeof buf}, re = {(void *)(uintptr_t)sp, sizeof buf};
+            ssize_t got = process_vm_readv(getpid(), &lo, 1, &re, 1, 0);       // a stack may end before 640 bytes: read what is mapped
+            if (cpu_is_aarch32()) { for (int i = 0; i < (got > 0 ? got / 4 : 0); i++) if (buf[i] >= 0x206000 && buf[i] < 0x1512000) fprintf(stderr, " %#x", buf[i]); }
+            else for (int i = 0; i + 1 < (got > 0 ? got / 4 : 0); i += 2) { uint64_t v = buf[i] | (uint64_t)buf[i + 1] << 32; if (v >= 0x2000011000ull && v < 0x2001a63000ull) fprintf(stderr, " %#llx", (unsigned long long)v - 0x2000015000ull); }       // 64
+            fprintf(stderr, "\n");
+        }
+    if (locked) pthread_mutex_unlock(&G);
+}
+
+static void *threads_dump(void *unused) {            // NX_THREADS=<seconds>: the dump above, repeated (NX_THREADS_STACK=1 adds the stacks, NX_THREADS_ALL=1 also those of blocked threads)
     (void)unused; int secs = atoi(getenv("NX_THREADS")); if (secs < 1) secs = 10;
-    for (;;) {
-        sleep((unsigned)secs);
-        pthread_mutex_lock(&G);
-        fprintf(stderr, "[threads] ---\n");
-        for (thr_t *t = g_all; t; t = t->all)
-            fprintf(stderr, "[threads] id=%#llx h=%#x prio=%d core=%d %s wait=%s addr=%#llx lr=%#llx r0=%#llx\n", (unsigned long long)t->id, t->handle, t->prio, t->core, t->exited ? "EXITED" : "alive",
-                    (const char *[]){"none", "lock", "cond", "address", "sync"}[t->wkind < 5 ? t->wkind : 0], (unsigned long long)t->waddr, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 30) : 0ull, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 0) : 0ull);
-        if (getenv("NX_THREADS_STACK"))
-            for (thr_t *t = g_all; t; t = t->all) if (t->cpu && !t->exited && (t->wkind == 0 || getenv("NX_THREADS_ALL"))) {
-                uint64_t sp = cpu_get_sp(t->cpu); fprintf(stderr, "[threads]   %#llx stack:", (unsigned long long)t->id);
-                uint32_t buf[160]; struct iovec lo = {buf, sizeof buf}, re = {(void *)(uintptr_t)sp, sizeof buf};
-                ssize_t got = process_vm_readv(getpid(), &lo, 1, &re, 1, 0);       // a stack may end before 640 bytes: read what is mapped
-                if (cpu_is_aarch32()) { for (int i = 0; i < (got > 0 ? got / 4 : 0); i++) if (buf[i] >= 0x206000 && buf[i] < 0x1512000) fprintf(stderr, " %#x", buf[i]); }
-                else for (int i = 0; i + 1 < (got > 0 ? got / 4 : 0); i += 2) { uint64_t v = buf[i] | (uint64_t)buf[i + 1] << 32; if (v >= 0x2000011000ull && v < 0x2001a63000ull) fprintf(stderr, " %#llx", (unsigned long long)v - 0x2000015000ull); }       // 64-bit: main-module offsets of the return-looking words
-                fprintf(stderr, "\n");
-            }
-        pthread_mutex_unlock(&G);
-    }
+    for (;;) { sleep((unsigned)secs); threads_dump_once(getenv("NX_THREADS_STACK") != NULL, getenv("NX_THREADS_ALL") != NULL, "every NX_THREADS seconds"); }
     return NULL;
+}
+
+// kill -QUIT <pid> (Ctrl-\ in the terminal) dumps every guest thread with its stack, blocked ones too, into stderr/the log, in a process started without any variable: a frozen title can be looked at.
+// The handler only posts the semaphore (async-signal-safe); a thread does the printing. The process no longer dies of SIGQUIT: use SIGTERM or SIGKILL. NX_NO_QUIT_DUMP=1 leaves SIGQUIT alone.
+static sem_t g_dump_sem;
+static void on_quit(int sig) { (void)sig; sem_post(&g_dump_sem); }
+static void *quit_dump(void *unused) {
+    (void)unused;
+    for (;;) { if (sem_wait(&g_dump_sem)) continue; threads_dump_once(1, 1, "SIGQUIT"); }
+    return NULL;
+}
+static void quit_dump_start(void) {
+    if (getenv("NX_NO_QUIT_DUMP") || sem_init(&g_dump_sem, 0, 0)) return;
+    pthread_t th; if (pthread_create(&th, NULL, quit_dump, NULL)) return;
+    pthread_detach(th);
+    struct sigaction sa = {0}; sa.sa_handler = on_quit; sa.sa_flags = SA_RESTART; sigemptyset(&sa.sa_mask); sigaction(SIGQUIT, &sa, NULL);
 }
 
 void kernel_init(void) {
     pthread_key_create(&g_keythr, NULL);
     if (getenv("NX_THREADS")) { pthread_t th; pthread_create(&th, NULL, threads_dump, NULL); pthread_detach(th); }
+    quit_dump_start();
     g_landing = guest_alloc(16, 16);
     if (cpu_is_aarch32()) {                                  // where a guest function the host calls (cpu_call32) returns to
         uint64_t pad = guest_alloc(16, 16); *(uint32_t *)pad = 0xEF0007FEu;
@@ -354,6 +379,16 @@ static void on_fault(cpu_t *c, uint64_t pc, int kind, void *user) {
     fprintf(stderr, "[RED] guest thread %#x faulted: kind %d at pc=%#llx\n", t->handle, kind, (unsigned long long)pc);
 }
 
+// An IPC request blocks the caller until the service answers, so on a console a thread that polls a service without ever sleeping (MK8D's vibration thread, priority 41) does not keep
+// its core: lower priority threads of that core run meanwhile. The host answers inside the SVC, so the core is given up for the duration when another thread waits for it.
+static int ipc_svc_yielding(cpu_t *c, uint32_t swi) {
+    thr_t *me = pthread_getspecific(g_keythr); int rel = 0;
+    if (me && (swi == 0x21 || swi == 0x22) && sched_on() && atomic_load(&g_nwant)) { pthread_mutex_lock(&G); if (g_owner[me->core & 3] == me) { core_release(me); rel = 1; } pthread_mutex_unlock(&G); }
+    int r = ipc_svc(c, swi);
+    if (rel) { pthread_mutex_lock(&G); core_acquire(me); pthread_mutex_unlock(&G); }
+    return r;
+}
+
 static void on_svc(cpu_t *c, uint32_t swi, void *user) {
     (void)user;
     if (!cpu_is_aarch32()) { static int tr = -1; static const char *tf; static _Atomic int n; if (tr < 0) { tf = getenv("NX_TRACE_SVC"); tr = tf != NULL; }       // NX_TRACE_SVC for an AArch64 title: the first 3000 SVCs (read once: this runs on every SVC)
@@ -363,7 +398,7 @@ static void on_svc(cpu_t *c, uint32_t swi, void *user) {
     static int errs = -1; if (errs < 0) errs = getenv("NX_SVC_ERRORS") != NULL;       // NX_SVC_ERRORS=1: every distinct (svc, non-zero result) once, with its arguments
     uint64_t a0 = errs ? cpu_get_x(c, 0) : 0, a1 = errs ? cpu_get_x(c, 1) : 0, a2 = errs ? cpu_get_x(c, 2) : 0, a3 = errs ? cpu_get_x(c, 3) : 0, lr = errs ? cpu_get_x(c, 30) : 0;
     #define SVC_DONE(call) if (call) { if (errs && swi < 0x100) { uint32_t r = (uint32_t)cpu_get_x(c, 0); if (r) { static uint64_t seen[256]; static int ns; uint64_t key = (uint64_t)swi << 32 | r; int dup = 0; for (int i = 0; i < ns; i++) if (seen[i] == key) dup = 1; if (!dup && ns < 256) { seen[ns++] = key; fprintf(stderr, "[svcerr] svc %#x -> %#x (x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx)\n", swi, r, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)lr); } } } return; }
-    SVC_DONE(ipc_svc(c, swi))             // before the kernel: CloseHandle of a session is not a kernel handle
+    SVC_DONE(ipc_svc_yielding(c, swi))             // before the kernel: CloseHandle of a session is not a kernel handle
     SVC_DONE(kernel_svc(c, swi))
     SVC_DONE(mem_svc(c, swi))
     if (hle_dispatch(c, swi)) return;

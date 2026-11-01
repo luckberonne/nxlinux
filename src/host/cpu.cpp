@@ -80,7 +80,7 @@ struct jitenv final : UserCallbacks {
 
     // An access outside the guest window is a guest bug (a NULL pointer, a stale address): it stops this thread, with the registers, instead of faulting in the host
     bool ok(uint64_t a, size_t n) {
-        if (!guest_mem_base || !guest_mem_end || (a >= guest_mem_base() && a + n <= guest_mem_end())) return true;
+        if (!guest_mem_base || !guest_mem_end || (a >= guest_mem_base() && a < guest_mem_end() && n <= guest_mem_end() - a)) return true;
         cur->bad_addr = a; cur->faulted = true;
         jit->HaltExecution(HaltReason::MemoryAbort);
         return false;

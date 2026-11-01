@@ -336,6 +336,17 @@ static uint32_t hid(int session, const ipc_in_t *in, ipc_out_t *out) {
     case 108: OUT64(0); return 0;                                  // GetPlayerLedPattern
     case 121: OUT64(0); return 0;                                  // GetNpadJoyHoldType
     case 11: case 66: case 67: case 120: case 122: case 123: case 124: case 125: case 126: case 127: case 128: return 0;   // touch screen, six-axis sensor, joy hold type, joy assignment, handheld mode: nothing to configure
+    // Vibration (the pads have none here, but a title polls these for every pad it sees, and MK8D's vibration thread never sleeps between the polls)
+    case 200: { uint32_t h = in->nargs ? in->args[0] : 0; OUT32(1); OUT32(((h >> 16) & 0xff) + 1); return 0; }     // GetVibrationDeviceInfo(handle: style, player, device in bytes 0..2) → {type 1 = linear resonant actuator, position 1 left / 2 right}
+    case 201: return 0;                                            // SendVibrationValue(handle, value, aruid): the motor is not there, the value is dropped
+    case 202: { union { float f; uint32_t u; } lo = {160.0f}, hi = {320.0f}; OUT32(0); OUT32(lo.u); OUT32(0); OUT32(hi.u); return 0; }   // GetActualVibrationValue(handle, aruid) → VibrationValue at rest: amplitude 0, 160 Hz low band, 320 Hz high band
+    case 204: return 0;                                            // PermitVibration(bool)
+    case 205: OUT32(1); return 0;                                  // IsVibrationPermitted → true
+    case 206: return 0;                                            // SendVibrationValues(aruid, handles[], values[]): dropped like 201
+    case 207: return 0;                                            // SendVibrationGcErmCommand
+    case 208: OUT32(0); return 0;                                  // GetActualVibrationGcErmCommand → none
+    case 209: case 210: return 0;                                  // Begin/EndPermitVibrationSession
+    case 211: OUT32(1); return 0;                                  // IsVibrationDeviceMounted(handle, aruid): every handle the title asks for is a pad that is there
     case 203: out->move[out->nmove++] = ipc_new_session("hid.vib", vibration_list); return 0;   // CreateActiveVibrationDeviceList
     default: return hid_permissive("hid", in);
     }

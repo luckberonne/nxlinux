@@ -233,6 +233,7 @@ All are environment variables; nothing costs anything when unset.
 | `NX_SVC_ERRORS=1` | each distinct (SVC, non-zero result) once |
 | `NX_SVC_STATS=1` | 32-bit: a histogram of SVCs and hooks with callers every 2 s |
 | `NX_IPC_TRACE=1` | every IPC request, its first words, the reply buffer addresses and the reply (`NX_IPC_RAW=1` adds the raw message) |
+| `kill -QUIT <pid>` (Ctrl-\) | every guest thread with priority, core, wait, pc, lr and call stack (blocked ones too) into the log, with no variable set; the process no longer dies of SIGQUIT (`NX_NO_QUIT_DUMP=1` restores that) |
 | `NX_THREADS=<s>` | every `<s>` seconds, each guest thread: priority, core, what it waits on, lr (`NX_THREADS_STACK=1` adds a call stack, `NX_THREADS_ALL=1` also for blocked threads) |
 | `NX_WATCH=<hex addr>` | stop at each guest write to that word and print who wrote it (both architectures; host-side writes such as an IPC read are not seen) |
 | `NX_TRACE_PC=<file>` (+ `NX_TRACE_PC_AFTER=<s>`) | every instruction the JIT translated, written at exit, after `<s>` seconds and on a host SIGSEGV (u32 addresses in 32-bit, u64 in 64-bit) |
