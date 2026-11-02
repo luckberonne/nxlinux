@@ -59,6 +59,16 @@ class Encryptor:
         return bytes(out)
 
 
+class Bounded:
+    """a file read only up to n bytes from where it stands: zstd reading across frames would otherwise go on into the next file of the container (Super Smash Bros. Ultimate's
+    big NCZ is followed by more files, and the stream reader failed there with "Unknown frame descriptor" after writing 14.5 GB)"""
+    def __init__(self, f, n): self.f, self.left = f, n
+    def read(self, n=-1):
+        if self.left <= 0: return b''
+        n = self.left if n is None or n < 0 else min(n, self.left)
+        b = self.f.read(n); self.left -= len(b); return b
+
+
 def ncz_to_nca(src, start, size, out):
     src.seek(start)
     out.write(src.read(HEADER))
@@ -82,7 +92,7 @@ def ncz_to_nca(src, start, size, out):
             out.write(enc.crypt(pos, data)); pos += len(data)
     else:
         src.seek(mark)
-        rd = zstandard.ZstdDecompressor().stream_reader(src, read_across_frames=True)
+        rd = zstandard.ZstdDecompressor().stream_reader(Bounded(src, start + size - mark), read_across_frames=True)   # the stream ends with this NCZ: past it are the next file's bytes
         while True:
             data = rd.read(PIECE)
             if not data: break
