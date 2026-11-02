@@ -47,13 +47,18 @@ void hid_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t
 
 static uint64_t mono_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000; }
 // NX_HID_PIPE=<fifo>: each line "<bit>[+<bit>...][:<ms>]" written to that FIFO presses those buttons for player 1 for 200 ms (or ms), for driving a headless run from a script
-static uint64_t g_pipe_bits, g_pipe_until;
+static uint64_t g_pipe_bits, g_pipe_until; static int32_t g_pipe_lx, g_pipe_ly; static uint64_t g_pipe_stick_until;      // NX_HID_PIPE: the buttons, and a left stick position, each for a while
 static void *pipe_reader(void *arg) {
     const char *path = arg; char line[128];
     for (;;) {
         FILE *f = fopen(path, "r"); if (!f) { fprintf(stderr, "[dm] [RED] [hid] NX_HID_PIPE: cannot open %s\n", path); return NULL; }
         while (fgets(line, sizeof line, f)) {
             uint64_t b = 0; unsigned ms = 200; char *q = line;
+            if (*q == 's') {       // s<x>,<y>[:<ms>]: the left stick at x, y (-32767..32767) for a while (a title's cursor needs the stick, not only the d-pad)
+                int x = (int)strtol(q + 1, &q, 10), y = 0; if (*q == ',') y = (int)strtol(q + 1, &q, 10); if (*q == ':') ms = (unsigned)strtoul(q + 1, NULL, 10);
+                __atomic_store_n(&g_pipe_lx, x, __ATOMIC_RELEASE); __atomic_store_n(&g_pipe_ly, y, __ATOMIC_RELEASE); __atomic_store_n(&g_pipe_stick_until, mono_ms() + ms, __ATOMIC_RELEASE);
+                fprintf(stderr, "[dm] [hid] pipe: left stick %d,%d for %u ms\n", x, y, ms); continue;
+            }
             for (;;) { long bit = strtol(q, &q, 10); if (bit >= 0 && bit < 64) b |= 1ull << bit; if (*q != '+') break; q++; }
             if (*q == ':') ms = (unsigned)strtoul(q + 1, NULL, 10);
             __atomic_store_n(&g_pipe_until, mono_ms() + ms, __ATOMIC_RELEASE); __atomic_store_n(&g_pipe_bits, b, __ATOMIC_RELEASE);
@@ -90,6 +95,7 @@ static void publish_player(uint8_t *mem, int pl) {
             buttons |= 1ull << scr[i].bit;
             if (!said[i]) { said[i] = 1; fprintf(stderr, "[dm] [hid] script: button bit %d at %.1f s\n", scr[i].bit, (ms - t_start) / 1000.0); } } }
     static int tap_sig = -1; if (tap_sig < 0) { tap_sig = getenv("NX_TAP_STOP_SIGNAL") != NULL; if (tap_sig) signal(SIGUSR2, tap_stop_handler); }      // NX_TAP_STOP_SIGNAL=1: SIGUSR2 stops the taps for good (the screen then stays where it is)
+    if ((pl == 0 || mirror) && mono_ms() < __atomic_load_n(&g_pipe_stick_until, __ATOMIC_ACQUIRE)) { st[0] = __atomic_load_n(&g_pipe_lx, __ATOMIC_ACQUIRE); st[1] = __atomic_load_n(&g_pipe_ly, __ATOMIC_ACQUIRE); }
     if (pl == 0 || mirror) { uint64_t now = mono_ms(), b = __atomic_load_n(&g_pipe_bits, __ATOMIC_ACQUIRE); if (b && now < __atomic_load_n(&g_pipe_until, __ATOMIC_ACQUIRE)) buttons |= b; }
     if (tap >= 0 && !g_tap_off && (pl == 0 || mirror)) { struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); uint64_t ms = (uint64_t)t0.tv_sec * 1000 + (uint64_t)t0.tv_nsec / 1000000; if (ms % (period * 1000ull) < hold) buttons |= 1ull << tap; }
     uint64_t n = ++g_sample;     // one counter for all players: it only has to grow

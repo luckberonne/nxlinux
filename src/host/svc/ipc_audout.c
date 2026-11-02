@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef NX_HAVE_SDL3
+#include <SDL3/SDL.h>
+#endif
 
 #define R_NOT_IMPL 0xF201u
 #define OUT32(v) (out->out[out->nout++] = (uint32_t)(v))
@@ -27,13 +30,35 @@ typedef struct {
     float volume;
     uint64_t id[AU_QUEUE];   // the BufferClientPtr of each appended buffer, waiting to be reported as released
     uint64_t clock_ns;       // when the audio appended so far has been played, at 48 kHz
+#ifdef NX_HAVE_SDL3
+    SDL_AudioStream *stream; int tried;     // the sound card, opened with the first buffer (NX_AUDIO=0 keeps it closed)
+#endif
     int head, count;
 } audout_t;
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 #define AU_LEAD_NS 60000000ull   // how far ahead of the playback a title may queue before Append makes it wait
 
-static void audout_fin(void *p) { free(p); }
+static void audout_fin(void *p) {
+    audout_t *s = p;
+#ifdef NX_HAVE_SDL3
+    if (s->stream) SDL_DestroyAudioStream(s->stream);
+#endif
+    free(s);
+}
+
+#ifdef NX_HAVE_SDL3
+static void audout_open(audout_t *s) {
+    s->tried = 1;
+    const char *on = getenv("NX_AUDIO"); if (on && *on == '0') return;
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { fprintf(stderr, "[RED] audout: SDL audio could not start (%s): no sound\n", SDL_GetError()); return; }
+    SDL_AudioSpec spec = { SDL_AUDIO_S16, AU_CHANNELS, AU_RATE };
+    s->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!s->stream) { fprintf(stderr, "[RED] audout: no audio device (%s): no sound\n", SDL_GetError()); return; }
+    SDL_ResumeAudioStreamDevice(s->stream);
+}
+#endif
 
 static uint32_t audout_session(int session, const ipc_in_t *in, ipc_out_t *out) {
     (void)session;
@@ -50,6 +75,13 @@ static uint32_t audout_session(int session, const ipc_in_t *in, ipc_out_t *out) 
         // The buffers are released at once, but the device plays them one after the other: the caller that is further ahead than AU_LEAD_NS waits, with its core free, until the playback has caught up.
         // Released at once and not waiting, a title's audio thread mixes flat out and takes a core of the three the title has (Super Smash Bros. Ultimate's reverb was half of all the guest time).
         uint64_t bytes = in->nsend && in->send[0].size >= 0x20 ? ((const uint64_t *)(uintptr_t)in->send[0].addr)[3] : 3840;   // AudioOutBuffer: next, samples, capacity, data size (+0x18), data offset
+#ifdef NX_HAVE_SDL3
+        if (in->nsend && in->send[0].size >= 0x28) {         // the samples: the buffer's pointer (+8) and offset (+0x20) say where the PCM16 data of `bytes` bytes is
+            const uint64_t *ab = (const uint64_t *)(uintptr_t)in->send[0].addr;
+            if (!s->tried) audout_open(s);
+            if (s->stream && ab[1] && bytes && bytes <= ab[2] && SDL_GetAudioStreamQueued(s->stream) < (int)(AU_RATE * AU_CHANNELS * 2 / 4)) SDL_PutAudioStreamData(s->stream, (const uint8_t *)(uintptr_t)(ab[1] + ab[4]), (int)bytes);
+        }
+#endif
         uint64_t now = now_ns(); if (s->clock_ns < now) s->clock_ns = now;
         s->clock_ns += (bytes / (AU_CHANNELS * 2) + 1) * 1000000000ull / AU_RATE;
         if (s->clock_ns > now + AU_LEAD_NS) {

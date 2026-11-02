@@ -104,7 +104,7 @@ static uint32_t idirectory(int session, const ipc_in_t *in, ipc_out_t *out) {
     }
 }
 
-static uint32_t ifilesystem(int session, const ipc_in_t *in, ipc_out_t *out) {
+static uint32_t ifilesystem_impl(int session, const ipc_in_t *in, ipc_out_t *out) {
     (void)session;
     const fs_t *fs = in->data; char p[PATH_MAX], q[PATH_MAX]; struct stat st;
     switch (in->cmd) {
@@ -145,6 +145,14 @@ static uint32_t ifilesystem(int session, const ipc_in_t *in, ipc_out_t *out) {
     case 14: for (int i = 0; i < 8; i++) OUT32(0); return 0;         // GetFileTimeStampRaw: created, modified, accessed, flags
     default: fprintf(stderr, "[RED] ipc: fsp IFileSystem command %u is not implemented\n", in->cmd); return R_NOT_IMPL;
     }
+}
+
+// NX_FS_LOG=1: every path the title asks of the file system and what it got back
+static uint32_t ifilesystem(int session, const ipc_in_t *in, ipc_out_t *out) {
+    uint32_t r = ifilesystem_impl(session, in, out);
+    static int lg = -1; if (lg < 0) lg = getenv("NX_FS_LOG") != NULL;
+    if (lg && in->cmd <= 14 && !in->control) { char p[PATH_MAX]; const fs_t *fs = in->data; const char *rel = in->nsend ? in_path(in, 0) : ""; host_path(fs, rel, p); fprintf(stderr, "[fs] cmd %u %s -> %#x\n", in->cmd, p, r); }
+    return r;
 }
 
 static int savedata_root(char *root) {                              // the save data directory, created if need be
