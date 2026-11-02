@@ -5,7 +5,10 @@
 
 // Notification event that never fires (GetSystemEvent-style calls return a pointer; bound on the guest thread on first use)
 static _Alignas(16) uint8_t g_ev_notify[0x100], g_ev_invite[0x100];
-static void *quiet_event(uint8_t *ev) { hle_bind_system_event(ev, 0); return ev; }
+// The events are the host's own static objects, so each is bound to a kernel event pair once: Super Smash Bros. Ultimate asks for them every frame, and binding on each call made a new pair
+// each time and filled the kernel's 4096-entry handle table in a minute.
+static void *quiet_event(uint8_t *ev, int *bound) { if (!__atomic_exchange_n(bound, 1, __ATOMIC_ACQ_REL)) hle_bind_system_event(ev, 0); return ev; }
+static int g_bound_notify, g_bound_invite;
 
 HLE_FORCE("_ZN2nn7friends10InitializeEv", "connects to the friends service (cut)", void, h_fr_Initialize, void) {}
 // AsyncContext: no request is sent; the completion event fires immediately and the result is failure (same as hle_account.c)
@@ -16,6 +19,11 @@ HLE_FORCE("_ZNK2nn7friends12AsyncContext9GetResultEv", "async result always fail
 // Lists / profiles / play history
 HLE_FORCE("_ZN2nn7friends13GetFriendListEPiPNS0_6FriendEiiRKNS0_12FriendFilterE", "friend list is empty (cut)", Result, h_fr_GetFriendList, int *count, void *out, int off, int n, const void *filt) {
     (void)out; (void)off; (void)n; (void)filt; if (count) *count = 0; return RES_FAIL;
+}
+// The Uid overload (Super Smash Bros. Ultimate imports only this one): it opens friend:u by itself through ShimLibraryGlobal::GetSyncSession, so without this hook the
+// service request aborts the title before the friends code it belongs to is ever reached
+HLE_FORCE("_ZN2nn7friends13GetFriendListEPiPNS0_6FriendERKNS_7account3UidEiiRKNS0_12FriendFilterE", "friend list is empty (cut)", Result, h_fr_GetFriendListUid, int *count, void *out, const void *uid, int off, int n, const void *filt) {
+    (void)out; (void)uid; (void)off; (void)n; (void)filt; if (count) *count = 0; return RES_FAIL;
 }
 // Blocked users, SDK 4's overload without a Uid: an empty list and success. Dark Souls Remastered asks after the opening movie and turns a failure into an error for the error applet
 // (main+0x8ff9f0). The Uid overload below reports a failure, which DRAGON QUEST XI S takes as it is
@@ -34,10 +42,10 @@ HLE_FORCE("_ZN2nn7friends29GetPlayHistoryRegistrationKeyEPNS0_26PlayHistoryRegis
 HLE_FORCE("_ZN2nn7friends17NotificationQueueC1Ev", "notification queue creates no session (cut)", void, h_fr_NqCtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn7friends17NotificationQueueD1Ev", "notification queue has no session to close (cut)", void, h_fr_NqDtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn7friends17NotificationQueue10InitializeERKNS_7account3UidE", "notification queue init fails (cut)", Result, h_fr_NqInit, void *self, const void *uid) { (void)self; (void)uid; return RES_FAIL; }
-HLE_FORCE("_ZN2nn7friends17NotificationQueue14GetSystemEventEv", "notification event never fires (cut)", void *, h_fr_NqGetEv, void *self) { (void)self; return quiet_event(g_ev_notify); }
+HLE_FORCE("_ZN2nn7friends17NotificationQueue14GetSystemEventEv", "notification event never fires (cut)", void *, h_fr_NqGetEv, void *self) { (void)self; return quiet_event(g_ev_notify, &g_bound_notify); }
 HLE_FORCE("_ZN2nn7friends17NotificationQueue3PopEPNS0_16NotificationInfoE", "notification queue is always empty (cut)", Result, h_fr_NqPop, void *self, void *info) { (void)self; (void)info; return RES_FAIL; }
 // Invitations
-HLE_FORCE("_ZN2nn7friends36GetFriendInvitationNotificationEventEv", "invitation notification event never fires (cut)", void *, h_fr_InvEv, void) { return quiet_event(g_ev_invite); }
+HLE_FORCE("_ZN2nn7friends36GetFriendInvitationNotificationEventEv", "invitation notification event never fires (cut)", void *, h_fr_InvEv, void) { return quiet_event(g_ev_invite, &g_bound_invite); }
 HLE_FORCE("_ZN2nn7friends38TryPopFriendInvitationNotificationInfoEPNS_7account3UidEPmPvm", "no invitations (cut)", int, h_fr_InvPop, void *uid, uint64_t *sz, void *buf, size_t n) {
     (void)uid; (void)sz; (void)buf; (void)n; return 0;
 }

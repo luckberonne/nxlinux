@@ -1,0 +1,106 @@
+// audout:u (the audio-out device: nn::audio opens it and feeds raw PCM buffers). The host has no audio device yet, so the device exists but runs at the
+// speed of the caller: every buffer that is appended is released again at once, which keeps the title's audio thread going with silence. The stream is
+// not played (ipc_audren.c is the mixer that makes sound for a title that renders its own frames).
+// Command layouts: switchbrew "Audio services" (audout:u, IAudioOut).
+#include "ipc.h"
+#include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define R_NOT_IMPL 0xF201u
+#define OUT32(v) (out->out[out->nout++] = (uint32_t)(v))
+#define OUT64(v) do { uint64_t _v = (v); OUT32(_v); OUT32(_v >> 32); } while (0)
+
+// The default device: stereo PCM16 at 48 kHz, the same defaults nn::audio asks for (AudioOutParameter with the 0xcafe marker).
+#define AU_RATE 48000
+#define AU_CHANNELS 2
+#define AU_FORMAT 2          // nn::audio::SampleFormat_PcmInt16
+#define AU_STOPPED 1         // nn::audio::AudioOutState: 0 started, 1 stopped
+static const char g_name[] = "AudioStereoJackOutput";
+
+#define AU_QUEUE 64          // buffers a title may have in flight before the oldest identifier is dropped
+typedef struct {
+    uint32_t event;          // RegisterBufferEvent's handle (0 until it is registered)
+    int started;
+    float volume;
+    uint64_t id[AU_QUEUE];   // the BufferClientPtr of each appended buffer, waiting to be reported as released
+    int head, count;
+} audout_t;
+
+static void audout_fin(void *p) { free(p); }
+
+static uint32_t audout_session(int session, const ipc_in_t *in, ipc_out_t *out) {
+    (void)session;
+    audout_t *s = in->data;
+    switch (in->cmd) {
+    case 0: OUT32(s->started ? 0 : AU_STOPPED); return 0;         // GetAudioOutState
+    case 1: s->started = 1; return 0;                             // Start
+    case 2: s->started = 0; return 0;                             // Stop
+    case 3: case 7: {                                             // AppendAudioOutBuffer(Auto)(AudioOutBuffer in an input buffer, u64 BufferClientPtr): the Auto one only differs in how the buffer travels (Super Smash Bros. Ultimate uses it)
+        uint64_t id = in->nargs >= 2 ? (uint64_t)in->args[0] | ((uint64_t)in->args[1] << 32) : 0;
+        if (s->count == AU_QUEUE) { s->head = (s->head + 1) % AU_QUEUE; s->count--; }
+        s->id[(s->head + s->count) % AU_QUEUE] = id; s->count++;
+        if (s->event) kernel_event_signal(s->event);
+        return 0;
+    }
+    case 4:                                                       // RegisterBufferEvent → the event a released buffer signals
+        if (!s->event) s->event = kernel_event_new(0);
+        out->copy[out->ncopy++] = s->event; return 0;
+    case 5: case 8: {                                             // GetReleasedAudioOutBuffers(Auto): everything appended is already released
+        unsigned n = (unsigned)s->count;
+        if (in->nrecv) {                                          // the identifiers land in the output buffer
+            uint64_t *b = (uint64_t *)(uintptr_t)in->recv[0].addr;
+            unsigned room = (unsigned)(in->recv[0].size / 8); if (n > room) n = room;
+            for (unsigned i = 0; i < n; i++) b[i] = s->id[(s->head + i) % AU_QUEUE];
+        }
+        OUT32(n);
+        s->head = (s->head + (int)n) % AU_QUEUE; s->count -= (int)n;
+        return 0;
+    }
+    case 6: {                                                     // ContainsAudioOutBuffer(u64 BufferClientPtr) → bool
+        uint64_t id = in->nargs >= 2 ? (uint64_t)in->args[0] | ((uint64_t)in->args[1] << 32) : 0;
+        int found = 0;
+        for (int i = 0; i < s->count; i++) if (s->id[(s->head + i) % AU_QUEUE] == id) found = 1;
+        OUT32(found); return 0;
+    }
+    case 9: OUT32((uint32_t)s->count); return 0;                  // GetAudioOutBufferCount
+    case 10: OUT64(0); return 0;                                  // GetAudioOutPlayedSampleCount
+    case 11: OUT32(0); return 0;                                  // FlushAudioOutBuffers → Pending
+    case 12: {                                                    // SetAudioOutVolume(float)
+        float v = 1.0f; if (in->nargs >= 1) memcpy(&v, &in->args[0], 4); s->volume = v; return 0;
+    }
+    case 13: { float v = s->volume; uint32_t w; memcpy(&w, &v, 4); OUT32(w); return 0; }   // GetAudioOutVolume
+    default: fprintf(stderr, "[RED] ipc: audout IAudioOut command %u is not implemented\n", in->cmd); return R_NOT_IMPL;
+    }
+}
+
+static void put_name(const ipc_in_t *in) {                        // the 0x100-byte device name an output buffer receives
+    if (!in->nrecv) return;
+    uint8_t *b = (uint8_t *)(uintptr_t)in->recv[0].addr;
+    size_t n = in->recv[0].size < 0x100 ? in->recv[0].size : 0x100;
+    memset(b, 0, n);
+    if (n > sizeof g_name) memcpy(b, g_name, sizeof g_name);
+}
+
+static uint32_t audout(int session, const ipc_in_t *in, ipc_out_t *out) {
+    (void)session;
+    switch (in->cmd) {
+    case 0: case 2: {                                             // ListAudioOuts(Auto) → Count, names into the output buffer
+        put_name(in);
+        OUT32(1); return 0;
+    }
+    case 1: case 3: {                                             // OpenAudioOut(Auto) → NameOut + AudioOutParameterInternal + IAudioOut
+        audout_t *s = calloc(1, sizeof *s);
+        if (!s) return 0x105u;
+        s->volume = 1.0f;
+        out->move[out->nmove++] = ipc_new_session_owned("audout.s", audout_session, s, audout_fin);
+        put_name(in);
+        OUT32(AU_RATE); OUT32(AU_CHANNELS); OUT32(AU_FORMAT); OUT32(AU_STOPPED);
+        return 0;
+    }
+    default: fprintf(stderr, "[RED] ipc: audout:u command %u is not implemented\n", in->cmd); return R_NOT_IMPL;
+    }
+}
+
+__attribute__((constructor)) static void register_audout(void) { ipc_register_service("audout:u", audout); }

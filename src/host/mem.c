@@ -103,8 +103,9 @@ static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapp
     uint64_t p = (addr - (uint64_t)g_alias) >> 12, np = g_alias_cap >> 12, lo = p, hi = p + 1;
     #define BIT(i) ((atomic_load(&g_alias_bits[(i) >> 6]) >> ((i) & 63)) & 1)
     *mapped = (int)BIT(p);
-    while (lo && (int)BIT(lo - 1) == *mapped) lo--;
-    while (hi < np && (int)BIT(hi) == *mapped) hi++;
+    uint64_t full = *mapped ? ~0ull : 0;      // whole 64-page words of the same state are skipped at once: the region is 64 GB (16 M pages) and mostly one state
+    while (lo && (int)BIT(lo - 1) == *mapped) { lo--; while (lo >= 64 && !(lo & 63) && atomic_load(&g_alias_bits[(lo >> 6) - 1]) == full) lo -= 64; }
+    while (hi < np && (int)BIT(hi) == *mapped) { hi++; while (!(hi & 63) && hi + 64 <= np && atomic_load(&g_alias_bits[hi >> 6]) == full) hi += 64; }
     #undef BIT
     *base = (uint64_t)g_alias + (lo << 12); *size = (hi - lo) << 12;
 }
@@ -200,6 +201,12 @@ done:
 
 // ---- Break
 static void default_break(uint64_t reason, uint64_t ptr, uint64_t size, uint64_t lr) {
+    if (reason & 0x80000000u) {      // NotificationOnlyFlag: a message for a debugger (PreLoadLibrary 3, PostLoadLibrary 4, PreUnloadLibrary 5, PostUnloadLibrary 6, CppException 7); with none attached the call just returns.
+        static const char *const kind[] = {"Panic", "Assert", "User", "PreLoadLibrary", "PostLoadLibrary", "PreUnloadLibrary", "PostUnloadLibrary", "CppException"};      // nn::ro::LoadModule sends the library ones around each NRO it loads
+        static _Atomic unsigned n; unsigned k = atomic_fetch_add(&n, 1);
+        if (k < 6) fprintf(stderr, "[dm] Break notification %s (%#llx), the process goes on\n", kind[(reason & 0x7fffffffu) < 8 ? (reason & 0x7fffffffu) : 0], (unsigned long long)reason);
+        return;
+    }
     uint32_t res = (ptr && size >= 4) ? *(uint32_t *)ptr : 0;
     fprintf(stderr, "[RED] Break reason=%#llx Result=%#x lr=%#llx\n", (unsigned long long)reason, res, (unsigned long long)lr);
     _exit(42);
@@ -263,7 +270,13 @@ int mem_svc(cpu_t *c, uint32_t num) {
         if (res) { regs[0] = res; break; }
         pthread_mutex_lock(&g_map_lock);
         if (num == 0x04) {
-            if (map_find(dst, size) || map_source_busy(src, size) || !map_source_backed(src, size)) res = R_INVALID_STATE;
+            int m_dst = map_find(dst, size), m_busy = map_source_busy(src, size), m_back = map_source_backed(src, size);
+            if (m_dst || m_busy || !m_back) {
+                res = R_INVALID_STATE;
+                static _Atomic unsigned nfail; unsigned k = atomic_fetch_add(&nfail, 1) + 1;
+                if (k <= 8 || !(k & (k - 1))) fprintf(stderr, "[RED] mem: MapMemory(dst %#llx, src %#llx, size %#llx) refused (#%u): %s%s%s\n", (unsigned long long)dst, (unsigned long long)src, (unsigned long long)size, k,
+                        m_dst ? "the destination is already mapped; " : "", m_busy ? "the source is lent to a live mapping; " : "", !m_back ? "the source is not committed memory the guest owns" : "");
+            }
             else if (g_nmap == MAX_MAP) res = R_OUT_OF_RESOURCE;
             if (!res) {
                 if (mprotect((void *)dst, size, PROT_READ | PROT_WRITE)) die("MapMemory mprotect failed");
@@ -316,6 +329,15 @@ int mem_svc(cpu_t *c, uint32_t num) {
     }
     case 0x1E: regs[0] = kernel_cntpct(); break;   // GetSystemTick: the tick count itself in x0 (not a Result)
     case 0x26: {  // Break(reason, ptr, size): the SDK's fatal abort; bit 31 of the reason marks a notification that can continue
+        if (getenv("NX_BREAK_STACK")) {   // the guest frames that led to the abort (x29 chain, as NX_FAULT_STACK does for a fault)
+            uint64_t fp = cpu_get_x(c, 29);
+            fprintf(stderr, "[RED]   frames (x29 chain):");
+            for (int i = 0; i < 16 && fp >= guest_mem_base() && fp + 16 <= guest_mem_end() && !(fp & 7); i++) {
+                fprintf(stderr, " %#llx", (unsigned long long)*(uint64_t *)(fp + 8));
+                fp = *(uint64_t *)fp;
+            }
+            fprintf(stderr, "\n");
+        }
         (g_break ? g_break : default_break)(regs[0], regs[1], regs[2], cpu_get_x(c, 30));
         regs[0] = 0; break;
     }

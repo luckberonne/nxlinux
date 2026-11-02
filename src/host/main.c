@@ -1,9 +1,10 @@
 // The nxlinux executable: maps the modules of a title (tools/run_title.py unpacks them from the ExeFS into memory images and a manifest), relocates them against the host's
 // service hooks, and runs the first guest thread. Usage:
-//   nxlinux --manifest FILE [--entry SYMBOL] [--shaders LIB.nxsl] [--mem-mb N] [--arch32]
+//   nxlinux --manifest FILE [--entry SYMBOL] [--shaders LIB.nxsl] [--mem-mb N] [--arch32] [--sys-resource N]
 // The manifest has one line per module in load order: "name image-path bss-bytes [ro-offset data-offset]" (hex; the offsets split the image into code, read-only and data for
-// QueryMemory). --arch32 runs a 32-bit (AArch32) process, as main.npdm declares: the window sits in the low 4 GiB and the modules are ELF32. Retail titles start at offset 0 of the first module (rtld); --entry names a symbol instead
-// (the synthetic test titles). A window opens by default (NX_PRESENT=sdl); set NX_PRESENT=memory for none.
+// QueryMemory). --arch32 runs a 32-bit (AArch32) process, as main.npdm declares: the window sits in the low 4 GiB and the modules are ELF32. --sys-resource is main.npdm's
+// SystemResourceSize (meta header +0x14), which the SDK reads with GetInfo(SystemResourceSize) and needs before it manages the alias region. Retail titles start at offset 0 of the
+// first module (rtld); --entry names a symbol instead (the synthetic test titles). A window opens by default (NX_PRESENT=sdl); set NX_PRESENT=memory for none.
 #include "dm.h"
 #include "hle.h"
 #include "guest_mem.h"
@@ -31,7 +32,7 @@ static uint8_t *slurp(const char *path, size_t *n) {
 
 int main(int argc, char **argv) {
     { extern void nx_prof_init(void); nx_prof_init(); }          // NX_PROF=1: the sampling profiler (prof.c)
-    const char *manifest = NULL, *entry_sym = NULL, *shaders = NULL; unsigned mem_mb = 4096; int arch32 = 0;
+    const char *manifest = NULL, *entry_sym = NULL, *shaders = NULL; unsigned mem_mb = 4096; int arch32 = 0; unsigned long long sys_resource = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--manifest") && i + 1 < argc) manifest = argv[++i];
         else if (!strcmp(argv[i], "--entry") && i + 1 < argc) entry_sym = argv[++i];
@@ -40,17 +41,26 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--romfs") && i + 1 < argc) fsp_set_romfs(argv[++i]);
         else if (!strcmp(argv[i], "--aoc") && i + 1 < argc) { if (aoc_add(argv[++i])) return 2; }
         else if (!strcmp(argv[i], "--mem-mb") && i + 1 < argc) mem_mb = (unsigned)atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s --manifest FILE [--entry SYMBOL] [--shaders LIB.nxsl] [--mem-mb N] [--arch32] [--romfs IMAGE] [--aoc ID:IMAGE]...\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--sys-resource") && i + 1 < argc) sys_resource = strtoull(argv[++i], NULL, 0);
+        else { fprintf(stderr, "usage: %s --manifest FILE [--entry SYMBOL] [--shaders LIB.nxsl] [--mem-mb N] [--arch32] [--sys-resource N] [--romfs IMAGE] [--aoc ID:IMAGE]...\n", argv[0]); return 2; }
     }
     if (!manifest) { fprintf(stderr, "nxlinux: --manifest is required\n"); return 2; }
     if (!getenv("NX_PRESENT")) setenv("NX_PRESENT", "sdl", 1);
     g_t0_ns = now_ns();
     if (arch32) cpu_set_aarch32(1);
+    mem_profile_t mp = mem_default_profile();
+    mp.sys_resource = sys_resource;      // the NPDM's SystemResourceSize: without it the SDK leaves its virtual address memory manager unbuilt
+    if (arch32) { mp.heap = 0x80000000; mp.app_pool = 0xC0000000; }      // a 32-bit title asks for its heap in one piece (Mario Kart 8 Deluxe: SetMemoryHeapSize(0x78000000))
+    else {
+        mp.heap = 0xD0000000; mp.app_pool = 0xCD500000; mp.stack = 0x10000000;      // a 64-bit retail title (Mario Kart 8 Deluxe 4.x: SetHeapSize(0xc1c00000)) asks for 3 GB of heap
+        // The alias region of a 39-bit process is 64 GB on the console, and the SDK's address region manager (nn::os::AllocateAddressRegion) hands out pieces of it:
+        // Super Smash Bros. Ultimate's engine reserves 62 GB there in a static constructor and aborts if it does not get them. Only reserved here (PROT_NONE, MAP_NORESERVE):
+        // a page costs memory once the title maps it with MapPhysicalMemory. NX_ALIAS_MB=<n> sets another size (256 MB was the size before).
+        const char *am = getenv("NX_ALIAS_MB"); mp.alias = am ? (uint64_t)atoll(am) << 20 : 0x1000000000ull;
+    }
+    { uint64_t need = mem_window_size(&mp); if (!entry_sym && !arch32 && need > ((uint64_t)mem_mb << 20)) mem_mb = (unsigned)((need + 0xFFFFF) >> 20); }      // the window holds the whole profile
     if (arch32 ? guest_mem_init32((uint64_t)mem_mb << 20) : guest_mem_init((uint64_t)mem_mb << 20)) { LOG("[RED] cannot reserve %u MiB of guest memory", mem_mb); return 1; }
-    if (!entry_sym) { mem_profile_t mp = mem_default_profile();
-        if (arch32) { mp.heap = 0x80000000; mp.app_pool = 0xC0000000; }      // a 32-bit title asks for its heap in one piece (Mario Kart 8 Deluxe: SetMemoryHeapSize(0x78000000))
-        else { mp.heap = 0xD0000000; mp.app_pool = 0xCD500000; mp.stack = 0x10000000; }      // a 64-bit retail title (Mario Kart 8 Deluxe 4.x: SetHeapSize(0xc1c00000)) asks for 3 GB of heap
-        if (mem_init(&mp)) return 1; }   // a retail title brings its own heap and stack: SetHeapSize, MapMemory, QueryMemory
+    if (!entry_sym) { if (mem_init(&mp)) return 1; }   // a retail title brings its own heap and stack: SetHeapSize, MapMemory, QueryMemory
     if (!arch32) kernel_init();            // an AArch32 title's rtld must be the first thing in the window: kernel_init allocates after the modules are mapped
     hle_collect_sections();
 
@@ -68,6 +78,7 @@ int main(int argc, char **argv) {
         if (dyn <= 0) { LOG("[RED] module %s has no MOD0 block", name); return 1; }
         if (arch32 ? module32_map(&mods32[nm], &mods[nm], name, file, len, (size_t)bss, (uint64_t)dyn, ro, data)
                    : module_map(&mods[nm], name, file, len, (size_t)bss, (uint64_t)dyn)) { LOG("[RED] module %s could not be mapped", name); return 1; }
+        if (!arch32) { mods[nm].ro_off = ro; mods[nm].data_off = data; }      // the NSO header's segment offsets (0 = the manifest does not say): QueryMemory reports code, read-only and data apart, and the data and bss of a module count as memory a thread stack can be mapped from (Super Smash Bros. Ultimate allocates them there)
         module_register(&mods[nm]); loaded[nm] = &mods[nm]; loaded32[nm] = &mods32[nm];
         LOG("module %-10s base %#llx size %#zx", name, (unsigned long long)mods[nm].base, mods[nm].size);
         free(file); nm++;

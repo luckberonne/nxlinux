@@ -12,4 +12,5 @@ HLE_FORCE("_ZN2nn3aoc10InitializeEv", "add-on content (DLC) service: no session 
 HLE_FORCE("_ZN2nn3err26InitializeContextWriterApiEv", "connect to the err error context service; the host does not report", void, h_err_InitCtx, void) { once("err::InitializeContextWriterApi"); }
 HLE_FORCE("_ZN2nn2fs24InitializeForApplicationEv", "connect to the fsp-srv file service; the file interface goes to the host file system + RomFS", void, h_fs_InitApp, void) { once("fs::InitializeForApplication"); }
 HLE_FORCE("_ZN2nn4pctl10InitializeEv", "connect to the pctl parental controls service; single-player has no parental controls", void, h_pctl_Initialize, void) { once("pctl::Initialize"); }
+HLE_FORCE("_ZN2nn4bcat10InitializeEv", "connect to the bcat background content acquisition service; the host acquires no background content", void, h_bcat_Initialize, void) { once("bcat::Initialize"); }
 HLE_FORCE("_ZN2nn4diag34InitializeApplicationAbortObserverEv", "register with the system's abort observer; host crashes are printed by the signal handler", void, h_diag_AbortObs, void) { once("diag::InitializeApplicationAbortObserver"); }

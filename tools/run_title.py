@@ -5,7 +5,7 @@
 
 The keys and the dumps come from your own console (Lockpick_RCM, nxdumptool) and stay wherever you keep them: nothing is copied into the repository, and the extracted files go
 under --work (default work/run/<title>, which git ignores). Modules load in the order the Switch's loader does: rtld, main, subsdk0..9, sdk."""
-import argparse, os, re, shutil, subprocess, sys
+import argparse, os, re, shutil, struct, subprocess, sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -50,15 +50,22 @@ def main(argv=None):
         with open(img, 'r+b') as f: f.truncate(len(m.image) + m.bss)       # bss as a sparse zero tail: the host reads (file size - bss) bytes of image
         lines.append(f'{n} {img} {m.bss:x} {m.segments[1][0]:x} {m.segments[2][0]:x}')   # name, image, bss, then where the read-only and data segments start
         print(f'{n}: image {len(m.image):#x}, bss {m.bss:#x}, build id {m.build_id[:8].hex()}')
-    # main.npdm's first flags byte: bit 0 set = 64-bit instructions; clear = an AArch32 process (Mario Kart 8 Deluxe 1.0.0 is one)
+    # main.npdm's meta header: flags0 bit 0 set = 64-bit instructions (clear = an AArch32 process, as Mario Kart 8 Deluxe 1.0.0 is one), and SystemResourceSize
+    # at +0x14 (3.0.0+). The SDK reads the latter with GetInfo and only builds its virtual address memory manager when it is non-zero: Super Smash Bros. Ultimate
+    # declares 16 MB and needs it before it can reserve 62 GB of address space.
     npdm = exefs / 'main.npdm'
     d = npdm.read_bytes() if npdm.is_file() else b''
-    arch32 = len(d) > 0xC and d[:4] == b'META' and not d[0xC] & 1
+    is_meta = len(d) >= 0x80 and d[:4] == b'META'
+    arch32 = is_meta and not d[0xC] & 1
+    sysres = struct.unpack_from('<I', d, 0x14)[0] if is_meta else 0
+    if sysres > 0x1FE00000: sysres = 0          # the kernel's maximum; older NPDMs kept reserved bytes there
     if arch32: print('main.npdm: 32-bit process (AArch32)')
+    if sysres: print(f'main.npdm: SystemResourceSize {sysres:#x}')
     manifest = work / 'modules.txt'
     manifest.write_text('\n'.join(lines) + '\n')
     cmd = [a.exe, '--manifest', str(manifest)]
     if arch32: cmd += ['--arch32']
+    if sysres: cmd += ['--sys-resource', hex(sysres)]
     if (out / 'RomFS.img').is_file(): cmd += ['--romfs', str(out / 'RomFS.img')]
     if a.entry: cmd += ['--entry', a.entry]
     if a.shaders: cmd += ['--shaders', a.shaders]

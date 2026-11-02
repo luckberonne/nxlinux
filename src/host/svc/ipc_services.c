@@ -484,6 +484,40 @@ static uint32_t pl(int session, const ipc_in_t *in, ipc_out_t *out) {
     }
 }
 
+// ---- ldr:ro: nn::ro's IRoInterface, which a title uses to let the loader map NRO modules by hand and to register NRR module info.
+// A retail title runs the code in its ExeFS, so the ranges are only recorded: RegisterModuleInfo/UnregisterModuleInfo succeed, and a
+// MapManualLoadModuleMemory is reported (nn::ro is initialised before the title asks anything of it).
+// MapManualLoadModuleMemory(pid placeholder, nro address, nro size, bss address, bss size) -> the address the module is mapped at: the NRO is already in the title's memory (it read the file
+// there), and the one process is the host's own, so it stays where it is and the address comes back unchanged. The Jit's translations of that range are dropped here and on unmap: a
+// title that loads the same fighter again (a second battle) puts different code at addresses that held an earlier module.
+static struct { uint64_t addr, size; } g_nro_map[128]; static int g_nro_n;
+static uint32_t ldr_ro(int session, const ipc_in_t *in, ipc_out_t *out) {
+    (void)session;
+    unsigned o = in->nargs >= 10 ? 2 : 0;                    // SDK 3+ sends a process id placeholder first
+    #define ARG64(i) ((uint64_t)in->args[o + 2 * (i)] | ((uint64_t)in->args[o + 2 * (i) + 1] << 32))
+    switch (in->cmd) {
+    case 0: {
+        uint64_t nro = ARG64(0), nsz = ARG64(1), bss = ARG64(2), bsz = ARG64(3);
+        extern void cpu_invalidate(cpu_t *, uint64_t, uint64_t);
+        if (in->nargs < o + 8 || !nro || !nsz) return 0xCC01u;      // ro ResultInvalidAddress-like: a malformed request
+        cpu_invalidate(NULL, nro, nsz); if (bsz) cpu_invalidate(NULL, bss, bsz);
+        if (g_nro_n < 128) { g_nro_map[g_nro_n].addr = nro; g_nro_map[g_nro_n++].size = nsz; }
+        static unsigned seen; if (seen++ < 6) fprintf(stderr, "[dm] ldr:ro: NRO mapped at %#llx (%#llx bytes, bss %#llx + %#llx)\n", (unsigned long long)nro, (unsigned long long)nsz, (unsigned long long)bss, (unsigned long long)bsz);
+        OUT64(nro); return 0;
+    }
+    case 1: {                                                // UnmapManualLoadModuleMemory(pid placeholder, nro address)
+        uint64_t nro = ARG64(0);
+        extern void cpu_invalidate(cpu_t *, uint64_t, uint64_t);
+        for (int i = 0; i < g_nro_n; i++) if (g_nro_map[i].addr == nro) { cpu_invalidate(NULL, nro, g_nro_map[i].size); g_nro_map[i] = g_nro_map[--g_nro_n]; break; }
+        return 0;
+    }
+    case 2: case 3: case 10: return 0;      // RegisterModuleInfo / UnregisterModuleInfo / RegisterModuleInfoWithUserProcessHandle
+    case 4: return 0;                       // RegisterProcessHandle: the process is this one (the host has a single process)
+    default: return unimpl("ldr:ro", in);
+    }
+    #undef ARG64
+}
+
 __attribute__((constructor)) static void register_services(void) {
     (void)ok_all;
     ipc_register_service("lm", lm);
@@ -498,4 +532,5 @@ __attribute__((constructor)) static void register_services(void) {
     ipc_register_service("prepo:a", prepo); ipc_register_service("prepo:u", prepo); ipc_register_service("prepo:m", prepo); ipc_register_service("prepo:s", prepo);
     ipc_register_service("mii:u", mii_static); ipc_register_service("mii:e", mii_static);
     ipc_register_service("nvdrv", nvdrv); ipc_register_service("nvdrv:a", nvdrv); ipc_register_service("nvdrv:s", nvdrv);
+    ipc_register_service("ldr:ro", ldr_ro); ipc_register_service("ro:1", ldr_ro);
 }
