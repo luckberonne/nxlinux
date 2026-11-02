@@ -867,16 +867,76 @@ void nvn_vk_clear_color(uint64_t serial, const view_t *v, int has_view, int mask
     mark_gpu(e, level, layer0, n);
 }
 
+// A stencil clear with a write mask (a title clears the low bits of the stencil every frame to reset its clipping): the clear value goes through a draw, since a Vulkan clear takes no mask. One
+// full-screen triangle with the stencil operation REPLACE, the value as the reference and the mask as the write mask, no colour and no depth written. The vertex shader (glslc, 450) is:
+//   void main() { vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2)); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }
+static const uint32_t k_fs_vert[] = {
+    0x07230203, 0x00010000, 0x000d000b, 0x0000002c, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0007000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000c, 0x0000001d, 0x00040047,
+    0x0000000c, 0x0000000b, 0x0000002a, 0x00030047, 0x0000001b, 0x00000002, 0x00050048, 0x0000001b,
+    0x00000000, 0x0000000b, 0x00000000, 0x00050048, 0x0000001b, 0x00000001, 0x0000000b, 0x00000001,
+    0x00050048, 0x0000001b, 0x00000002, 0x0000000b, 0x00000003, 0x00050048, 0x0000001b, 0x00000003,
+    0x0000000b, 0x00000004, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+    0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040015, 0x0000000a,
+    0x00000020, 0x00000001, 0x00040020, 0x0000000b, 0x00000001, 0x0000000a, 0x0004003b, 0x0000000b,
+    0x0000000c, 0x00000001, 0x0004002b, 0x0000000a, 0x0000000e, 0x00000001, 0x0004002b, 0x0000000a,
+    0x00000010, 0x00000002, 0x00040017, 0x00000017, 0x00000006, 0x00000004, 0x00040015, 0x00000018,
+    0x00000020, 0x00000000, 0x0004002b, 0x00000018, 0x00000019, 0x00000001, 0x0004001c, 0x0000001a,
+    0x00000006, 0x00000019, 0x0006001e, 0x0000001b, 0x00000017, 0x00000006, 0x0000001a, 0x0000001a,
+    0x00040020, 0x0000001c, 0x00000003, 0x0000001b, 0x0004003b, 0x0000001c, 0x0000001d, 0x00000003,
+    0x0004002b, 0x0000000a, 0x0000001e, 0x00000000, 0x0004002b, 0x00000006, 0x00000020, 0x40000000,
+    0x0004002b, 0x00000006, 0x00000022, 0x3f800000, 0x0004002b, 0x00000006, 0x00000025, 0x00000000,
+    0x00040020, 0x00000029, 0x00000003, 0x00000017, 0x0005002c, 0x00000007, 0x0000002b, 0x00000022,
+    0x00000022, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+    0x0004003d, 0x0000000a, 0x0000000d, 0x0000000c, 0x000500c4, 0x0000000a, 0x0000000f, 0x0000000d,
+    0x0000000e, 0x000500c7, 0x0000000a, 0x00000011, 0x0000000f, 0x00000010, 0x0004006f, 0x00000006,
+    0x00000012, 0x00000011, 0x000500c7, 0x0000000a, 0x00000014, 0x0000000d, 0x00000010, 0x0004006f,
+    0x00000006, 0x00000015, 0x00000014, 0x00050050, 0x00000007, 0x00000016, 0x00000012, 0x00000015,
+    0x0005008e, 0x00000007, 0x00000021, 0x00000016, 0x00000020, 0x00050083, 0x00000007, 0x00000024,
+    0x00000021, 0x0000002b, 0x00050051, 0x00000006, 0x00000026, 0x00000024, 0x00000000, 0x00050051,
+    0x00000006, 0x00000027, 0x00000024, 0x00000001, 0x00070050, 0x00000017, 0x00000028, 0x00000026,
+    0x00000027, 0x00000025, 0x00000022, 0x00050041, 0x00000029, 0x0000002a, 0x0000001d, 0x0000001e,
+    0x0003003e, 0x0000002a, 0x00000028, 0x000100fd, 0x00010038};
+static struct { VkFormat fmt; VkPipeline pipe; } g_scp[8]; static int g_nscp; static VkPipelineLayout g_scl;
+static VkPipeline stencil_clear_pipeline(vkctx_t *c, VkFormat fmt, int has_depth) {
+    for (int i = 0; i < g_nscp; i++) if (g_scp[i].fmt == fmt) return g_scp[i].pipe;
+    if (g_nscp == 8) return VK_NULL_HANDLE;
+    if (!g_scl) { VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; if (vkCreatePipelineLayout(c->dev, &li, NULL, &g_scl)) return VK_NULL_HANDLE; }
+    VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof k_fs_vert, .pCode = k_fs_vert}; VkShaderModule m;
+    if (vkCreateShaderModule(c->dev, &mi, NULL, &m)) return VK_NULL_HANDLE;
+    VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = m, .pName = "main"};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkStencilOpState so = {.failOp = VK_STENCIL_OP_REPLACE, .passOp = VK_STENCIL_OP_REPLACE, .depthFailOp = VK_STENCIL_OP_REPLACE, .compareOp = VK_COMPARE_OP_ALWAYS, .compareMask = 0xFF};
+    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_FALSE, .depthWriteEnable = VK_FALSE, .stencilTestEnable = VK_TRUE, .front = so, .back = so};
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 4, .pDynamicStates = dyn};
+    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .depthAttachmentFormat = has_depth ? fmt : VK_FORMAT_UNDEFINED, .stencilAttachmentFormat = fmt};
+    VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, .stageCount = 1, .pStages = &st, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp,
+        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy, .layout = g_scl};
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(c->dev, VK_NULL_HANDLE, 1, &gi, NULL, &pipe)) pipe = VK_NULL_HANDLE;
+    vkDestroyShaderModule(c->dev, m, NULL);
+    if (pipe) { g_scp[g_nscp].fmt = fmt; g_scp[g_nscp++].pipe = pipe; }
+    return pipe;
+}
+
 void nvn_vk_clear_ds(uint64_t serial, const view_t *v, int has_view, float depth, int depth_mask, int stencil, int stencil_mask, const int *rect) {
     static int partial, bad;
     vkctx_t *c = nvn_vk_ctx(); VkCommandBuffer cb = nvn_vk_cmd();
     if (!c || !cb) return;
     vktex_t *e = find(serial);
     if (!use(e, c, cb)) return;
-    unsigned sm = (unsigned)stencil_mask & 0xFF;
-    if (sm && sm != 0xFF) { red_once(&partial, "a stencil clear with a partial mask needs the draw path (not executed yet)", e->d.format); sm = 0; }
+    unsigned sm = (unsigned)stencil_mask & 0xFF, masked = 0;
+    if (sm && sm != 0xFF) { masked = sm; static unsigned nlog; if (nlog < 12 && getenv("NX_CLEAR_LOG")) { nlog++; fprintf(stderr, "[dm] [nvn] partial stencil clear: value %#x mask %#x depth %g depth_mask %d on serial %llu\n", (unsigned)stencil, sm, depth, depth_mask, (unsigned long long)serial); }
+        sm = 0; }
     int do_d = depth_mask && (e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT), do_s = sm && (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
-    if (!do_d && !do_s) return;
+    if (!do_d && !do_s && !(masked && (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT))) return;
     unsigned level, layer0, n; VkFormat fmt; VkRect2D area;
     if (!clear_target(e, v, has_view, rect, &level, &layer0, &n, &fmt, &area) || !(e->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) { red_once(&bad, "the clear target is a 3D texture, a missing level or layer, or not a depth-stencil format", e->d.format); return; }
     if (!n) return;
@@ -888,8 +948,23 @@ void nvn_vk_clear_ds(uint64_t serial, const view_t *v, int has_view, float depth
     VkRenderingAttachmentInfo sa = da; sa.loadOp = do_s ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = area, .layerCount = n,
         .pDepthAttachment = (e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? &da : NULL, .pStencilAttachment = (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? &sa : NULL};
-    vkCmdBeginRendering(cb, &ri); vkCmdEndRendering(cb);
-    nvn_vk_barrier_all(cb);
+    if (do_d || do_s) { vkCmdBeginRendering(cb, &ri); vkCmdEndRendering(cb); nvn_vk_barrier_all(cb); }
+    if (masked && (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) {                    // the partial-mask stencil clear, through a draw into the same view
+        VkPipeline pp = stencil_clear_pipeline(c, e->fmt, (e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0);
+        if (pp) {
+            VkRenderingAttachmentInfo la = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = iv, .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+            VkRenderingInfo ri2 = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = area, .layerCount = 1,
+                .pDepthAttachment = (e->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? &la : NULL, .pStencilAttachment = &la};
+            vkCmdBeginRendering(cb, &ri2);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp);
+            VkViewport vpt = {(float)area.offset.x, (float)area.offset.y, (float)area.extent.width, (float)area.extent.height, 0.0f, 1.0f};
+            vkCmdSetViewport(cb, 0, 1, &vpt); vkCmdSetScissor(cb, 0, 1, &area);
+            vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, masked); vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, (uint32_t)stencil & 0xFF);
+            vkCmdDraw(cb, 3, 1, 0, 0);
+            vkCmdEndRendering(cb);
+            nvn_vk_barrier_all(cb);
+        } else red_once(&partial, "a stencil clear with a partial mask: no pipeline for the format", e->d.format);
+    }
     mark_gpu(e, level, layer0, n);
 }
 

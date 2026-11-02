@@ -41,6 +41,7 @@ Shaders: `NX_SHADER_DUMP=work/run/ssbu/shd` on a run, then `python3 -I tools/sha
 | 5 minutes to the title, the audio thread taking a core | the device released every buffer at once, so the game's audio thread (its reverb, in guest code) mixed flat out, which was half of all the guest time on the three cores the title has | `ipc_audout.c`: Append makes a caller that is more than 60 ms ahead of the 48 kHz playback wait (core released). The cinematic now starts about 10 s in instead of 3 minutes |
 | abort `GetService "hwopus"` (about 18 s in, once the game wants its music) | no Opus decoder service | `ipc_hwopus.c`: libopus behind IHardwareOpusDecoderManager (single and multistream; DecodeInterleaved with the 8-byte big-endian packet header); CMake links `libopus` when it is there |
 | abort `GetService "nfp:user"` when the main menu opens | no amiibo service | `ipc_nfp.c`: initialised, no device, no tag |
+| the menus came out without their panels and texts (only the background and a few pictures) | the game clears the low two stencil bits to 0 every frame (`ClearDepthStencil` with a stencil mask of 3) to reset its clipping, and a Vulkan clear takes no write mask, so the host skipped it and the stale bits clipped the panels away | `nvn_tex_vk.c`: the masked stencil clear is drawn (a full-screen triangle, stencil op REPLACE, the mask as write mask; the vertex shader is embedded as SPIR-V); `NX_CLEAR_LOG=1` lists them |
 
 ## State
 
