@@ -12,8 +12,8 @@ int dm_opmode(void) {
     return m;
 }
 // ---------- System notification queue (AppletMessage): front end state changes → fetched by the game every frame with TryPopNotificationMessage ----------
-// Message numbers the host sends: 15 focus change, 30 operation mode change, 31 performance mode change
-enum { MSG_FOCUS = 15, MSG_OPMODE = 30, MSG_PERFMODE = 31 };
+// Message numbers the host sends: 15 focus change, 16 resume (after a library applet the host stood in for), 30 operation mode change, 31 performance mode change
+enum { MSG_FOCUS = 15, MSG_RESUME = 16, MSG_OPMODE = 30, MSG_PERFMODE = 31 };
 #define MQ 32
 static pthread_mutex_t g_mq_lock = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_mq_cond = PTHREAD_COND_INITIALIZER;   // cond: wakes the blocking PopNotificationMessage
 static uint32_t g_mq[MQ]; static int g_mqh, g_mqn;
@@ -219,7 +219,12 @@ HLE_FORCE("_ZN2nn2oe27GetNotificationMessageEventEv", "notification event: the h
     return g_mq_ev;
 }
 // bool arguments: Switch callers do not extend them, declared as unsigned and only the low 8 bits are looked at
-HLE_FORCE("_ZN2nn2oe28SetResumeNotificationEnabledEb", "resume notification switch; the host expresses resume as focus notification 15", void, h_oe_SetResumeNtf, unsigned on) { (void)on; }
+static _Atomic int g_ntf_resume;
+HLE_FORCE("_ZN2nn2oe28SetResumeNotificationEnabledEb", "resume notification switch; the host sends Resume (16) after a library applet the host stood in for, and expresses other resumes as focus notification 15", void, h_oe_SetResumeNtf, unsigned on) { g_ntf_resume = on & 0xff; }
+// A library applet the host answers at once (svc/hle_hid.c, the controller applet): on the console the application is suspended while the applet runs and gets Resume (16) when it
+// returns, if it asked for resume notifications, and a focus notification otherwise. MK8D stops its own scene before it starts the controller applet and starts it again only on one
+// of these (main+0x8da0bc for 16, main+0x8da080 for 15 with InFocus): without one, the two-player character select stood still forever.
+void dm_applet_returned(void) { if (atomic_load(&g_ntf_resume)) mq_push(MSG_RESUME); else if (focus_notifies()) mq_push(MSG_FOCUS); }
 HLE_FORCE("_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb", "operation mode change notification switch", void, h_oe_SetOpModeNtf, unsigned on) { g_ntf_opmode = on & 0xff; }
 HLE_FORCE("_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb", "performance mode change notification switch", void, h_oe_SetPerfModeNtf, unsigned on) { g_ntf_perfmode = on & 0xff; }
 

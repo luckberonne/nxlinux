@@ -305,7 +305,7 @@ static uint32_t nvdrv(int session, const ipc_in_t *in, ipc_out_t *out) {
     }
 }
 
-// ---- hid: input. The SDK's hid library reads a shared memory block of ring buffers; the host hands out a zeroed one, so every device reads as absent and every state list as empty.
+// ---- hid: input. The SDK's hid library reads a shared memory block of ring buffers, which hid_input.c fills from the SDL window's keyboard and gamepads. The controller applet is svc/hle_hid.c.
 // Commands that configure or activate something are accepted; one not listed is reported once and accepted too, since input is optional and a refusal makes a title stop.
 static uint32_t hid_permissive(const char *what, const ipc_in_t *in) {
     static unsigned seen[64]; unsigned k = in->cmd & 63;
@@ -332,7 +332,10 @@ static uint32_t hid(int session, const ipc_in_t *in, ipc_out_t *out) {
     case 100: g_npad_styles = (uint32_t)in->args[0]; return 0;       // SetSupportedNpadStyleSet(style set, aruid)
     case 101: OUT32(g_npad_styles); return 0;                      // GetSupportedNpadStyleSet → what the title set
     case 102: case 103: case 104: return 0;                        // SetSupportedNpadIdType / ActivateNpad / DeactivateNpad
-    case 106: out->copy[out->ncopy++] = kernel_event_new(0); return 0;   // AcquireNpadStyleSetUpdateEventHandle → event
+    case 106: {                                                    // AcquireNpadStyleSetUpdateEventHandle(npad id, aruid, ...) → event, signaled by hid_input.c when that player connects or disconnects
+        uint32_t h = kernel_event_new(0), id = in->nargs ? in->args[0] : ~0u;
+        if (id < 8) hid_set_style_event((int)id, h);              // ids 0..7 are players 1..8; handheld (0x20) and other (0x10) never change here
+        out->copy[out->ncopy++] = h; return 0; }
     case 108: OUT64(0); return 0;                                  // GetPlayerLedPattern
     case 121: OUT64(0); return 0;                                  // GetNpadJoyHoldType
     case 11: case 66: case 67: case 120: case 122: case 123: case 124: case 125: case 126: case 127: case 128: return 0;   // touch screen, six-axis sensor, joy hold type, joy assignment, handheld mode: nothing to configure
