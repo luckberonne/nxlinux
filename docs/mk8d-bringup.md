@@ -202,6 +202,23 @@ Measured with the host's own sampling profiler (`NX_PROF`, `tools/prof_report.py
 No gain, and left as they were: inline exclusive accesses (`fastmem_exclusive_access`), fewer Jits in the pool (`NX_JITS` 3 and 4 against 8). The guest's own code is about 39 % of the CPU and is spread over the whole of `main` (no block above 0.7 %); the one
 hot spot, 6 % of the guest, is the SDK's mutex code (`TryLock` failing in a polling loop, `sdk+0x96f80`).
 
+## Two-player race, 2026-11-01 (Radeon 660M, window path)
+
+Measured as the CPU the process used over 45 s of a two-player Grand Prix, driven to it by a script through `NX_HID_PIPE` (the frames read back with `NX_SDL_READBACK` under `SDL_VIDEO_DRIVER=offscreen`):
+
+| Build | CPU | Frame rate |
+|---|---|---|
+| Before (9da6bc1) | 2.11 cores | 25.9 fps |
+| Kernel lock, Jit pool and present changes (1c93d25, 2caea35), exact JIT | 1.92 cores | 39.0 fps |
+| Plus yuzu's default JIT accuracy and the rest of 68dc44d | 1.49 cores | 60 fps (the cap) |
+
+What the profiler (`NX_PROF`) showed and what was done:
+- A quarter of the CPU was the kernel lock `G`: every SVC took it to ask whether to give the core up, whenever any thread anywhere waited for any core, and walked the thread list. Now the best waiting priority of each core is an atomic the SVC reads without the lock.
+- The Jit pool's mutex was taken twice per SVC (6 %); a thread now takes its last Jit back with a compare-exchange. The 32 vector registers were reloaded at each run because every HLE call writes v0; now only the changed ones are.
+- Exclusive stores went through the callbacks, where dynarmic always takes the global monitor's spinlock (3.5 %). With `Unsafe_IgnoreGlobalMonitor` and inline exclusives (what yuzu's "Auto" accuracy does, with `Unsafe_UnfuseFMA` and `Unsafe_InaccurateNaN`) they are a plain compare-exchange. `NX_JIT_ACCURATE=1` brings the exact behaviour back.
+- The presented frame was copied twice under the lock the game's present takes; three buffers whose roles swap under the lock now hold it.
+- Not done: the replay of the command buffers (about 12 % of the CPU, `prepare` and `nvn_vk_desc_sampled` the largest parts) runs on the game's render thread; the frame time still has spikes of 30-70 ms with no pipeline or texture work in them.
+
 ## Debugging aids
 
 All are environment variables; nothing costs anything when unset.
@@ -229,6 +246,7 @@ All are environment variables; nothing costs anything when unset.
 | `NX_HID_SCRIPT="<s>:<bit>[:<ms>],..."` | press buttons at given seconds after the hid block is mapped (each logged); e.g. `50:0,65:15` = A at 50 s, down at 65 s |
 | `NX_HID_PIPE=<fifo>` | each line `<bit>[+<bit>...][:<ms>]` written to that FIFO (make it with `mkfifo`) presses those buttons for player 1 for 200 ms (or `<ms>`): a script can wait for a screen in the `NX_FRAME_DUMP` frames and only then press (the menus take a varying time to accept input, so fixed times as in `NX_HID_SCRIPT` miss) |
 | `NX_HID_FAKE_PLAYERS=<n>` | players 2..n are connected pads that repeat player 1's buttons (and its scripted, tapped and piped presses), to try multiplayer without the pads |
+| `NX_JIT_ACCURATE=1` | the JIT without yuzu's default inexact optimizations (fused FMA, canonical NaNs, exclusives through the global monitor), to tell a JIT inexactness from a bug |
 | `NX_FRAME_EVERY=<n>` | with `NX_FRAME_DUMP`: also every n-th frame |
 | `NX_MOVIE_LOG=1` | the movie decoder takeover's calls (`hle_movie.c`) |
 | `NX_HID_TAP=<bit>[:<s>[:<ms>]]` | press that `NpadButton` bit (0 = A) for 150 ms (or `<ms>`) every `<s>` seconds (default 4), for runs nobody sits at; `0:4:3500` goes through every menu into a Grand Prix and keeps accelerating in the race |
