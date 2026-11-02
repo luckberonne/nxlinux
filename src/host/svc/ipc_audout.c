@@ -49,11 +49,17 @@ static uint32_t audout_session(int session, const ipc_in_t *in, ipc_out_t *out) 
         out->copy[out->ncopy++] = s->event; return 0;
     case 5: case 8: {                                             // GetReleasedAudioOutBuffers(Auto): everything appended is already released
         unsigned n = (unsigned)s->count;
-        if (in->nrecv) {                                          // the identifiers land in the output buffer
-            uint64_t *b = (uint64_t *)(uintptr_t)in->recv[0].addr;
-            unsigned room = (unsigned)(in->recv[0].size / 8); if (n > room) n = room;
-            for (unsigned i = 0; i < n; i++) b[i] = s->id[(s->head + i) % AU_QUEUE];
+        uint64_t oaddr = in->nrecv ? in->recv[0].addr : 0; unsigned osize = in->nrecv ? in->recv[0].size : 0;
+        if (in->cmd == 8 && !osize && in->nrecv >= 2 && !in->recv[1].size && in->nargs >= 3) {
+            // The Auto form with its output as a pointer entry: the SDK's message has one data word more than the receive-list rule counts, so both entries read as empty;
+            // the entry is {address low = the last argument word, size << 16 | address bits 32-47 = the word the list parse took for an address} (Super Smash Bros. Ultimate asks for one buffer a time)
+            oaddr = (uint64_t)in->args[2] | ((uint64_t)(in->recv[1].addr & 0xffff) << 32); osize = (unsigned)(in->recv[1].addr >> 16);
         }
+        if (osize) {                                              // the identifiers land in the output buffer
+            uint64_t *b = (uint64_t *)(uintptr_t)oaddr;
+            unsigned room = osize / 8; if (n > room) n = room;
+            for (unsigned i = 0; i < n; i++) b[i] = s->id[(s->head + i) % AU_QUEUE];
+        } else if (in->nrecv) n = 0;
         OUT32(n);
         s->head = (s->head + (int)n) % AU_QUEUE; s->count -= (int)n;
         return 0;

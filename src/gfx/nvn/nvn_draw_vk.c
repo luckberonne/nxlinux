@@ -50,6 +50,7 @@ static struct {
     int init;
     const prog_t *prog; int nkeys; uint8_t keys[6][8];
     const prog_t *cprog;                        // the compute program (bound apart from the graphics one)
+    const prog_t *vprog, *fprog;                // the programs bound for the vertex and the fragment stage: a title may bind a separable program to each (Super Smash Bros. Ultimate does)
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
     uint32_t attr[16]; int nattr; vs_st stream[16]; int nstream; NVNbufferRange vbuf[16];
     p_bind_buf ubo[6][16], ssbo[6][16];
@@ -86,6 +87,10 @@ int nvn_draw_state_op(uint32_t op, const void *a) {
     case OP_BIND_PROGRAM: {
         const p_bind_program *b = a;
         if (b->stages & 0x1f) { S.prog = b->prog; S.nkeys = b->prog ? nvn_prog_keys(b->prog, S.keys) : 0; }
+        { static int lg = -1; static unsigned n; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL; if (lg && n < 60) { n++; fprintf(stderr, "[dm] [nvn] BindProgram %p stages %#x (%d stage(s) in it)\n", (const void *)b->prog, (unsigned)b->stages, b->prog ? (int)b->prog->nstage : -1); } }
+        if (b->stages & 0x01) S.vprog = b->prog;
+        if (b->stages & 0x02) S.fprog = b->prog;                                       // NVNshaderStage: vertex 0, fragment 1, geometry 2, tessellation control 3, evaluation 4, compute 5; the bits are 1 << stage
+        if ((b->stages & 0x03) == 0x03) S.vprog = S.fprog = b->prog;
         if (b->stages & 0x20) S.cprog = b->prog;
         return 1; }
     case OP_BIND_STATE: {
@@ -355,6 +360,18 @@ static VkBuffer zero_storage(vkctx_t *c) {                        // what an unb
     if (!made) { made = 1; if (!vkbuf_create(c, &z, 65536, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 1)) memset(z.map, 0, 65536); }
     return z.buf;
 }
+// The shader of one stage of a program in the library, by the program's key for it and then by its code
+static const nvn_shader *find_stage(const prog_t *p, int want) {
+    if (!p) return NULL;
+    uint8_t keys[6][8]; int nk = nvn_prog_keys(p, keys);
+    for (int i = 0; i < nk; i++) { const nvn_shader *s = nvn_shader_find(keys[i]); if (s && nvn_shader_stage(s) == want) return s; }
+    for (unsigned i = 0; i < p->nstage && i < 6; i++) {
+        uint8_t ak[8]; const nvn_shader *s = prog_alt_key(p, i, ak) ? nvn_shader_find(ak) : NULL;
+        if (s && nvn_shader_stage(s) == want) { uint8_t pk[8]; if (prog_key(p, i, pk)) nvn_shader_alias(pk, s); return s; }
+    }
+    return NULL;
+}
+
 static void skip(const char *why, int *flag) {
     unsigned k = atomic_fetch_add(&g_nskip, 1);
     { static int lg = -1; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;   // NX_SKIP_LOG=1: every skipped draw with its reason, 1 in 64 after the first 400
@@ -394,7 +411,9 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     if (!c->has_push_descriptor) { skip("the device lacks VK_KHR_push_descriptor", &f_off); return 0; }
     if (!S.prog || !S.nkeys) { skip("no program is bound", &f_noprog); return 0; }
     const nvn_shader *vs = NULL, *fs = NULL; int focus = 0;
-    for (int i = 0; i < S.nkeys; i++) {
+    int split = S.vprog && S.fprog && S.vprog != S.fprog;        // a separable program for each stage: each one's shader of its own stage
+    if (split) { vs = find_stage(S.vprog, NVN_STAGE_VERTEX); fs = find_stage(S.fprog, NVN_STAGE_FRAGMENT); }
+    for (int i = 0; !split && i < S.nkeys; i++) {
         const nvn_shader *s = nvn_shader_find(S.keys[i]);
         if (!s) {
             static int lg = -1; static uint64_t seen[256]; static unsigned nseen; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;
@@ -407,7 +426,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
         if (st == NVN_STAGE_VERTEX) vs = s; else if (st == NVN_STAGE_FRAGMENT) fs = s;
         else { skip("geometry, tessellation and compute stages are not supported in a draw yet", &f_noshader); return 0; }
     }
-    if (!vs || !fs) {                       // the normal key hashes bytes that change from run to run: look the stages up by their code (cached per program: it hashes the code area)
+    if (!split && (!vs || !fs)) {           // the normal key hashes bytes that change from run to run: look the stages up by their code (cached per program: it hashes the code area)
         static _Thread_local struct { uint64_t serial; unsigned st; const nvn_shader *s; int valid; } cache[1024];
         for (unsigned i = 0; i < S.prog->nstage && i < 6; i++) {
             typeof(cache[0]) *ce = &cache[(S.prog->serial * 6 + i) & 1023];
@@ -424,7 +443,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     if (!vs || !fs) {
         static int lg = -1; static unsigned nlog; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;
         if (lg && nlog++ < 1600 && nlog % 16 == 1) {                                     // NX_SKIP_LOG: the state of each stage of the program (the keys found, and what a stage without one holds)
-            fprintf(stderr, "[dm] [nvn] no vs/fs pair: %d stage(s), %d key(s)", S.prog->nstage, S.nkeys);
+            fprintf(stderr, "[dm] [nvn] no vs/fs pair: %d stage(s), %d key(s), vs %p fs %p", S.prog->nstage, S.nkeys, (const void *)vs, (const void *)fs);
             for (unsigned i = 0; i < S.prog->nstage && i < 6; i++) { const NVNshaderData *d = &S.prog->sd[i]; uint32_t nc = 0, c0 = 0, c30 = 0, mg = 0;
                 if (d->control) { memcpy(&nc, (const uint8_t *)d->control + 0x704, 4); memcpy(&mg, d->control, 4); }
                 void *mb; uint64_t mo; int mapped = d->data && nc && nc < (1u << 24) && mtl_addr(d->data, nc, &mb, &mo);
