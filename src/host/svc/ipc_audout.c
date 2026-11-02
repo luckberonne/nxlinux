@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define R_NOT_IMPL 0xF201u
 #define OUT32(v) (out->out[out->nout++] = (uint32_t)(v))
@@ -25,8 +26,12 @@ typedef struct {
     int started;
     float volume;
     uint64_t id[AU_QUEUE];   // the BufferClientPtr of each appended buffer, waiting to be reported as released
+    uint64_t clock_ns;       // when the audio appended so far has been played, at 48 kHz
     int head, count;
 } audout_t;
+
+static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+#define AU_LEAD_NS 60000000ull   // how far ahead of the playback a title may queue before Append makes it wait
 
 static void audout_fin(void *p) { free(p); }
 
@@ -42,6 +47,15 @@ static uint32_t audout_session(int session, const ipc_in_t *in, ipc_out_t *out) 
         if (s->count == AU_QUEUE) { s->head = (s->head + 1) % AU_QUEUE; s->count--; }
         s->id[(s->head + s->count) % AU_QUEUE] = id; s->count++;
         if (s->event) kernel_event_signal(s->event);
+        // The buffers are released at once, but the device plays them one after the other: the caller that is further ahead than AU_LEAD_NS waits, with its core free, until the playback has caught up.
+        // Released at once and not waiting, a title's audio thread mixes flat out and takes a core of the three the title has (Super Smash Bros. Ultimate's reverb was half of all the guest time).
+        uint64_t bytes = in->nsend && in->send[0].size >= 0x20 ? ((const uint64_t *)(uintptr_t)in->send[0].addr)[3] : 3840;   // AudioOutBuffer: next, samples, capacity, data size (+0x18), data offset
+        uint64_t now = now_ns(); if (s->clock_ns < now) s->clock_ns = now;
+        s->clock_ns += (bytes / (AU_CHANNELS * 2) + 1) * 1000000000ull / AU_RATE;
+        if (s->clock_ns > now + AU_LEAD_NS) {
+            uint64_t ns = s->clock_ns - now - AU_LEAD_NS; struct timespec ts = { (time_t)(ns / 1000000000ull), (long)(ns % 1000000000ull) };
+            kernel_core_release(); nanosleep(&ts, NULL); kernel_core_acquire();
+        }
         return 0;
     }
     case 4:                                                       // RegisterBufferEvent → the event a released buffer signals
