@@ -71,7 +71,7 @@ struct cpu {
     uint64_t bad_addr = 0;                    // the address of the access that stopped this thread
     std::atomic<jitenv *> running{nullptr};   // the Jit this cpu is on right now, null while outside Run()
     jitenv *last = nullptr;                   // the Jit it ran on before: taken again without the pool's lock when free (see acquire)
-    bool v_dirty = true;                      // its vector registers changed outside the Jit (cpu_set_v, cpu_call64's restore): they must be loaded again
+    uint32_t v_dirty = ~0u;                   // which vector registers changed outside the Jit (bit i: v<i>; cpu_set_v, cpu_call64's restore): those must be loaded again
     jitenv *vec_in = nullptr;                 // the Jit its vectors were last loaded into
 };
 
@@ -197,9 +197,14 @@ static std::unique_ptr<jitenv> make_env(unsigned id) {
     cfg.callbacks = e.get();
     if (!getenv("NX_SLOWMEM")) cfg.fastmem_pointer = 0;     // guest address == host address (NX_SLOWMEM=1: no fast memory, every access goes through the callbacks)
     if (getenv("NX_JIT_NOOPT")) cfg.optimizations = no_optimizations;        // NX_JIT_NOOPT=1: dynarmic's IR and dispatch optimizations off, to tell a translation bug from the title's own
+    else if (!getenv("NX_JIT_ACCURATE")) {   // the inexact optimizations yuzu turns on in its default ("Auto") CPU accuracy, under which MK8D and the rest of its library run: FMA as multiply then add,
+        cfg.unsafe_optimizations = true;     // NaNs not made canonical after every floating-point operation, exclusive stores without the global monitor's bookkeeping. NX_JIT_ACCURATE=1: exact
+        cfg.optimizations |= OptimizationFlag::Unsafe_UnfuseFMA | OptimizationFlag::Unsafe_InaccurateNaN | OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
+        cfg.fastmem_exclusive_access = true;     // the global monitor is ignored only by the inline exclusives; through the callbacks every exclusive store still took the monitor's spinlock and
+    }                                            // CheckAndClear (3.5 % of a 2P race). Measured inline before only with the monitor kept, where it was no faster (below)
     cfg.fastmem_address_space_bits = 48;
     cfg.silently_mirror_fastmem = false;
-    cfg.fastmem_exclusive_access = false;       // exclusives go through MemoryWriteExclusive* (compare-exchange). Inline ones (true) were measured in the race: no faster (19.7-20.5 ms against 18.7-20.6), and dynarmic warns that they do not reproduce ABA
+    if (!cfg.unsafe_optimizations) cfg.fastmem_exclusive_access = false;       // exact mode: exclusives go through MemoryWriteExclusive* (compare-exchange). Inline ones (true) were measured in the race: no faster (19.7-20.5 ms against 18.7-20.6), and dynarmic warns that they do not reproduce ABA
     cfg.tpidr_el0 = &e->tpidr;
     cfg.tpidrro_el0 = &e->tpidrro;
     cfg.wall_clock_cntpct = true;
@@ -286,7 +291,7 @@ uint64_t cpu_call64(cpu_t *cp, uint64_t fn, const uint64_t *args, int nargs) {
     cpu_run(cp);
     c->nested--;
     uint64_t ret = c->s.x[0];
-    c->s = saved; c->halt_req = halt; c->v_dirty = true;
+    c->s = saved; c->halt_req = halt; c->v_dirty = ~0u;
     return ret;
 }
 uint32_t cpu_call32(cpu_t *c, uint32_t fn, const uint32_t *args, int nargs) { return g_a32 ? cpu32_call(c, fn, args, nargs) : 0; }
@@ -310,8 +315,10 @@ static void load(jitenv *e, const ctx &s, cpu *c) {
     memcpy(x.data(), s.x, sizeof s.x);
     j.SetRegisters(x);
     j.SetSP(s.sp); j.SetPC(s.pc);
-    if (e->loaded != c || c->vec_in != e || c->v_dirty) for (int i = 0; i < 32; i++) j.SetVector(i, s.v[i]);      // the Jit still holds this cpu's vectors when it ran here last and nothing changed them
-    e->loaded = c; c->vec_in = e; c->v_dirty = false;
+    // The Jit still holds this cpu's vectors when it ran here last: only those changed since are loaded (every HLE call writes v0, and reloading all 32 was 4 % of a 2P race)
+    uint32_t m = e->loaded != c || c->vec_in != e ? ~0u : c->v_dirty;
+    for (int i = 0; m && i < 32; i++, m >>= 1) if (m & 1) j.SetVector(i, s.v[i]);
+    e->loaded = c; c->vec_in = e; c->v_dirty = 0;
     j.SetFpcr(s.fpcr); j.SetFpsr(s.fpsr); j.SetPstate(s.pstate);
     e->tpidr = s.tpidr; e->tpidrro = s.tpidrro;
 }
@@ -412,7 +419,7 @@ uint64_t cpu_get_sp(cpu_t *c) { if (g_a32) return cpu32_get_sp(c); return C(c)->
 void cpu_set_sp(cpu_t *c, uint64_t v) { if (g_a32) return cpu32_set_sp(c, v); C(c)->s.sp = v; }
 void cpu_set_tls(cpu_t *c, uint64_t a, uint64_t b) { if (g_a32) return cpu32_set_tls(c, a, b); C(c)->s.tpidr = a; C(c)->s.tpidrro = b; }
 void cpu_get_v(cpu_t *c, int i, uint64_t out[2]) { if (g_a32) return cpu32_get_v(c, i, out); out[0] = C(c)->s.v[i][0]; out[1] = C(c)->s.v[i][1]; }
-void cpu_set_v(cpu_t *c, int i, const uint64_t in[2]) { if (g_a32) return cpu32_set_v(c, i, in); C(c)->s.v[i] = {in[0], in[1]}; C(c)->v_dirty = true; }
+void cpu_set_v(cpu_t *c, int i, const uint64_t in[2]) { if (g_a32) return cpu32_set_v(c, i, in); C(c)->s.v[i] = {in[0], in[1]}; C(c)->v_dirty |= 1u << (i & 31); }
 void cpu_invalidate(cpu_t *c, uint64_t addr, uint64_t len) {
     if (g_a32) return cpu32_invalidate(c, addr, len);
     std::lock_guard<std::mutex> lk(g_mu);

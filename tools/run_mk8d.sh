@@ -11,5 +11,10 @@ export VK_LOADER_LAYERS_DISABLE=${VK_LOADER_LAYERS_DISABLE-VK_LAYER_KHRONOS_vali
 # On a laptop with an AMD iGPU and an NVIDIA dGPU (the RTX 2050 here) the iGPU is the faster one for this: the race takes 16 ms a frame on the Radeon 660M against 25-29 ms on the
 # power-limited RTX (docs/next-steps.md, 2026-10-31), and with only the AMD driver loaded the NVIDIA stays asleep, which leaves the shared power budget to the CPU the emulator is bound by.
 # So unless VK_DRIVER_FILES or NX_GPU says otherwise, only the AMD Vulkan driver is loaded when there is one; VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json runs on the NVIDIA.
-if [ -z "${VK_DRIVER_FILES+x}" ] && [ -z "$NX_GPU" ] && [ -f /usr/share/vulkan/icd.d/radeon_icd.json ]; then export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json; fi
+if [ -z "${VK_DRIVER_FILES+x}" ] && [ -z "$NX_GPU" ] && [ -f /usr/share/vulkan/icd.d/radeon_icd.json ]; then
+    export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json
+    # The window's own drawing (SDL's renderer, OpenGL through EGL) too: left to glvnd it can pick NVIDIA's EGL, which wakes the dGPU and moves every frame between the two GPUs
+    [ -z "${__EGL_VENDOR_LIBRARY_FILENAMES+x}" ] && [ -f /usr/share/glvnd/egl_vendor.d/50_mesa.json ] && export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+    [ -z "${__GLX_VENDOR_LIBRARY_NAME+x}" ] && export __GLX_VENDOR_LIBRARY_NAME=mesa
+fi
 NX_PRESENT=${NX_PRESENT:-sdl} NX_NVN_API=${NX_NVN_API:-53.313} exec "$B/nxlinux" --manifest work/run/mk8d_u/modules.txt --romfs work/run/mk8d_u/extract/RomFS.img $SH $AOC

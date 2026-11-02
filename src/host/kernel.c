@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "kernel.h"
 #include "guest_mem.h"
+#include "hle_stub.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -468,6 +469,7 @@ static void on_svc(cpu_t *c, uint32_t swi, void *user) {
     static int errs = -1; if (errs < 0) errs = getenv("NX_SVC_ERRORS") != NULL;       // NX_SVC_ERRORS=1: every distinct (svc, non-zero result) once, with its arguments
     uint64_t a0 = errs ? cpu_get_x(c, 0) : 0, a1 = errs ? cpu_get_x(c, 1) : 0, a2 = errs ? cpu_get_x(c, 2) : 0, a3 = errs ? cpu_get_x(c, 3) : 0, lr = errs ? cpu_get_x(c, 30) : 0;
     #define SVC_DONE(call) if (call) { if (errs && swi < 0x100) { uint32_t r = (uint32_t)cpu_get_x(c, 0); if (r) { static uint64_t seen[256]; static int ns; uint64_t key = (uint64_t)swi << 32 | r; int dup = 0; for (int i = 0; i < ns; i++) if (seen[i] == key) dup = 1; if (!dup && ns < 256) { seen[ns++] = key; fprintf(stderr, "[svcerr] svc %#x -> %#x (x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx)\n", swi, r, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)lr); } } } return; }
+    if (swi >= HLE_SVC_BASE && hle_dispatch(c, swi)) return;       // a host function (the most frequent kind): straight there, not through the IPC, kernel and memory handlers, which each copied 8 registers first
     SVC_DONE(ipc_svc_yielding(c, swi))             // before the kernel: CloseHandle of a session is not a kernel handle
     SVC_DONE(kernel_svc(c, swi))
     SVC_DONE(mem_svc(c, swi))
