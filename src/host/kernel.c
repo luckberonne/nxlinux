@@ -106,11 +106,21 @@ static pthread_cond_t g_core_cv[4] = {PTHREAD_COND_INITIALIZER, PTHREAD_COND_INI
 static void core_wake_all(void) { for (int i = 0; i < 4; i++) pthread_cond_broadcast(&g_core_cv[i]); }      // a thread's core changed while it may wait on the old one (holding G)
 static uint64_t g_ticket;
 static _Atomic int g_nwant;
+// The best (lowest) priority among the threads waiting for each core, NO_WAITER when none: read without G at every SVC to decide whether the thread has to yield, so the common case
+// (nobody of higher priority waits for this core) takes no lock. Before it, every SVC took G and walked the thread list whenever any thread anywhere waited for any core: in a
+// two-player MK8D race that was a quarter of the CPU (G's futex wait and wake plus core_yield). Kept by core_best_refresh, under G, whenever a want flag, a priority or a core changes.
+#define NO_WAITER 0x7fffffff
+static _Atomic int g_core_best[4] = {NO_WAITER, NO_WAITER, NO_WAITER, NO_WAITER};
 static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 static int sched_on(void) { if (g_sched < 0) g_sched = getenv("NX_NO_SCHED") == NULL; return g_sched; }
 static void core_release(thr_t *t) {                    // holding G
     if (!sched_on()) return;
     if (g_owner[t->core & 3] == t) { g_owner[t->core & 3] = NULL; pthread_cond_broadcast(&g_core_cv[t->core & 3]); }
+}
+static void core_best_refresh(void) {                  // holding G
+    int b[4] = {NO_WAITER, NO_WAITER, NO_WAITER, NO_WAITER};
+    for (thr_t *o = g_all; o; o = o->all) if (o->want && o->prio < b[o->core & 3]) b[o->core & 3] = o->prio;
+    for (int i = 0; i < 4; i++) atomic_store_explicit(&g_core_best[i], b[i], memory_order_relaxed);
 }
 static int core_first(thr_t *t) {                       // t is the waiter that should get the core (holding G)
     for (thr_t *o = g_all; o; o = o->all)
@@ -121,9 +131,9 @@ static void core_acquire(thr_t *t) {                    // holding G
     if (!sched_on()) return;
     int c = t->core & 3;
     if (g_owner[c] == t) return;                         // already the owner (an IPC that blocked inside took the core back)
-    t->want = 1; t->ticket = ++g_ticket; atomic_fetch_add(&g_nwant, 1);
+    t->want = 1; t->ticket = ++g_ticket; atomic_fetch_add(&g_nwant, 1); core_best_refresh();
     while (g_owner[c] || !core_first(t)) { pthread_cond_wait(&g_core_cv[c], &G); c = t->core & 3; }
-    g_owner[c] = t; t->want = 0; t->since_ns = mono_ns(); atomic_fetch_sub(&g_nwant, 1);
+    g_owner[c] = t; t->want = 0; t->since_ns = mono_ns(); atomic_fetch_sub(&g_nwant, 1); core_best_refresh();
 }
 static void core_yield(thr_t *t) {                      // holding G
     if (!sched_on() || !atomic_load(&g_nwant)) return;
@@ -440,7 +450,7 @@ static void on_fault(cpu_t *c, uint64_t pc, int kind, void *user) {
 // its core: lower priority threads of that core run meanwhile. The host answers inside the SVC, so the core is given up for the duration when another thread waits for it.
 static int ipc_svc_yielding(cpu_t *c, uint32_t swi) {
     thr_t *me = pthread_getspecific(g_keythr); int rel = 0;
-    if (me && (swi == 0x21 || swi == 0x22) && sched_on() && atomic_load(&g_nwant)) { pthread_mutex_lock(&G); if (g_owner[me->core & 3] == me) { core_release(me); rel = 1; } pthread_mutex_unlock(&G); }
+    if (me && (swi == 0x21 || swi == 0x22) && sched_on() && atomic_load_explicit(&g_core_best[me->core & 3], memory_order_relaxed) != NO_WAITER) { pthread_mutex_lock(&G); if (g_owner[me->core & 3] == me) { core_release(me); rel = 1; } pthread_mutex_unlock(&G); }
     int r = ipc_svc(c, swi);
     if (rel) { pthread_mutex_lock(&G); core_acquire(me); pthread_mutex_unlock(&G); }
     return r;
@@ -452,7 +462,9 @@ static void on_svc(cpu_t *c, uint32_t swi, void *user) {
     if (!cpu_is_aarch32()) { static int tr = -1; static const char *tf; static _Atomic int n; if (tr < 0) { tf = getenv("NX_TRACE_SVC"); tr = tf != NULL; }       // NX_TRACE_SVC for an AArch64 title: the first 3000 SVCs (read once: this runs on every SVC)
         int match = tf && tf[0] && strcmp(tf, "1") && swi >= 0x1000 && hle_stub_name(swi) && strstr(hle_stub_name(swi), tf);       // NX_TRACE_SVC=<name part>: only hooks whose name has it
         if (match || (tr && (!tf || !strcmp(tf, "1")) && n++ < 3000)) fprintf(stderr, "[svc] %#x%s%s x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx\n", swi, swi >= 0x1000 && hle_stub_name(swi) ? " " : "", swi >= 0x1000 && hle_stub_name(swi) ? hle_stub_name(swi) : "", (unsigned long long)cpu_get_x(c, 0), (unsigned long long)cpu_get_x(c, 1), (unsigned long long)cpu_get_x(c, 2), (unsigned long long)cpu_get_x(c, 3), (unsigned long long)cpu_get_x(c, 30)); }
-    { thr_t *me = pthread_getspecific(g_keythr); if (me && atomic_load(&g_nwant)) { pthread_mutex_lock(&G); core_yield(me); pthread_mutex_unlock(&G); } }   // a yield point of the core scheduler
+    { thr_t *me = pthread_getspecific(g_keythr);   // a yield point of the core scheduler: G only when a thread that would get the core waits for it
+      if (me) { int b = atomic_load_explicit(&g_core_best[me->core & 3], memory_order_relaxed);
+        if (b < me->prio || (b == me->prio && mono_ns() - me->since_ns > 10000000ull)) { pthread_mutex_lock(&G); core_yield(me); pthread_mutex_unlock(&G); } } }
     static int errs = -1; if (errs < 0) errs = getenv("NX_SVC_ERRORS") != NULL;       // NX_SVC_ERRORS=1: every distinct (svc, non-zero result) once, with its arguments
     uint64_t a0 = errs ? cpu_get_x(c, 0) : 0, a1 = errs ? cpu_get_x(c, 1) : 0, a2 = errs ? cpu_get_x(c, 2) : 0, a3 = errs ? cpu_get_x(c, 3) : 0, lr = errs ? cpu_get_x(c, 30) : 0;
     #define SVC_DONE(call) if (call) { if (errs && swi < 0x100) { uint32_t r = (uint32_t)cpu_get_x(c, 0); if (r) { static uint64_t seen[256]; static int ns; uint64_t key = (uint64_t)swi << 32 | r; int dup = 0; for (int i = 0; i < ns; i++) if (seen[i] == key) dup = 1; if (!dup && ns < 256) { seen[ns++] = key; fprintf(stderr, "[svcerr] svc %#x -> %#x (x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx)\n", swi, r, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)lr); } } } return; }
@@ -512,7 +524,7 @@ int kernel_svc(cpu_t *c, uint32_t num) {
     case 0x0C: { pthread_mutex_lock(&G); thr_t *t = h_peek((uint32_t)regs[1], O_THREAD);
         regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; pthread_mutex_unlock(&G); break; }
     case 0x0D: { pthread_mutex_lock(&G); thr_t *t = h_peek((uint32_t)regs[0], O_THREAD);   // SetThreadPriority
-        if (t) t->prio = (int)regs[1];
+        if (t) { t->prio = (int)regs[1]; core_best_refresh(); }
         regs[0] = t ? 0 : R_BAD_HANDLE; pthread_mutex_unlock(&G); break; }
     case 0x0E: { pthread_mutex_lock(&G); thr_t *t = h_peek((uint32_t)regs[2], O_THREAD);   // GetThreadCoreMask(→w1 ideal core, x2 mask)
         regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0; pthread_mutex_unlock(&G); break; }
@@ -522,7 +534,7 @@ int kernel_svc(cpu_t *c, uint32_t num) {
         if (t) { int cc = (int)regs[1]; if (cc >= 0) t->core = cc; if (cc == -2) { t->core = 0; t->mask = 1; } else if (regs[2]) t->mask = regs[2];
             // The ideal core must be in the mask: move it to the lowest core of the mask, as Horizon does
             if (t->mask && (t->core < 0 || !(t->mask >> t->core & 1))) t->core = __builtin_ctzll(t->mask);
-            core_wake_all(); }
+            core_best_refresh(); core_wake_all(); }
         pthread_mutex_unlock(&G);
         regs[0] = t ? 0 : R_BAD_HANDLE; break;
     }

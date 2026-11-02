@@ -727,10 +727,10 @@ int nvn_trace_frame_now(void) {        // 1 while the frame NX_DRAW_TRACE (or th
 }
 static int trace_draw(const char *what, uint32_t count, int *skip_it) {
     long frame = trace_target();
+    *skip_it = 0;
+    if (frame < 0 || (long)nvn_present_count() != frame) return 0;      // first: this runs for every draw, and the getenv below only matters in the traced frame (two getenv per draw were 0.3 % of a 2P race)
     long sa = -1, sb = -1;      // NX_DRAW_SKIP=a-b skips those draws of the traced frame; a list "a-b;c-d;..." gives the k-th F12 / SIGUSR1 request its k-th range ("-" = none)
     { const char *k = getenv("NX_DRAW_SKIP"); int want = getenv("NX_DRAW_TRACE") ? 0 : atomic_load(&g_req_n) - 1; while (k && want-- > 0) { k = strchr(k, ';'); if (k) k++; } if (k) sscanf(k, "%ld-%ld", &sa, &sb); }
-    *skip_it = 0;
-    if (frame < 0 || (long)nvn_present_count() != frame) return 0;
     static long idx = -1, seen_frame = -1; if (seen_frame != frame) { seen_frame = frame; idx = -1; }
     idx++;
     if (sa >= 0 && idx >= sa && idx <= sb) *skip_it = 1;

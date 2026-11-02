@@ -70,6 +70,9 @@ struct cpu {
     bool watch_hit = false, watch_skip = false; uint64_t watch_value = 0;       // see NX_WATCH
     uint64_t bad_addr = 0;                    // the address of the access that stopped this thread
     std::atomic<jitenv *> running{nullptr};   // the Jit this cpu is on right now, null while outside Run()
+    jitenv *last = nullptr;                   // the Jit it ran on before: taken again without the pool's lock when free (see acquire)
+    bool v_dirty = true;                      // its vector registers changed outside the Jit (cpu_set_v, cpu_call64's restore): they must be loaded again
+    jitenv *vec_in = nullptr;                 // the Jit its vectors were last loaded into
 };
 
 struct jitenv;
@@ -79,6 +82,8 @@ struct jitenv final : UserCallbacks {
     std::unique_ptr<Jit> jit;
     unsigned id = 0;
     cpu *cur = nullptr;
+    std::atomic<bool> busy{false};             // held by a cpu (taken with a compare-exchange, so a cpu can take its own last Jit back without the pool's lock)
+    cpu *loaded = nullptr;                     // whose registers the Jit holds: the vectors need no reload when the same cpu comes back and did not change them
     uint64_t tpidr = 0, tpidrro = 0;           // the Jit's TLS registers while a cpu is loaded
     std::atomic<uint64_t> last_code{0}, ncode{0};   // the last instruction the translator asked for, and how many it asked for in all (the thread dump shows a translation that never ends)
 
@@ -172,7 +177,6 @@ static ExclusiveMonitor &monitor() {
 static std::mutex g_mu;
 static std::condition_variable g_cv;
 static std::vector<std::unique_ptr<jitenv>> g_envs;   // every Jit created
-static std::vector<jitenv *> g_free;
 static void (*g_jit_hook)(void);
 void cpu_set_jit_created_hook(void (*fn)(void)) { g_jit_hook = fn; }
 static unsigned g_max_jits, g_created;     // g_created: ids handed out, including Jits still being built
@@ -206,10 +210,16 @@ static std::unique_ptr<jitenv> make_env(unsigned id) {
     return e;
 }
 
+// A Jit per run of guest code between two SVCs. Every SVC gives it back and the next run takes one again, so this is on the hottest path of the emulator: a thread first tries,
+// without the pool's lock, the Jit it had last (free nearly always: there are more Jits than cores the scheduler lets run); only a miss takes the lock. Before, every SVC took the
+// lock twice and woke a waiter, which was 6 % of the CPU in a two-player MK8D race.
+static std::atomic<int> g_waiting{0};          // cpus asleep in acquire waiting for a free Jit
+static jitenv *claim(cpu *c, jitenv *e) { e->cur = c; c->running.store(e); c->last = e; return e; }
 static jitenv *acquire(cpu *c) {
+    if (jitenv *e = c->last) { bool f = false; if (e->busy.compare_exchange_strong(f, true)) return claim(c, e); }
     std::unique_lock<std::mutex> lk(g_mu);
     for (;;) {
-        if (!g_free.empty()) { jitenv *e = g_free.back(); g_free.pop_back(); e->cur = c; c->running = e; return e; }
+        for (auto &u : g_envs) { bool f = false; if (u->busy.compare_exchange_strong(f, true)) return claim(c, u.get()); }
         if (g_created < max_jits()) {
             unsigned id = g_created++;          // reserved under the lock: ids are the exclusive-monitor slots and must be unique
             lk.unlock();                        // ~18 ms: do not hold the pool while building
@@ -217,25 +227,24 @@ static jitenv *acquire(cpu *c) {
             if (g_jit_hook) g_jit_hook();
             lk.lock();
             jitenv *p = e.get();
+            p->busy.store(true);
             g_envs.push_back(std::move(e));
-            p->cur = c; c->running = p;
-            return p;
+            return claim(c, p);
         }
-        g_cv.wait(lk);
+        g_waiting.fetch_add(1); g_cv.wait(lk); g_waiting.fetch_sub(1);
     }
 }
 
 static void release(cpu *c, jitenv *e) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    c->running = nullptr;
+    c->running.store(nullptr);
     e->jit->ClearHalt(HaltReason::UserDefined1);
     e->jit->ClearHalt(HaltReason::UserDefined2);
     e->jit->ClearHalt(HaltReason::UserDefined3);
     e->jit->ClearHalt(HaltReason::UserDefined4);
     e->jit->ClearHalt(HaltReason::UserDefined5);
     e->cur = nullptr;
-    g_free.push_back(e);
-    g_cv.notify_one();
+    e->busy.store(false);
+    if (g_waiting.load()) { std::lock_guard<std::mutex> lk(g_mu); g_cv.notify_one(); }
 }
 
 extern "C" __attribute__((weak)) void nx_prof_guest(uint64_t pc, uint64_t lr);          // the profiler (prof.c) is not linked into every test
@@ -277,7 +286,7 @@ uint64_t cpu_call64(cpu_t *cp, uint64_t fn, const uint64_t *args, int nargs) {
     cpu_run(cp);
     c->nested--;
     uint64_t ret = c->s.x[0];
-    c->s = saved; c->halt_req = halt;
+    c->s = saved; c->halt_req = halt; c->v_dirty = true;
     return ret;
 }
 uint32_t cpu_call32(cpu_t *c, uint32_t fn, const uint32_t *args, int nargs) { return g_a32 ? cpu32_call(c, fn, args, nargs) : 0; }
@@ -295,13 +304,14 @@ cpu_t *cpu_create(const cpu_ops_t *ops, void *user, unsigned core) {
 
 void cpu_destroy(cpu_t *c) { if (g_a32) cpu32_destroy(c); else delete C(c); }
 
-static void load(jitenv *e, const ctx &s) {
+static void load(jitenv *e, const ctx &s, cpu *c) {
     Jit &j = *e->jit;
     std::array<uint64_t, 31> x;
     memcpy(x.data(), s.x, sizeof s.x);
     j.SetRegisters(x);
     j.SetSP(s.sp); j.SetPC(s.pc);
-    for (int i = 0; i < 32; i++) j.SetVector(i, s.v[i]);
+    if (e->loaded != c || c->vec_in != e || c->v_dirty) for (int i = 0; i < 32; i++) j.SetVector(i, s.v[i]);      // the Jit still holds this cpu's vectors when it ran here last and nothing changed them
+    e->loaded = c; c->vec_in = e; c->v_dirty = false;
     j.SetFpcr(s.fpcr); j.SetFpsr(s.fpsr); j.SetPstate(s.pstate);
     e->tpidr = s.tpidr; e->tpidrro = s.tpidrro;
 }
@@ -326,7 +336,8 @@ int cpu_run(cpu_t *cp) {
     c->halt_req = false; c->faulted = false; c->svc_pending = false;
     for (;;) {
         jitenv *e = acquire(c);
-        load(e, c->s);
+        load(e, c->s, c);
+        std::atomic_thread_fence(std::memory_order_seq_cst);                // pairs with cpu_halt: it sets halt_req then looks at running, this sets running then looks at halt_req
         if (c->halt_req) e->jit->HaltExecution(HaltReason::UserDefined1);   // cpu_halt landed while no Jit was held
         HaltReason r = e->jit->Run();
         store(e, c->s);
@@ -379,7 +390,7 @@ int cpu_run(cpu_t *cp) {
             if (c->halt_req) return CPU_HALT_REQUESTED;
             continue;
         }
-        if (c->halt_req || (static_cast<uint32_t>(r) & static_cast<uint32_t>(HaltReason::UserDefined1))) return CPU_HALT_REQUESTED;
+        if (c->halt_req) return CPU_HALT_REQUESTED;      // a UserDefined1 stop without halt_req is a cpu_halt meant for the thread that had this Jit before (it reads `running` just as that one gives the Jit back): run on
         // CacheInvalidation or similar: run again
     }
 }
@@ -389,6 +400,7 @@ void cpu_halt(cpu_t *cp) {
     cpu *c = C(cp);
     std::lock_guard<std::mutex> lk(g_mu);
     c->halt_req = true;
+    std::atomic_thread_fence(std::memory_order_seq_cst);      // pairs with the fence in cpu_run after acquire
     if (jitenv *e = c->running.load()) e->jit->HaltExecution(HaltReason::UserDefined1);
 }
 
@@ -400,7 +412,7 @@ uint64_t cpu_get_sp(cpu_t *c) { if (g_a32) return cpu32_get_sp(c); return C(c)->
 void cpu_set_sp(cpu_t *c, uint64_t v) { if (g_a32) return cpu32_set_sp(c, v); C(c)->s.sp = v; }
 void cpu_set_tls(cpu_t *c, uint64_t a, uint64_t b) { if (g_a32) return cpu32_set_tls(c, a, b); C(c)->s.tpidr = a; C(c)->s.tpidrro = b; }
 void cpu_get_v(cpu_t *c, int i, uint64_t out[2]) { if (g_a32) return cpu32_get_v(c, i, out); out[0] = C(c)->s.v[i][0]; out[1] = C(c)->s.v[i][1]; }
-void cpu_set_v(cpu_t *c, int i, const uint64_t in[2]) { if (g_a32) return cpu32_set_v(c, i, in); C(c)->s.v[i] = {in[0], in[1]}; }
+void cpu_set_v(cpu_t *c, int i, const uint64_t in[2]) { if (g_a32) return cpu32_set_v(c, i, in); C(c)->s.v[i] = {in[0], in[1]}; C(c)->v_dirty = true; }
 void cpu_invalidate(cpu_t *c, uint64_t addr, uint64_t len) {
     if (g_a32) return cpu32_invalidate(c, addr, len);
     std::lock_guard<std::mutex> lk(g_mu);
