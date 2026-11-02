@@ -3,10 +3,6 @@
 Base game 1.0.0 (`01006A800016E000`, an NSZ with block compression), a 64-bit process, SDK 8.2.1. nxnative's notes on this title (`dm/games/01006A800016E000/README.md` in its checkout) were the guide: its profile and
 patches are what each step below reproduces.
 
-> **Not committed yet when this was written:** the edits to `src/host/main.c`, `mem.c`, `svc/ipc_services.c`, `svc/hle_friends.c`, `svc/hle_sdkinit.c`, `svc/ipc_audout.c`, `svc/hle_bcat.c` and
-> `tools/run_title.py` (the alias region, the NPDM system resource size, the break notifications, `ldr:ro`, the Auto audout commands, the friends events and the segment offsets in the table below) sit in the
-> working tree: another agent's claim on those files blocks `agentmsg.py commit` until it is released or goes stale (12 h). The rest is committed.
-
 ## Run it
 
 ```
