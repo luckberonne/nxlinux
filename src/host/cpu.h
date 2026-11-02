@@ -34,6 +34,9 @@ void cpu_destroy(cpu_t *c);
 
 int cpu_run(cpu_t *c);                 // runs until cpu_halt() or a fault; returns a CPU_HALT_* value
 void cpu_halt(cpu_t *c);               // callable from any thread, or from inside the svc handler
+void cpu_set_preempt_hook(void (*fn)(cpu_t *));   // AArch64: called on the guest thread's own host thread, outside the Jit, after cpu_preempt stopped it
+int cpu_translating(cpu_t *c, uint64_t *pc, uint64_t *count);   // thread dump: the last instruction address the Jit's translator read for this cpu, and how many it has read in all
+void cpu_preempt(cpu_t *c);            // callable from any thread: the guest thread stops at the end of its block, fn runs, the guest continues
 
 uint64_t cpu_get_x(cpu_t *c, int i);
 void cpu_set_x(cpu_t *c, int i, uint64_t v);

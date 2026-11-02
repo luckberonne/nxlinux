@@ -9,10 +9,12 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#include <sys/syscall.h>
 #include <string.h>
 #include <time.h>
 #include <signal.h>
 #include <semaphore.h>
+#include <execinfo.h>
 
 #define WAITERS_BIT   0x40000000u
 #define H_CUR_THREAD  0xFFFF8000u
@@ -34,6 +36,8 @@ typedef struct thr {
     struct thr *next;   // wait chain
     struct thr *all;    // all-threads chain
     int want; uint64_t ticket, since_ns;   // scheduler: asking for its core; when it asked; when it got the core
+    int tid; uint64_t nsvc;               // the host thread's tid (top -H) and how many SVCs it has made (two dumps with the same count: it runs guest code without ever calling the kernel)
+    const char *ipc_name; uint32_t ipc_cmd; uint64_t ipc_ns;   // the IPC request it is inside of (service object, command, since when); NULL when none
 } thr_t;
 
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
@@ -234,7 +238,7 @@ static uint64_t tlr_alloc(void) {                      // holding G
 }
 
 static void thread_attach(thr_t *t) {                  // on the thread's own host thread; sets up its cpu
-    pthread_setspecific(g_keythr, t);
+    pthread_setspecific(g_keythr, t); t->tid = (int)syscall(SYS_gettid);
     pthread_mutex_lock(&G);
     t->tlr = tlr_alloc();
     pthread_mutex_unlock(&G);
@@ -277,6 +281,42 @@ static void *thread_main(void *p) {
     return NULL;
 }
 
+
+// Preemption of a guest thread that spins without any SVC (cpu_preempt, cpu.cpp): a watcher looks every 5 ms at the thread that owns each core; one that made no SVC since the last look,
+// has had the core for 10 ms and has a thread of its core waiting that core_yield would serve (higher priority, or equal after the slice) is stopped, and gives the core up in preempt_cb.
+// Seen on MK8D with several pads: a priority 44 worker polling memory held core 0 for minutes while the main thread and the priority 41 vibration thread, both of core 0, waited.
+static void preempt_cb(cpu_t *c) {
+    thr_t *me = pthread_getspecific(g_keythr); (void)c;
+    if (!me) return;
+    static int lg = -1; if (lg < 0) lg = getenv("NX_PREEMPT_LOG") != NULL;
+    pthread_mutex_lock(&G); uint64_t was = me->since_ns; core_yield(me); if (lg) fprintf(stderr, "[preempt] %#llx stopped: %s\n", (unsigned long long)me->id, me->since_ns != was ? "gave the core up" : "nobody to give it to"); pthread_mutex_unlock(&G);
+}
+static void *preempt_watch(void *unused) {
+    (void)unused; uint64_t last_n[4] = {0}; thr_t *last_o[4] = {0};
+    for (;;) {
+        usleep(5000);
+        if (!atomic_load(&g_nwant)) { for (int i = 0; i < 4; i++) last_o[i] = NULL; continue; }
+        if (pthread_mutex_trylock(&G)) continue;
+        uint64_t now = mono_ns();
+        for (int i = 0; i < 4; i++) {
+            thr_t *o = g_owner[i];
+            int same = o && o == last_o[i] && o->nsvc == last_n[i];
+            last_o[i] = o; last_n[i] = o ? o->nsvc : 0;
+            if (!same || !o->cpu || now - o->since_ns <= 10000000ull) continue;
+            for (thr_t *w = g_all; w; w = w->all)
+                if (w->want && (w->core & 3) == i && w->prio <= o->prio) { static int lg = -1; if (lg < 0) lg = getenv("NX_PREEMPT_LOG") != NULL; if (lg) fprintf(stderr, "[preempt] asking %#llx (core %d, %llu SVCs) to stop for %#llx\n", (unsigned long long)o->id, i, (unsigned long long)o->nsvc, (unsigned long long)w->id); cpu_preempt(o->cpu); break; }
+        }
+        pthread_mutex_unlock(&G);
+    }
+    return NULL;
+}
+
+// The host call stack of a running guest thread (it does not call the kernel: is it in the Jit or in a host function that loops?): the dump sends it a real-time signal and the handler prints
+// its own backtrace (backtrace_symbols_fd is not strictly async-signal-safe, but this only runs on a process that is being looked at because it is stuck). addr2line -f -e nxlinux <addr> names a frame.
+#define BT_SIG (SIGRTMIN + 3)
+static void on_bt(int sig) { (void)sig; void *fr[24]; int n = backtrace(fr, 24); dprintf(2, "[hostbt] tid %d:\n", (int)syscall(SYS_gettid)); backtrace_symbols_fd(fr, n, 2); }
+static void host_bt_install(void) { struct sigaction sa = {0}; sa.sa_handler = on_bt; sa.sa_flags = SA_RESTART; sigemptyset(&sa.sa_mask); sigaction(BT_SIG, &sa, NULL); }
+
 // What every guest thread is doing: priority, core, what it waits on, lr, and (stacks) the guest call stack. Taking G could itself hang if the freeze being looked at holds it, so it is
 // tried for two seconds and the dump goes on without it (said in the header line) when it stays taken: the thread list is only read.
 static void threads_dump_once(int stacks, int all, const char *why) {
@@ -284,9 +324,11 @@ static void threads_dump_once(int stacks, int all, const char *why) {
     fprintf(stderr, "[threads] --- %s%s\n", why, locked ? "" : " (the kernel lock is held by someone: reading without it)");
     for (int c = 0; c < 4; c++) if (g_owner[c]) fprintf(stderr, "[threads] core %d is held by %#llx (%.1f s)\n", c, (unsigned long long)g_owner[c]->id, (double)(mono_ns() - g_owner[c]->since_ns) / 1e9);
     for (thr_t *t = g_all; t; t = t->all)
-        fprintf(stderr, "[threads] id=%#llx h=%#x prio=%d core=%d %s%s wait=%s addr=%#llx lr=%#llx pc=%#llx r0=%#llx\n", (unsigned long long)t->id, t->handle, t->prio, t->core, t->exited ? "EXITED" : "alive", t->want ? " wants-core" : "",
+        fprintf(stderr, "[threads] id=%#llx h=%#x prio=%d core=%d %s%s wait=%s addr=%#llx lr=%#llx pc=%#llx r0=%#llx tid=%d svcs=%llu\n", (unsigned long long)t->id, t->handle, t->prio, t->core, t->exited ? "EXITED" : "alive", t->want ? " wants-core" : "",
                 (const char *[]){"none", "lock", "cond", "address", "sync"}[t->wkind >= 0 && t->wkind < 5 ? t->wkind : 0], (unsigned long long)t->waddr, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 30) : 0ull,
-                t->cpu ? (unsigned long long)cpu_get_pc(t->cpu) : 0ull, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 0) : 0ull);
+                t->cpu ? (unsigned long long)cpu_get_pc(t->cpu) : 0ull, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 0) : 0ull, t->tid, (unsigned long long)t->nsvc);
+    for (thr_t *t = g_all; t; t = t->all) { uint64_t pc, n; if (t->cpu && !t->exited && !cpu_is_aarch32() && cpu_translating(t->cpu, &pc, &n)) fprintf(stderr, "[threads] %#llx is on a Jit, last instruction read %#llx (main+%#llx), %llu read so far\n", (unsigned long long)t->id, (unsigned long long)pc, (unsigned long long)(pc - 0x2000015000ull), (unsigned long long)n); }
+    for (thr_t *t = g_all; t; t = t->all) if (t->ipc_name) fprintf(stderr, "[threads] %#llx is inside IPC %s cmd %u for %.1f s\n", (unsigned long long)t->id, t->ipc_name, t->ipc_cmd, (double)(mono_ns() - t->ipc_ns) / 1e9);
     if (stacks)
         for (thr_t *t = g_all; t; t = t->all) if (t->cpu && !t->exited && (t->wkind == 0 || all)) {
             uint64_t sp = cpu_get_sp(t->cpu); fprintf(stderr, "[threads]   %#llx stack:", (unsigned long long)t->id);
@@ -296,6 +338,7 @@ static void threads_dump_once(int stacks, int all, const char *why) {
             else for (int i = 0; i + 1 < (got > 0 ? got / 4 : 0); i += 2) { uint64_t v = buf[i] | (uint64_t)buf[i + 1] << 32; if (v >= 0x2000011000ull && v < 0x2001a63000ull) fprintf(stderr, " %#llx", (unsigned long long)v - 0x2000015000ull); }       // 64
             fprintf(stderr, "\n");
         }
+    if (stacks) { int sent = 0; for (thr_t *t = g_all; t && sent < 8; t = t->all) if (t->tid && !t->exited && t->wkind == 0 && t->nsvc && t->tid != (int)syscall(SYS_gettid)) { syscall(SYS_tgkill, getpid(), t->tid, BT_SIG); sent++; usleep(150000); } }
     if (locked) pthread_mutex_unlock(&G);
 }
 
@@ -315,16 +358,23 @@ static void *quit_dump(void *unused) {
     return NULL;
 }
 static void quit_dump_start(void) {
+    host_bt_install();
     if (getenv("NX_NO_QUIT_DUMP") || sem_init(&g_dump_sem, 0, 0)) return;
     pthread_t th; if (pthread_create(&th, NULL, quit_dump, NULL)) return;
     pthread_detach(th);
     struct sigaction sa = {0}; sa.sa_handler = on_quit; sa.sa_flags = SA_RESTART; sigemptyset(&sa.sa_mask); sigaction(SIGQUIT, &sa, NULL);
 }
 
+void kernel_note_ipc(const char *name, uint32_t cmd) {         // ipc.c: the calling guest thread starts (name) or leaves (NULL) the handler of a request, for the thread dump
+    thr_t *me = pthread_getspecific(g_keythr); if (!me) return;
+    me->ipc_cmd = cmd; me->ipc_ns = name ? mono_ns() : 0; me->ipc_name = name;
+}
+
 void kernel_init(void) {
     pthread_key_create(&g_keythr, NULL);
     if (getenv("NX_THREADS")) { pthread_t th; pthread_create(&th, NULL, threads_dump, NULL); pthread_detach(th); }
     quit_dump_start();
+    if (!cpu_is_aarch32() && sched_on() && !getenv("NX_NO_PREEMPT")) { cpu_set_preempt_hook(preempt_cb); pthread_t th; if (!pthread_create(&th, NULL, preempt_watch, NULL)) pthread_detach(th); }      // NX_NO_PREEMPT=1 turns it off
     g_landing = guest_alloc(16, 16);
     if (cpu_is_aarch32()) {                                  // where a guest function the host calls (cpu_call32) returns to
         uint64_t pad = guest_alloc(16, 16); *(uint32_t *)pad = 0xEF0007FEu;
@@ -377,6 +427,13 @@ void kernel_wait_all(void) {
 static void on_fault(cpu_t *c, uint64_t pc, int kind, void *user) {
     (void)c; thr_t *t = user;
     fprintf(stderr, "[RED] guest thread %#x faulted: kind %d at pc=%#llx\n", t->handle, kind, (unsigned long long)pc);
+    if (!cpu_is_aarch32()) {              // who called it: lr, sp, the first arguments and the frame chain (main-relative addresses are main+X with the module at 0x2000015000)
+        fprintf(stderr, "[RED]   lr=%#llx sp=%#llx x0=%#llx x1=%#llx x2=%#llx x19=%#llx x20=%#llx x29=%#llx\n", (unsigned long long)cpu_get_x(c, 30), (unsigned long long)cpu_get_sp(c), (unsigned long long)cpu_get_x(c, 0),
+                (unsigned long long)cpu_get_x(c, 1), (unsigned long long)cpu_get_x(c, 2), (unsigned long long)cpu_get_x(c, 19), (unsigned long long)cpu_get_x(c, 20), (unsigned long long)cpu_get_x(c, 29));
+        uint64_t fp = cpu_get_x(c, 29); fprintf(stderr, "[RED]   frames:");
+        for (int i = 0; i < 12 && fp >= guest_mem_base() && fp + 16 <= guest_mem_end() && !(fp & 7); i++) { uint64_t r = *(uint64_t *)(fp + 8); fprintf(stderr, " %#llx", (unsigned long long)(r - 0x2000015000ull)); fp = *(uint64_t *)fp; }
+        fprintf(stderr, "\n");
+    }
 }
 
 // An IPC request blocks the caller until the service answers, so on a console a thread that polls a service without ever sleeping (MK8D's vibration thread, priority 41) does not keep
@@ -391,6 +448,7 @@ static int ipc_svc_yielding(cpu_t *c, uint32_t swi) {
 
 static void on_svc(cpu_t *c, uint32_t swi, void *user) {
     (void)user;
+    { thr_t *me = pthread_getspecific(g_keythr); if (me) me->nsvc++; }
     if (!cpu_is_aarch32()) { static int tr = -1; static const char *tf; static _Atomic int n; if (tr < 0) { tf = getenv("NX_TRACE_SVC"); tr = tf != NULL; }       // NX_TRACE_SVC for an AArch64 title: the first 3000 SVCs (read once: this runs on every SVC)
         int match = tf && tf[0] && strcmp(tf, "1") && swi >= 0x1000 && hle_stub_name(swi) && strstr(hle_stub_name(swi), tf);       // NX_TRACE_SVC=<name part>: only hooks whose name has it
         if (match || (tr && (!tf || !strcmp(tf, "1")) && n++ < 3000)) fprintf(stderr, "[svc] %#x%s%s x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx\n", swi, swi >= 0x1000 && hle_stub_name(swi) ? " " : "", swi >= 0x1000 && hle_stub_name(swi) ? hle_stub_name(swi) : "", (unsigned long long)cpu_get_x(c, 0), (unsigned long long)cpu_get_x(c, 1), (unsigned long long)cpu_get_x(c, 2), (unsigned long long)cpu_get_x(c, 3), (unsigned long long)cpu_get_x(c, 30)); }

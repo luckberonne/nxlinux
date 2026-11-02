@@ -22,6 +22,7 @@ uint32_t kernel_event_new_pair(uint32_t *writable, uint32_t *readable);   // bot
 void kernel_event_clear(uint32_t readable);
 uint32_t kernel_event_new(int signaled);   // a readable event the host owns (for services that hand the guest an event): the guest waits on and closes the handle
 void kernel_event_signal(uint32_t handle);
+void kernel_note_ipc(const char *name, uint32_t cmd);   // the thread dump shows which request a thread is inside of: call with the service name before the handler and NULL after
 void kernel_core_release(void);            // for a host function that waits outside the kernel: free the calling guest thread's core while it waits, take it again after
 void kernel_core_acquire(void);
 uint64_t kernel_tls(void);             // the calling guest thread's thread-local region (its IPC message buffer is at the start)

@@ -196,7 +196,7 @@ static uint32_t send(uint32_t h, uint32_t *m) {
         case 3: out.out[out.nout++] = 0x1000; break;                                              // QueryPointerBufferSize: a service whose arrays travel by pointer (X) needs room for them
         default: fprintf(stderr, "[RED] ipc: control command %u on %s is not implemented\n", in.cmd, g_s[s].name); out.result = R_NOT_IMPL; break;
         }
-    } else out.result = fn ? fn(s, &in, &out) : 0xE401u;
+    } else { kernel_note_ipc(oname, in.cmd); out.result = fn ? fn(s, &in, &out) : 0xE401u; kernel_note_ipc(NULL, 0); }
     if (dom) {                                                         // the sessions the handler made become objects of this domain
         for (unsigned k = 0; k < out.nmove && nobjs < 8; k++) {
             int ns = slot(out.move[k]); if (ns < 0) continue;

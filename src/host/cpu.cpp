@@ -72,11 +72,15 @@ struct cpu {
     std::atomic<jitenv *> running{nullptr};   // the Jit this cpu is on right now, null while outside Run()
 };
 
+struct jitenv;
+static void store(jitenv *e, ctx &s);     // defined below: a fault reads the registers of the Jit before it reports them
+
 struct jitenv final : UserCallbacks {
     std::unique_ptr<Jit> jit;
     unsigned id = 0;
     cpu *cur = nullptr;
     uint64_t tpidr = 0, tpidrro = 0;           // the Jit's TLS registers while a cpu is loaded
+    std::atomic<uint64_t> last_code{0}, ncode{0};   // the last instruction the translator asked for, and how many it asked for in all (the thread dump shows a translation that never ends)
 
     // An access outside the guest window is a guest bug (a NULL pointer, a stale address): it stops this thread, with the registers, instead of faulting in the host
     bool ok(uint64_t a, size_t n) {
@@ -117,6 +121,10 @@ struct jitenv final : UserCallbacks {
         return __atomic_compare_exchange_n((T *)a, &expected, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     }
     std::optional<std::uint32_t> MemoryReadCode(VAddr a) override {
+        last_code.store(a, std::memory_order_relaxed); ncode.fetch_add(1, std::memory_order_relaxed);
+        if (guest_mem_base && guest_mem_end && !(a >= guest_mem_base() && a < guest_mem_end() && 4 <= guest_mem_end() - a)) {      // code outside the guest window (a jump through a wild pointer): dynarmic then raises a fault for the block instead of merging zero words for ever
+            cur->bad_addr = a; cur->faulted = true; return std::nullopt;
+        }
         if (g_pc_trace) { std::lock_guard<std::mutex> lk(g_pc_mu); g_pc_log.push_back(a); }
         return MemoryRead32(a);
     }
@@ -149,6 +157,7 @@ struct jitenv final : UserCallbacks {
     }
     void fault(uint64_t pc, int kind) {
         cur->faulted = true;
+        store(this, cur->s); cur->s.pc = pc;      // the registers at the fault (the copy in cpu is from the last stop, an SVC)
         if (cur->ops.fault) cur->ops.fault(reinterpret_cast<cpu_t *>(cur), pc, kind, cur->user);
         jit->HaltExecution(HaltReason::UserDefined3);
     }
@@ -223,6 +232,7 @@ static void release(cpu *c, jitenv *e) {
     e->jit->ClearHalt(HaltReason::UserDefined2);
     e->jit->ClearHalt(HaltReason::UserDefined3);
     e->jit->ClearHalt(HaltReason::UserDefined4);
+    e->jit->ClearHalt(HaltReason::UserDefined5);
     e->cur = nullptr;
     g_free.push_back(e);
     g_cv.notify_one();
@@ -237,6 +247,21 @@ extern "C" void cpu_prof_poke(void) {                  // the profiler's thread:
 }
 
 static cpu *C(cpu_t *c) { return reinterpret_cast<cpu *>(c); }
+
+// Preemption: the kernel's scheduler only gives a core to another thread at an SVC, so a guest thread that spins on memory without ever calling the kernel (a wait for a thread of its own
+// core) would keep the core for ever. cpu_preempt stops that thread's Jit at the end of its current block; cpu_run then calls the hook (which may block, the Jit is back in the pool by
+// then) and runs on. A stop that lands on a thread which just left that Jit is harmless: the hook looks at the situation again and the thread continues.
+static void (*g_preempt_hook)(cpu_t *);
+extern "C" void cpu_set_preempt_hook(void (*fn)(cpu_t *)) { g_preempt_hook = fn; }
+extern "C" int cpu_translating(cpu_t *cp, uint64_t *pc, uint64_t *count) {      // the Jit this cpu is on: the last address its translator read and the reads so far (0 if the cpu is on no Jit)
+    std::lock_guard<std::mutex> lk(g_mu);
+    for (auto &e : g_envs) if (e->cur == C(cp)) { *pc = e->last_code.load(); *count = e->ncode.load(); return 1; }
+    return 0;
+}
+extern "C" void cpu_preempt(cpu_t *cp) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    for (auto &e : g_envs) if (e->cur == C(cp)) e->jit->HaltExecution(HaltReason::UserDefined5);
+}
 
 static bool g_a32;
 static uint64_t g_return_pad64;
@@ -308,6 +333,10 @@ int cpu_run(cpu_t *cp) {
         release(c, e);
         if (static_cast<uint32_t>(r) & static_cast<uint32_t>(HaltReason::UserDefined4)) {      // a profiler sample, not a stop of the guest
             if (nx_prof_guest) nx_prof_guest(c->s.pc, c->s.x[30]);
+            if (!c->watch_hit && !c->faulted && !c->svc_pending && !c->halt_req) continue;
+        }
+        if (static_cast<uint32_t>(r) & static_cast<uint32_t>(HaltReason::UserDefined5)) {      // the kernel's scheduler asks this thread to give its core up
+            if (g_preempt_hook) g_preempt_hook(cp);
             if (!c->watch_hit && !c->faulted && !c->svc_pending && !c->halt_req) continue;
         }
         if (c->watch_hit) {
