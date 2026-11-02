@@ -144,6 +144,14 @@ static void map_source_query(uint64_t addr, uint64_t *base, uint64_t *size, uint
 static void query(uint64_t addr, uint64_t *base, uint64_t *size, uint32_t *state, uint64_t *perm, uint32_t *attr) {
     int k; *attr = 0;
     uint64_t ab = (uint64_t)g_alias, ae = ab + g_alias_cap;
+    { module_t *nm = module_of(addr);       // an NRO the title loaded: its pages lie in the heap the title read the file into, and nn::ro::MapManualLoadModuleMemory made them AliasCode / AliasCodeData
+      if (nm && nm->nro) {
+        uint64_t off = addr - nm->base, ro = nm->ro_off ? nm->ro_off : nm->size, da = nm->data_off ? nm->data_off : ro;
+        if (off < ro)      { *base = nm->base;      *size = ro;             *state = 8; *perm = 5; }
+        else if (off < da) { *base = nm->base + ro; *size = da - ro;        *state = 8; *perm = 1; }
+        else               { *base = nm->base + da; *size = nm->size - da;  *state = 9; *perm = 3; }
+        goto done;
+      } }
     if (addr >= (uint64_t)g_heap && addr < (uint64_t)g_heap + g_heap_cur) { *base = (uint64_t)g_heap; *size = g_heap_cur; *state = 5; *perm = 3; }
     else if ((k = map_find(addr, 1))) { *base = g_map[k - 1].base; *size = g_map[k - 1].size; *state = g_map[k - 1].state; *perm = 3; }
     else if (addr >= ab && addr < ae) {
@@ -168,9 +176,10 @@ static void query(uint64_t addr, uint64_t *base, uint64_t *size, uint32_t *state
         // unwinding (nn::ro::detail::GetExceptionInfo) walks back over Code regions to find the module start, then reads MOD0 there.
         module_t *m = module_of(addr); uint64_t off = addr - m->base;
         uint64_t ro = m->ro_off ? m->ro_off : m->data_off ? m->data_off : m->size, da = m->data_off ? m->data_off : ro;
-        if (off < ro)      { *base = m->base;        *size = ro;           *state = 3; *perm = 5; }
-        else if (off < da) { *base = m->base + ro;   *size = da - ro;      *state = 3; *perm = 1; }
-        else               { *base = m->base + da;   *size = m->size - da; *state = 4; *perm = 3; }
+        unsigned cs = m->nro ? 8 : 3, ds = m->nro ? 9 : 4;       // an NRO the title loaded with nn::ro is AliasCode / AliasCodeData: GetExceptionInfo looks for exactly those types
+        if (off < ro)      { *base = m->base;        *size = ro;           *state = cs; *perm = 5; }
+        else if (off < da) { *base = m->base + ro;   *size = da - ro;      *state = cs; *perm = 1; }
+        else               { *base = m->base + da;   *size = m->size - da; *state = ds; *perm = 3; }
     }
     else {
         for (int i = 0; i < g_nstacks; i++)

@@ -98,6 +98,7 @@ int module_relocate(module_t *m, module_t **loaded, int nloaded) {
 static module_t *g_modules[MAX_MODULES];
 static int g_nmodules;
 void module_register(module_t *m) { if (g_nmodules < MAX_MODULES) g_modules[g_nmodules++] = m; }
+void module_unregister(module_t *m) { for (int i = 0; i < g_nmodules; i++) if (g_modules[i] == m) { g_modules[i] = g_modules[--g_nmodules]; return; } }
 uint64_t module_next_base(uint64_t addr) {   // the lowest module base above addr, or 0 if none
     uint64_t best = 0;
     for (int i = 0; i < g_nmodules; i++) if (g_modules[i]->base > addr && (!best || g_modules[i]->base < best)) best = g_modules[i]->base;

@@ -13,6 +13,7 @@ typedef struct {
     const char *strtab;
     unsigned nsym;
     uint64_t init, init_array, init_arraysz;
+    int nro;                     // mapped by nn::ro (ldr:ro): QueryMemory reports it as AliasCode / AliasCodeData (8 / 9), not Code / CodeData (3 / 4)
     uint64_t ro_off, data_off;   // segment offsets from base (0 = unknown): code [0,ro) RX, read-only [ro,data) R, data and bss [data,size) RW
 } module_t;
 
@@ -29,6 +30,7 @@ uint64_t module_sym(const module_t *m, const char *name);   // guest address of 
 
 // Registry for QueryMemory: modules are found by address.
 void module_register(module_t *m);
+void module_unregister(module_t *m);
 module_t *module_of(uint64_t addr);
 uint64_t module_next_base(uint64_t addr);   // the lowest module base above addr, or 0
 uint64_t module_image_bytes(void);   // total size of the registered modules, page-rounded (counted against the application pool by SetHeapSize)

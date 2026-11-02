@@ -3,6 +3,7 @@
 // a command not listed is reported in red and answered with ResultNotImplemented, so the next one a title needs shows up in the log.
 // A request that carries the caller's process id (send_pid) has two placeholder words at the start of in->args.
 #include "ipc.h"
+#include "module.h"
 #include "kernel.h"
 #include "hid_input.h"
 #include "mem.h"
@@ -491,7 +492,7 @@ static uint32_t pl(int session, const ipc_in_t *in, ipc_out_t *out) {
 // MapManualLoadModuleMemory(pid placeholder, nro address, nro size, bss address, bss size) -> the address the module is mapped at: the NRO is already in the title's memory (it read the file
 // there), and the one process is the host's own, so it stays where it is and the address comes back unchanged. The Jit's translations of that range are dropped here and on unmap: a
 // title that loads the same fighter again (a second battle) puts different code at addresses that held an earlier module.
-static struct { uint64_t addr, size; } g_nro_map[128]; static int g_nro_n;
+static struct { uint64_t addr, size; module_t *mod; } g_nro_map[128]; static int g_nro_n;
 static uint32_t ldr_ro(int session, const ipc_in_t *in, ipc_out_t *out) {
     (void)session;
     unsigned o = in->nargs >= 10 ? 2 : 0;                    // SDK 3+ sends a process id placeholder first
@@ -502,14 +503,23 @@ static uint32_t ldr_ro(int session, const ipc_in_t *in, ipc_out_t *out) {
         extern void cpu_invalidate(cpu_t *, uint64_t, uint64_t);
         if (in->nargs < o + 8 || !nro || !nsz) return 0xCC01u;      // ro ResultInvalidAddress-like: a malformed request
         cpu_invalidate(NULL, nro, nsz); if (bsz) cpu_invalidate(NULL, bss, bsz);
-        if (g_nro_n < 128) { g_nro_map[g_nro_n].addr = nro; g_nro_map[g_nro_n++].size = nsz; }
+        module_t *nm = NULL;
+        if (g_nro_n < 128 && nsz >= 0x80 && *(const uint32_t *)(uintptr_t)(nro + 0x10) == 0x304f524eu) {      // "NRO0": the segments say where the code, the read-only data and the data are
+            // The SDK's exception unwinding (nn::ro::detail::GetExceptionInfo) finds the module of a program counter by walking QueryMemory regions back over Code to the module start, so
+            // the NRO is a module of the registry like the ExeFS ones: code [0, ro) RX, read-only [ro, data) R, data and bss [data, end) RW. (Without it a C++ exception thrown in the
+            // NRO, Super Smash Bros. Ultimate's L2CExceptionShutdown, finds no handler and ends in std::terminate.)
+            const uint32_t *h = (const uint32_t *)(uintptr_t)nro;
+            nm = calloc(1, sizeof *nm); snprintf(nm->name, sizeof nm->name, "nro"); nm->base = nro; nm->size = (size_t)((nsz + 0xfff) & ~0xfffull);
+            nm->ro_off = h[0x28 / 4]; nm->data_off = h[0x30 / 4]; nm->nro = 1; module_register(nm);
+        }
+        if (g_nro_n < 128) { g_nro_map[g_nro_n].addr = nro; g_nro_map[g_nro_n].mod = nm; g_nro_map[g_nro_n++].size = nsz; }
         static unsigned seen; if (seen++ < 6) fprintf(stderr, "[dm] ldr:ro: NRO mapped at %#llx (%#llx bytes, bss %#llx + %#llx)\n", (unsigned long long)nro, (unsigned long long)nsz, (unsigned long long)bss, (unsigned long long)bsz);
         OUT64(nro); return 0;
     }
     case 1: {                                                // UnmapManualLoadModuleMemory(pid placeholder, nro address)
         uint64_t nro = ARG64(0);
         extern void cpu_invalidate(cpu_t *, uint64_t, uint64_t);
-        for (int i = 0; i < g_nro_n; i++) if (g_nro_map[i].addr == nro) { cpu_invalidate(NULL, nro, g_nro_map[i].size); g_nro_map[i] = g_nro_map[--g_nro_n]; break; }
+        for (int i = 0; i < g_nro_n; i++) if (g_nro_map[i].addr == nro) { cpu_invalidate(NULL, nro, g_nro_map[i].size); if (g_nro_map[i].mod) { module_unregister(g_nro_map[i].mod); free(g_nro_map[i].mod); } g_nro_map[i] = g_nro_map[--g_nro_n]; break; }
         return 0;
     }
     case 2: case 3: case 10: return 0;      // RegisterModuleInfo / UnregisterModuleInfo / RegisterModuleInfoWithUserProcessHandle
