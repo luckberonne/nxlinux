@@ -21,6 +21,9 @@
 #include "nvn_platform.h"
 #include "../../host/sha256.h"
 #include "../../host/hle_stub.h"
+#include "../../host/cpu.h"
+#include "../../host/kernel.h"
+#include "../../host/guest_mem.h"
 #include <sys/mman.h>
 #include <errno.h>
 #include <assert.h>
@@ -963,6 +966,11 @@ static uint8_t *cmd_alloc_keep(cmd_t *o, uint32_t size, uint32_t keep) {
         if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.cbs++; pthread_mutex_unlock(&g_cs_mu); }
         { static int cblog = -1; if (cblog < 0) cblog = getenv("DM_NVN_CBLOG") != NULL; static uint64_t ncb;
           if (cblog && (++ncb <= 40 || ncb % 1000 == 0)) LOG("[nvn] command memory callback #%llu cmd=%p need %u (used in this segment %ld)", (unsigned long long)ncb, (void *)o, size + keep, o->cur && o->end ? (long)(o->cur - (o->end - 1)) : -1L); }
+        cpu_t *gc = kernel_cpu();
+        if (gc && (uint64_t)(uintptr_t)o->cb >= guest_mem_base() && (uint64_t)(uintptr_t)o->cb < guest_mem_end()) {       // the callback is the title's own AArch64 code: the emulated CPU runs it (a native call lands on guest memory and faults)
+            uint64_t a[4] = {(uint64_t)(uintptr_t)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, size + keep, (uint64_t)(uintptr_t)o->cb_data};
+            cpu_call64(gc, (uint64_t)(uintptr_t)o->cb, a, 4);
+        } else
         o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, size + keep, o->cb_data);
     }
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.bytes += size; g_cs.recs++; pthread_mutex_unlock(&g_cs_mu); }
@@ -1101,7 +1109,9 @@ NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, c
     p_viewports *r = REC(c, OP_VIEWPORTS, p_viewports); r->first = first; r->n = n;
     for (int i = 0; i < n; i++) memcpy(r->v[i], v + 4 * i, 16);
 }
-NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
+NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) {
+    { static int lg = -1; static unsigned n; if (lg < 0) lg = getenv("NX_SCISSOR_LOG") != NULL; if (lg && n < 80) { n++; LOG("[nvn] SetScissor %d %d %d %d (cmd %p)", x, y, w, h, (void *)c); } }     // NX_SCISSOR_LOG=1: the first 80 scissor rectangles the title sets
+    *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
 NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
     *REC(c, OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){(const prog_t *)p, stages};

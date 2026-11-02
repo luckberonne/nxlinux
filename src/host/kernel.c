@@ -36,6 +36,7 @@ typedef struct thr {
     const uint32_t *whs; int whn;
     struct thr *next;   // wait chain
     struct thr *all;    // all-threads chain
+    int held;                              // the core this thread owns (g_owner[held] == it), -1 when none: SetThreadCoreMask can change `core` while it owns another one
     int want; uint64_t ticket, since_ns;   // scheduler: asking for its core; when it asked; when it got the core
     int tid; uint64_t nsvc;               // the host thread's tid (top -H) and how many SVCs it has made (two dumps with the same count: it runs guest code without ever calling the kernel)
     const char *ipc_name; uint32_t ipc_cmd; uint64_t ipc_ns;   // the IPC request it is inside of (service object, command, since when); NULL when none
@@ -119,7 +120,9 @@ static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONI
 static int sched_on(void) { if (g_sched < 0) g_sched = getenv("NX_NO_SCHED") == NULL; return g_sched; }
 static void core_release(thr_t *t) {                    // holding G
     if (!sched_on()) return;
-    if (g_owner[t->core & 3] == t) { g_owner[t->core & 3] = NULL; pthread_cond_broadcast(&g_core_cv[t->core & 3]); }
+    int c = t->held;
+    if (c >= 0 && g_owner[c & 3] == t) { g_owner[c & 3] = NULL; pthread_cond_broadcast(&g_core_cv[c & 3]); }
+    t->held = -1;
 }
 static void core_best_refresh(void) {                  // holding G
     int b[4] = {NO_WAITER, NO_WAITER, NO_WAITER, NO_WAITER};
@@ -134,10 +137,10 @@ static int core_first(thr_t *t) {                       // t is the waiter that 
 static void core_acquire(thr_t *t) {                    // holding G
     if (!sched_on()) return;
     int c = t->core & 3;
-    if (g_owner[c] == t) return;                         // already the owner (an IPC that blocked inside took the core back)
+    if (t->held >= 0 && g_owner[t->held & 3] == t) return;   // already the owner (an IPC that blocked inside took the core back)
     t->want = 1; t->ticket = ++g_ticket; atomic_fetch_add(&g_nwant, 1); core_best_refresh();
     while (g_owner[c] || !core_first(t)) { pthread_cond_wait(&g_core_cv[c], &G); c = t->core & 3; }
-    g_owner[c] = t; t->want = 0; t->since_ns = mono_ns(); atomic_fetch_sub(&g_nwant, 1); core_best_refresh();
+    g_owner[c] = t; t->held = c; t->want = 0; t->since_ns = mono_ns(); atomic_fetch_sub(&g_nwant, 1); core_best_refresh();
 }
 static void core_yield(thr_t *t) {                      // holding G
     if (!sched_on() || !atomic_load(&g_nwant)) return;
@@ -401,7 +404,7 @@ void kernel_init(void) {
 }
 
 static thr_t *thr_new(uint64_t entry, uint64_t arg, uint64_t sp, int prio, int core) {
-    thr_t *t = calloc(1, sizeof *t);
+    thr_t *t = calloc(1, sizeof *t); t->held = -1;
     pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
     pthread_cond_init(&t->cv, &ca); pthread_condattr_destroy(&ca);
     t->entry = entry; t->arg = arg; t->stack_top = sp & ~0xFull;

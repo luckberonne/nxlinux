@@ -390,6 +390,16 @@ int cpu_run(cpu_t *cp) {
                 fprintf(stderr, "[trap] pc=%#llx x0=%#llx x1=%#llx x2=%#llx x3=%#llx x19=%#llx x20=%#llx x21=%#llx x22=%#llx x23=%#llx lr=%#llx\n", (unsigned long long)pc, (unsigned long long)c->s.x[0], (unsigned long long)c->s.x[1], (unsigned long long)c->s.x[2], (unsigned long long)c->s.x[3],
                         (unsigned long long)c->s.x[19], (unsigned long long)c->s.x[20], (unsigned long long)c->s.x[21], (unsigned long long)c->s.x[22], (unsigned long long)c->s.x[23], (unsigned long long)c->s.x[30]);
                 for (int k = 0; k < 29; k++) { uint64_t a = c->s.x[k]; if (guest_mem_base && a >= guest_mem_base() && a + 64 < guest_mem_end()) { const char *t = (const char *)a; int n = 0; while (n < 80 && t[n] >= 0x20 && t[n] < 0x7f) n++; if (n >= 4) fprintf(stderr, "[trap]   x%d -> \"%.*s\"\n", k, n, t); } }
+                if (const char *pk = getenv("NX_TRAP_PEEK")) {      // NX_TRAP_PEEK=<reg>+<hex offset>:<words>,...: the 32-bit words at register + offset, whatever the trap logged (x2+0x15a18:8)
+                    for (const char *q = pk; *q; ) {
+                        char *e; int rg = (int)strtol(q + 1, &e, 10); uint64_t off = *e == '+' ? strtoull(e + 1, &e, 16) : 0; int n = *e == ':' ? (int)strtol(e + 1, &e, 10) : 4;
+                        uint64_t a = rg >= 0 && rg < 31 ? c->s.x[rg] + off : 0;
+                        if (a && guest_mem_base && a >= guest_mem_base() && a + 4 * (uint64_t)n <= guest_mem_end()) {
+                            fprintf(stderr, "[trap]   x%d+%#llx:", rg, (unsigned long long)off); for (int j = 0; j < n; j++) fprintf(stderr, " %#x", ((const uint32_t *)a)[j]); fprintf(stderr, "\n");
+                        }
+                        q = *e == ',' ? e + 1 : e; if (!*e) break;
+                    }
+                }
                 if ((orig & 0xFFE0FFE0) == 0xAA0003E0) c->s.x[orig & 31] = c->s.x[(orig >> 16) & 31];
                 c->s.pc = pc + 4; continue;
             }

@@ -434,7 +434,8 @@ static uint32_t prepo(int session, const ipc_in_t *in, ipc_out_t *out) {
 }
 
 // ---- pl:u: the shared fonts. They are firmware data the host does not have, so every font type is the host's own TrueType font (NX_SHARED_FONT, or fontconfig's sans) in the layout the
-// SDK reads: per font, 0x18029a7f, the size xor 0x49621806 (big endian), then the font. A title draws its text with a different face than on the console; its metrics are close enough.
+// SDK reads (NX_SHARED_FONT names the file: Super Smash Bros. Ultimate needs one with U+25A1, the square it draws for a glyph it lacks, which it looks up in every shared font and dereferences the null it gets,
+// while Mario Kart 8 Deluxe's font code faults on DejaVu Sans; tools/run_smash.sh picks one by charset): per font, 0x18029a7f, the size xor 0x49621806 (big endian), then the font. A title draws its text with a different face than on the console; its metrics are close enough.
 enum { FONT_TYPES = 6, SHARED_FONT_BLOCK = 0x1100000 };
 static struct { uint8_t *mem; uint32_t off[FONT_TYPES], size; } g_font;
 static ipc_shmem_t g_font_blob;

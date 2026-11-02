@@ -4,6 +4,7 @@
 // Implemented: the list structure (END, JUMP, CALL), the operations with a visible effect outside the GPU (events, counters, sync fences),
 // buffer copies, fills and uniform updates, and barriers. The operations that draw (render targets, clears, state, draws, dispatches,
 // texture copies) are accepted and counted but not executed yet; each kind is announced once so progress is visible in the log.
+#include <stdlib.h>
 #include "nvn_obj.h"
 #include "nvn_mtl.h"
 #include "nvn_vk.h"
@@ -123,7 +124,9 @@ void mtl_exec(const uint8_t *p) {
             for (int i = 0; i < g_rt.n; i++) { g_rt.cser[i] = r->color[i] ? r->color[i]->serial : 0; g_rt.cview[i] = r->cview[i]; g_rt.has_cview[i] = r->has_cview[i]; }
             g_rt.dser = r->depth ? r->depth->serial : 0; g_rt.dview = r->dview; g_rt.has_dview = r->has_dview;
             break; }
-        case OP_SCISSOR: { const p_scissor *sc = (const p_scissor *)a; g_sc.has = 1; g_sc.r[0] = sc->x; g_sc.r[1] = sc->y; g_sc.r[2] = sc->w; g_sc.r[3] = sc->h; break; }
+        case OP_SCISSOR: { const p_scissor *sc = (const p_scissor *)a;
+            { static int lg = -1; static unsigned n; if (lg < 0) lg = getenv("NX_SCISSOR_LOG") != NULL; if (lg && n < 40 && sc->w == 0 && sc->x != 0) { n++; const uint32_t *q = (const uint32_t *)(const void *)p; fprintf(stderr, "[dm] [nvn] replay: a scissor record at %p size %u reads %d %d %d %d; words around it: %#x %#x | %#x %#x %#x %#x | %#x %#x\n", (const void *)p, h.size, sc->x, sc->y, sc->w, sc->h, q[-2], q[-1], q[0], q[1], q[2], q[3], q[4], q[5]); } }
+            g_sc.has = 1; g_sc.r[0] = sc->x; g_sc.r[1] = sc->y; g_sc.r[2] = sc->w; g_sc.r[3] = sc->h; break; }
         case OP_DRAW: { p_draw t; nvn_draw(draw_rec(a, h.size, &t)); break; }
         case OP_DRAW_IDX: { p_draw_idx t; nvn_draw_idx(draw_idx_rec(a, h.size, &t)); break; }
         case OP_DISPATCH: { p_dispatch t; memset(&t, 0, sizeof t); memcpy(&t, a, h.size < sizeof t ? h.size : sizeof t); nvn_dispatch(&t); break; }
