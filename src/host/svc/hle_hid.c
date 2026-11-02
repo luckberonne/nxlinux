@@ -7,6 +7,7 @@
 #include "hid_input.h"
 void dm_applet_returned(void);   // svc/hle_oe.c
 #include <stdio.h>
+#include <string.h>
 
 // ControllerSupportArg starts { s8 playerCountMin, s8 playerCountMax, bool enableTakeOverConnection, bool enableLeftJustify, bool enablePermitJoyDual, bool enableSingleMode, ... }
 static int controller_applet(const int8_t *arg) {
@@ -31,3 +32,13 @@ HLE_FORCE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoE
 }
 HLE_FORCE("_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", "controller applet (no result wanted); the host reports the players right away",
           Result, h_hid_ShowCtrl0, const int8_t *arg) { controller_applet(arg); return RES_OK; }
+
+// Touch screen: nn::hid::TouchScreenState<N> = { int64 sampling number; int32 count; int32 reserved; TouchState[N] }. The SDK builds it from a ring in the hid shared memory, which the host
+// fills for the pads only; read from the empty ring it left `count` as garbage, and Super Smash Bros. Ultimate (which polls the screen every frame) indexes a 16-entry array with it and
+// aborts. The screen reports no touches: a state with a growing sampling number and a count of 0.
+HLE_FORCE("_ZN2nn3hid19GetTouchScreenStateILm16EEEvPNS0_16TouchScreenStateIXT_EEE", "touch screen state: no touches (the host has no touch screen; the SDK's read of the empty shared memory ring left the count undefined)",
+          void, h_hid_Touch1_16, uint8_t *s) {
+    static uint64_t sample; if (!s) return;
+    uint64_t n = ++sample; int32_t zero[2] = {0, 0};
+    memcpy(s, &n, 8); memcpy(s + 8, zero, 8);
+}
