@@ -42,7 +42,7 @@ typedef struct thr {
 } thr_t;
 
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
-static struct { int type; void *obj; } g_h[MAX_H];
+static struct { int type; void *obj; int org; } g_h[MAX_H];      // org: which creator made it (diagnostics when the table fills)
 static pthread_key_t g_keythr;
 static uint64_t g_next_id = 0x51, g_wseq;
 static thr_t *g_wait, *g_all;
@@ -60,11 +60,14 @@ uint64_t kernel_cntpct(void) {
 }
 
 
-static uint32_t h_new(int type, void *obj) {                // holding G
-    for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + i; }
+static uint32_t h_new_o(int type, void *obj, int org) {      // holding G
+    for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; g_h[i].org = org; return 0x1000 + i; }
+    { int cnt[16][8] = {{0}}; for (int i = 1; i < MAX_H; i++) if (g_h[i].type > 0 && g_h[i].type < 16) cnt[g_h[i].type][g_h[i].org & 7]++;      // which kind of handle piled up, and who made it (1 event pair, 2 host event, 3 svc CreateEvent, 4 thread)
+      fprintf(stderr, "[RED] kernel: handle table full; by type/creator:"); for (int t = 1; t < 16; t++) for (int o = 0; o < 8; o++) if (cnt[t][o]) fprintf(stderr, " %d/%d=%d", t, o, cnt[t][o]); fprintf(stderr, "\n"); }
     die("handle table full");
     return 0;
 }
+#define h_new(type, obj) h_new_o((type), (obj), 4)      // threads
 static void *h_peek(uint32_t h, int type) {
     if (h == H_CUR_THREAD && type == O_THREAD) return pthread_getspecific(g_keythr);
     unsigned i = h - 0x1000;
@@ -214,7 +217,7 @@ static void wake_sync_waiters(const void *obj) {
 cpu_t *kernel_cpu(void) { thr_t *t = pthread_getspecific(g_keythr); return t ? t->cpu : NULL; }
 uint32_t kernel_event_new_pair(uint32_t *w, uint32_t *r) {
     event_t *e = calloc(1, sizeof *e); e->refs = 2;
-    pthread_mutex_lock(&G); *w = h_new(O_EVENT_W, e); *r = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); *w = h_new_o(O_EVENT_W, e, 1); *r = h_new_o(O_EVENT_R, e, 1); pthread_mutex_unlock(&G);
     return *r;
 }
 void kernel_event_clear(uint32_t h) {
@@ -222,7 +225,7 @@ void kernel_event_clear(uint32_t h) {
 }
 uint32_t kernel_event_new(int signaled) {
     event_t *e = calloc(1, sizeof *e); e->refs = 1; e->signaled = signaled;
-    pthread_mutex_lock(&G); uint32_t h = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); uint32_t h = h_new_o(O_EVENT_R, e, 2); pthread_mutex_unlock(&G);
     return h;
 }
 void kernel_event_signal(uint32_t h) {
@@ -515,11 +518,18 @@ int kernel_svc(cpu_t *c, uint32_t num) {
             pthread_mutex_lock(&G); core_release(me); pthread_mutex_unlock(&G);
             struct timespec ts = {ns / 1000000000, ns % 1000000000}; nanosleep(&ts, NULL);
             pthread_mutex_lock(&G); core_acquire(me); pthread_mutex_unlock(&G);
-        } else {                                               // a yield: to any waiter of the core, not only the higher priority ones
+        } else {
+            // A yield: 0 gives the core to a thread of the same priority, -1 (with core migration) and -2 (to any thread) to a thread of ANY priority: a thread that spins on SleepThread(-1) while
+            // waiting for a lower priority one (Super Smash Bros. Ultimate's main thread, priority 44, waits like that for a worker of priority 51 of its own core) would otherwise keep the core
+            // for ever, as the scheduler hands it back at once to the best waiter, which is the yielder. The core is left for a moment, so that the waiter is the one that takes it.
+            int any_prio = ns < 0;
             pthread_mutex_lock(&G);
-            for (thr_t *o = g_all; o && sched_on(); o = o->all) if (o->want && (o->core & 3) == (me->core & 3) && o->prio <= me->prio) { core_release(me); core_acquire(me); break; }
+            int gave = 0;
+            for (thr_t *o = g_all; o && sched_on(); o = o->all) if (o->want && (o->core & 3) == (me->core & 3) && (any_prio || o->prio <= me->prio)) { core_release(me); gave = 1; break; }
+            if (gave && any_prio) { pthread_mutex_unlock(&G); struct timespec d = {0, 100000}; nanosleep(&d, NULL); pthread_mutex_lock(&G); }      // 100 us off the core
+            if (gave) core_acquire(me);
             pthread_mutex_unlock(&G);
-            sched_yield();
+            if (!gave) sched_yield();
         }
         break;
     }
@@ -609,7 +619,7 @@ int kernel_svc(cpu_t *c, uint32_t num) {
 
     case 0x45: {  // CreateEvent(→w1 write end, w2 read end)
         event_t *e = calloc(1, sizeof *e); e->refs = 2;
-        pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e), hr = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
+        pthread_mutex_lock(&G); uint32_t hw = h_new_o(O_EVENT_W, e, 3), hr = h_new_o(O_EVENT_R, e, 3); pthread_mutex_unlock(&G);
         regs[0] = 0; regs[1] = hw; regs[2] = hr; break;
     }
     case 0x11: case 0x12: case 0x17: {  // SignalEvent(write end) / ClearEvent(either end) / ResetSignal(read end, error if not signaled)
