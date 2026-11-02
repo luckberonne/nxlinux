@@ -340,10 +340,11 @@ static void threads_dump_once(int stacks, int all, const char *why) {
     int locked = 0; for (int i = 0; i < 200 && !(locked = pthread_mutex_trylock(&G) == 0); i++) usleep(10000);
     fprintf(stderr, "[threads] --- %s%s\n", why, locked ? "" : " (the kernel lock is held by someone: reading without it)");
     for (int c = 0; c < 4; c++) if (g_owner[c]) fprintf(stderr, "[threads] core %d is held by %#llx (%.1f s)\n", c, (unsigned long long)g_owner[c]->id, (double)(mono_ns() - g_owner[c]->since_ns) / 1e9);
-    for (thr_t *t = g_all; t; t = t->all)
-        fprintf(stderr, "[threads] id=%#llx h=%#x prio=%d core=%d %s%s wait=%s addr=%#llx lr=%#llx pc=%#llx r0=%#llx tid=%d svcs=%llu\n", (unsigned long long)t->id, t->handle, t->prio, t->core, t->exited ? "EXITED" : "alive", t->want ? " wants-core" : "",
+    for (thr_t *t = g_all; t; t = t->all) {
+        fprintf(stderr, "[threads] id=%#llx h=%#x prio=%d core=%d %s%s wait=%s addr=%#llx lr=%#llx pc=%#llx r0=%#llx tid=%d svcs=%llu entry=%#llx\n", (unsigned long long)t->id, t->handle, t->prio, t->core, t->exited ? "EXITED" : "alive", t->want ? " wants-core" : "",
                 (const char *[]){"none", "lock", "cond", "address", "sync"}[t->wkind >= 0 && t->wkind < 5 ? t->wkind : 0], (unsigned long long)t->waddr, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 30) : 0ull,
-                t->cpu ? (unsigned long long)cpu_get_pc(t->cpu) : 0ull, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 0) : 0ull, t->tid, (unsigned long long)t->nsvc);
+                t->cpu ? (unsigned long long)cpu_get_pc(t->cpu) : 0ull, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 0) : 0ull, t->tid, (unsigned long long)t->nsvc, (unsigned long long)t->entry);
+        if (getenv("NX_THREADS_ARG") && t->arg > 0x200000000ull && t->arg < 0x3000000000ull) { fprintf(stderr, "[threads]   arg %#llx:", (unsigned long long)t->arg); for (int k = 0; k < 24; k++) fprintf(stderr, " %#llx", (unsigned long long)((uint64_t *)(uintptr_t)t->arg)[k]); fprintf(stderr, "\n"); } }
     for (thr_t *t = g_all; t; t = t->all) { uint64_t pc, n; if (t->cpu && !t->exited && !cpu_is_aarch32() && cpu_translating(t->cpu, &pc, &n)) fprintf(stderr, "[threads] %#llx is on a Jit, last instruction read %#llx (main+%#llx), %llu read so far\n", (unsigned long long)t->id, (unsigned long long)pc, (unsigned long long)(pc - 0x2000015000ull), (unsigned long long)n); }
     for (thr_t *t = g_all; t; t = t->all) if (t->ipc_name) fprintf(stderr, "[threads] %#llx is inside IPC %s cmd %u for %.1f s\n", (unsigned long long)t->id, t->ipc_name, t->ipc_cmd, (double)(mono_ns() - t->ipc_ns) / 1e9);
     if (stacks)
