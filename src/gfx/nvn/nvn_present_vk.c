@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #ifdef NX_HAVE_SDL3
 #include <SDL3/SDL.h>
 #endif
@@ -149,7 +150,10 @@ static void *sdl_thread(void *arg) {
     if (rr) SDL_DestroyRenderer(rr);
     if (win) SDL_DestroyWindow(win);
     SDL_Quit();
-    return NULL;
+    // Closing the window ends the process. It used to end only the window: the game ran on unseen, a core or more each, and every launch from the desktop left one more behind
+    // (four after a day, slowing the one being played). Nothing is lost: save data goes to its files with pwrite as the game writes it (ipc_fs.c), not through a buffer.
+    fprintf(stderr, "[dm] the window was closed: exiting\n"); fflush(NULL);
+    _exit(0);
 fail:
     pthread_mutex_lock(&g_mu); g_sink_sdl = 0; g_shown = UINT64_MAX; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
     return NULL;
