@@ -40,6 +40,16 @@ The window is player 1's Pro Controller, always connected (`src/host/svc/hid_inp
 Keyboard: arrows = D-pad, WASD = left stick, K or Return = A, J or Backspace = B, I = X, U = Y, Q = L, E = R, 1 = ZL, 3 = ZR, P = Plus, O = Minus.
 A gamepad SDL knows works too: its A and B follow the labels SDL gives the face buttons (bottom = A on Xbox and generic pads, right = A with the Nintendo layout); by default (a driving layout) LB and LT are the console's L and ZL (the game's item buttons) and RB and RT its R (hop, drift), `NX_PAD_LAYOUT=pro` only makes RT send ZR, the right stick has the same 6000 dead zone as the left. The table is in the README. `hid` commands 100/101 keep the style set the title asks for; 11, 66, 67, 120 to 128 are accepted; 203 returns an empty vibration device list.
 
+### Local multiplayer
+
+Up to eight players: each gamepad joins as the lowest free player the first time it is used (a button, a stick or a trigger), not when it is plugged in, so an adapter that shows two devices for one pad does not make an empty player. The keyboard stays player 1.
+
+Choosing Multiplayer makes the game call `nn::hid::ShowControllerSupport`, the console's controller applet (the screen where the players press L+R). nxlinux has no library applets (`ILibraryAppletCreator` is not implemented), and the SDK called through a NULL applet handle (`StartLibraryAppletImmediately`, guest fault at pc 0). `src/host/svc/hle_hid.c` takes the call over and answers at once: the players connected now, raised to the minimum the game asks for (MK8D asks for exactly 2) and capped at its maximum. Players with no pad yet are reserved: they read as connected Pro Controllers with nothing pressed, and the next gamepad used becomes the lowest of them.
+
+That alone left the two-player character select standing still: the game drew every frame, the same frame. MK8D stops its own scene before it starts the applet and starts it again only when the system tells it the applet has returned: oe notification 16 (Resume, which it enables with `SetResumeNotificationEnabled`) or 15 with InFocus (its handler is main+0x8da04c, jump table at main+0xf75fbc). So the host now pushes Resume after answering (`dm_applet_returned` in `hle_oe.c`). Sending focus changes instead (OutOfFocus then InFocus) did not work: the game stopped presenting. Ruled out on the way: the core scheduler (`NX_NO_SCHED=1` changed nothing) and the npad style events (MK8D never asks for them; hid command 106 signals them now anyway).
+
+The 32-bit base (1.0.0) has no such hook yet (its hooks are the list in `svc32.c`).
+
 ## Audio
 
 `audren:u` renders on the host (`src/host/svc/audren_mix.c`, IPC in `ipc_audren.c`). Each RequestUpdate (revision 4: 96 voices, the final mix of 6 buffers and one
@@ -217,6 +227,8 @@ All are environment variables; nothing costs anything when unset.
 | `NX_TEX_ARRAYS=1` | with `NX_FRAME_DUMP`: list the 2D array textures at frame 1000 and write layer 0 of the BC4 ones (font sheets) as raw blocks |
 | `NX_TEX_NO_RECHECK=1` | do not hash texture storage to catch CPU rewrites after the first upload |
 | `NX_HID_SCRIPT="<s>:<bit>[:<ms>],..."` | press buttons at given seconds after the hid block is mapped (each logged); e.g. `50:0,65:15` = A at 50 s, down at 65 s |
+| `NX_HID_PIPE=<fifo>` | each line `<bit>[+<bit>...][:<ms>]` written to that FIFO (make it with `mkfifo`) presses those buttons for player 1 for 200 ms (or `<ms>`): a script can wait for a screen in the `NX_FRAME_DUMP` frames and only then press (the menus take a varying time to accept input, so fixed times as in `NX_HID_SCRIPT` miss) |
+| `NX_HID_FAKE_PLAYERS=<n>` | players 2..n are connected pads that repeat player 1's buttons (and its scripted, tapped and piped presses), to try multiplayer without the pads |
 | `NX_FRAME_EVERY=<n>` | with `NX_FRAME_DUMP`: also every n-th frame |
 | `NX_MOVIE_LOG=1` | the movie decoder takeover's calls (`hle_movie.c`) |
 | `NX_HID_TAP=<bit>[:<s>[:<ms>]]` | press that `NpadButton` bit (0 = A) for 150 ms (or `<ms>`) every `<s>` seconds (default 4), for runs nobody sits at; `0:4:3500` goes through every menu into a Grand Prix and keeps accelerating in the race |
