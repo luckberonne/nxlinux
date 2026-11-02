@@ -21,8 +21,17 @@
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
-static uint8_t *g_frame; static uint32_t g_fw, g_fh; static size_t g_fcap;      // the latest frame, RGBA8, tightly packed
-static uint64_t g_ticket, g_shown, g_pub;                                      // tickets handed out / frames fully handled by the sink / frames whose pixels are in g_frame
+// Three frame buffers (RGBA8, tightly packed), whose roles move by swapping indices under g_mu, so that no 8 MB copy runs while g_mu is held (the game's present takes g_mu: a copy
+// under it stalled the game's thread for a millisecond or two every frame, twice):
+//   g_ib[F]  front: where a frame is published (the async worker swaps its finished back buffer in; the synchronous path copies into it under the lock)
+//   g_ib[W]  the async worker's back buffer, written outside the lock
+//   g_ib[D]  the window's: the SDL thread takes the newest frame by swapping it with the front, then uploads it outside the lock
+// g_last is the one that holds the newest complete frame (the front or the window's); the worker's buffer is never it, so readers under the lock see a whole frame.
+typedef struct { uint8_t *p; size_t cap; uint32_t w, h; } fbuf_t;
+static fbuf_t g_fb[3]; enum { FB_F, FB_W, FB_D };
+static int g_ib[3] = {0, 1, 2}, g_last = -1;      // g_ib[role] = buffer index; g_last = buffer index of the newest frame, -1 before the first
+static void fb_fit(fbuf_t *b, size_t n) { if (n > b->cap) { free(b->p); b->p = malloc(n); b->cap = b->p ? n : 0; } }
+static uint64_t g_ticket, g_shown, g_pub;                                      // tickets handed out / frames fully handled by the sink / frames whose pixels are in a frame buffer (g_fb)
 static double g_last_time;
 static int g_sink_sdl, g_sink_init, g_quit;
 static _Atomic uint64_t g_count;
@@ -95,8 +104,9 @@ static void *sdl_thread(void *arg) {
             struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 16 * 1000 * 1000; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             if (pthread_cond_timedwait(&g_cv, &g_mu, &ts)) break;
         }
-        uint64_t upto = g_pub; uint32_t w = g_fw, h = g_fh; uint8_t *copy = NULL;
-        if (upto > seen && g_frame && w && h) { copy = malloc((size_t)w * h * 4); memcpy(copy, g_frame, (size_t)w * h * 4); }
+        uint64_t upto = g_pub; uint32_t w = 0, h = 0; const uint8_t *copy = NULL;
+        if (upto > seen && g_last == g_ib[FB_F] && g_fb[g_last].p && g_fb[g_last].w && g_fb[g_last].h) { int t = g_ib[FB_F]; g_ib[FB_F] = g_ib[FB_D]; g_ib[FB_D] = t; g_last = t; }      // the newest frame becomes the window's: no copy
+        if (upto > seen && g_last == g_ib[FB_D]) { copy = g_fb[g_last].p; w = g_fb[g_last].w; h = g_fb[g_last].h; }
         pthread_mutex_unlock(&g_mu);
         if (copy && shot_target >= 0 && (long)atomic_load(&g_count) > shot_target) {      // the traced frame has been presented: this copy is it (or a later, equal one on a still screen)
             const char *dir = getenv("NX_SHOT_DIR"); char fn[700]; snprintf(fn, sizeof fn, "%s", dir ? dir : "nx-shots"); mkdir(fn, 0755);
@@ -108,7 +118,7 @@ static void *sdl_thread(void *arg) {
             if (!win) {
                 win = SDL_CreateWindow("nxlinux", (int)w, (int)h, SDL_WINDOW_RESIZABLE);
                 rr = win ? SDL_CreateRenderer(win, NULL) : NULL;
-                if (!rr) { fprintf(stderr, "[dm] [RED] [nvn] no SDL window or renderer (%s): frames go to memory only\n", SDL_GetError()); free(copy); goto fail; }
+                if (!rr) { fprintf(stderr, "[dm] [RED] [nvn] no SDL window or renderer (%s): frames go to memory only\n", SDL_GetError()); goto fail; }
                 { const char *v = getenv("NX_SDL_VSYNC"); SDL_SetRenderVSync(rr, v && *v == '0' ? 0 : 1); }      // NX_SDL_VSYNC=0: present without waiting for the display
             }
             if (!tx || tw != w || th != h) { if (tx) SDL_DestroyTexture(tx); tx = SDL_CreateTexture(rr, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, (int)w, (int)h); tw = w; th = h;
@@ -123,7 +133,6 @@ static void *sdl_thread(void *arg) {
                     if (s1) SDL_DestroySurface(s1); if (s0) SDL_DestroySurface(s0);
                 }
                 SDL_RenderPresent(rr); }
-            free(copy);
         }
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -178,7 +187,7 @@ static void sink_init(void) {
 static inline uint64_t present_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static _Atomic uint64_t g_pt_read, g_pt_swap, g_pt_wait, g_pt_n;   // where a present spends its time (reported every 300 presents: NX_PRESENT_STATS=1)
 // The presentation that does not make the game wait for the GPU: the copy of the window texture is submitted without waiting and a thread of its own picks the pixels up once the GPU has
-// finished the frame, puts them in g_frame and tells the sink. The game's wait for the display is relaxed to the frame before (one frame of latency, as nxnative's present snapshots), so
+// finished the frame, puts them in its back buffer, swaps it in as the front (g_fb) and tells the sink. The game's wait for the display is relaxed to the frame before (one frame of latency, as nxnative's present snapshots), so
 // the frame limit stays. On for the window sink (and with NX_PRESENT_ASYNC for the memory sink); off for NX_PRESENT_SYNC and for the frame dumps, which need the pixels at once.
 typedef struct { uint64_t tk; mtl_rb_t rb; int swap; } pjob_t;
 static pjob_t g_jq[3]; static int g_jn, g_jbusy, g_worker_started, g_async_on;
@@ -196,14 +205,17 @@ static void *present_worker(void *arg) {
         pjob_t j = g_jq[0]; g_jbusy = 1;
         pthread_mutex_unlock(&g_mu);
         const uint8_t *src = mtl_read_async_wait(&j.rb);                       // the GPU is done with the frame
-        pthread_mutex_lock(&g_mu);
         size_t n = (size_t)j.rb.w * j.rb.h;
-        if (src && n * 4 > g_fcap) { free(g_frame); g_frame = malloc(n * 4); g_fcap = n * 4; }
-        if (src && g_frame) {
-            if (j.swap) { uint8_t *d = g_frame; for (size_t i = 0; i < n; i++) { d[i * 4] = src[i * 4 + 2]; d[i * 4 + 1] = src[i * 4 + 1]; d[i * 4 + 2] = src[i * 4]; d[i * 4 + 3] = src[i * 4 + 3]; } }
-            else memcpy(g_frame, src, n * 4);
-            g_fw = j.rb.w; g_fh = j.rb.h;
+        pthread_mutex_lock(&g_mu); fbuf_t *b = &g_fb[g_ib[FB_W]]; pthread_mutex_unlock(&g_mu);      // only this thread moves the back buffer's role, so it stays this one
+        if (src) fb_fit(b, n * 4);
+        int got = src && b->p;
+        if (got) {                                                             // outside the lock
+            if (j.swap) { uint8_t *d = b->p; for (size_t i = 0; i < n; i++) { d[i * 4] = src[i * 4 + 2]; d[i * 4 + 1] = src[i * 4 + 1]; d[i * 4 + 2] = src[i * 4]; d[i * 4 + 3] = src[i * 4 + 3]; } }
+            else memcpy(b->p, src, n * 4);
+            b->w = j.rb.w; b->h = j.rb.h;
         }
+        pthread_mutex_lock(&g_mu);
+        if (got) { int t = g_ib[FB_F]; g_ib[FB_F] = g_ib[FB_W]; g_ib[FB_W] = t; g_last = g_ib[FB_F]; }
         if (j.tk > g_pub) g_pub = j.tk;
         if (!g_sink_sdl) g_shown = g_pub;
         for (int i = 1; i < g_jn; i++) g_jq[i - 1] = g_jq[i];
@@ -290,8 +302,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     }
     pthread_mutex_lock(&g_mu);
     sink_init();
-    if ((size_t)w * h * 4 > g_fcap) { free(g_frame); g_frame = malloc((size_t)w * h * 4); g_fcap = (size_t)w * h * 4; }
-    memcpy(g_frame, px, (size_t)w * h * 4); g_fw = (uint32_t)w; g_fh = (uint32_t)h;
+    { fbuf_t *b = &g_fb[g_ib[FB_F]]; fb_fit(b, (size_t)w * h * 4);
+      if (b->p) { memcpy(b->p, px, (size_t)w * h * 4); b->w = (uint32_t)w; b->h = (uint32_t)h; g_last = g_ib[FB_F]; } }
     tk = ++g_ticket; if (tk > g_pub) g_pub = tk; g_last_time = now_s();
     if (!g_sink_sdl) g_shown = g_ticket;
     atomic_fetch_add(&g_count, 1);
@@ -329,8 +341,9 @@ uint64_t nvn_present_count(void) { return atomic_load(&g_count); }
 int nvn_present_quit_requested(void) { return __atomic_load_n(&g_quit, __ATOMIC_ACQUIRE); }
 int nvn_present_last(uint32_t *w, uint32_t *h, uint8_t *rgba, size_t cap) {
     pthread_mutex_lock(&g_mu);
-    int ok = g_frame && g_fw && g_fh;
-    if (ok) { if (w) *w = g_fw; if (h) *h = g_fh; if (rgba) memcpy(rgba, g_frame, (size_t)g_fw * g_fh * 4 < cap ? (size_t)g_fw * g_fh * 4 : cap); }
+    const fbuf_t *b = g_last >= 0 ? &g_fb[g_last] : NULL;
+    int ok = b && b->p && b->w && b->h;
+    if (ok) { if (w) *w = b->w; if (h) *h = b->h; if (rgba) memcpy(rgba, b->p, (size_t)b->w * b->h * 4 < cap ? (size_t)b->w * b->h * 4 : cap); }
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
