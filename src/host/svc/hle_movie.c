@@ -32,6 +32,7 @@ typedef struct { int32_t offset, size, i32; uint32_t u32; uint8_t owns, pad[7]; 
 typedef struct dec {
     uint64_t self;                     // the guest movie::Decoder
     int type, fmt, mode;
+    int audio, ch, rate;               // an audio decoder (a type that is not a video codec): its frames are PCM, silent here
     uint64_t events;                   // movie::DecoderEvents*: four nn::os::EventType*
     int w, h, started;
     uint64_t in_mem[NIN]; int in_free[NIN], nin_free;
@@ -75,7 +76,7 @@ static uint64_t pool_take(size_t size) {
 static void pool_give(uint64_t mem) { for (int i = 0; i < g_npool; i++) if (g_pool[i].mem == mem) g_pool[i].used = 0; }
 
 // A frame's size in the output format
-static size_t frame_bytes(const dec *d) { return d->fmt == FMT_ARGB ? (size_t)d->w * d->h * 4 : (size_t)d->w * d->h * 3 / 2; }
+static size_t frame_bytes(const dec *d) { if (d->audio) return 6144 * 4; return d->fmt == FMT_ARGB ? (size_t)d->w * d->h * 4 : (size_t)d->w * d->h * 3 / 2; }
 
 static int out_slot(dec *d) {
     for (int i = 0; i < NOUT; i++) if (!d->out[i].busy) {
@@ -87,6 +88,23 @@ static int out_slot(dec *d) {
     return -1;
 }
 
+// The samples an Opus packet holds at 48 kHz, from its table-of-contents byte (a guess for any other audio codec: 20 ms)
+static int opus_samples(const uint8_t *p, int n) {
+    if (n < 1) return 960;
+    int cfg = p[0] >> 3, c = p[0] & 3, dur;                          // frame duration in 0.1 ms
+    if (cfg < 12) dur = (int[]){100, 200, 400, 600}[cfg & 3]; else if (cfg < 16) dur = (cfg & 1) ? 200 : 100; else dur = (int[]){25, 50, 100, 200}[cfg & 3];
+    int frames = c == 0 ? 1 : c == 3 ? (n > 1 ? (p[1] & 0x3f) : 1) : 2;
+    int s = frames * dur * 48 / 10; return s > 0 && s <= 5760 ? s : 960;
+}
+static void push_audio(dec *d, const uint8_t *pkt, int n, int64_t pts) {
+    int i = out_slot(d);
+    if (i < 0) { MLOG("decoder %#llx: no free output slot, a packet is dropped", (unsigned long long)d->self); return; }
+    size_t bytes = (size_t)(opus_samples(pkt, n) * d->rate / 48000) * (size_t)d->ch * 2;
+    if (bytes > frame_bytes(d)) bytes = frame_bytes(d);
+    memset((void *)(uintptr_t)d->out[i].mem, 0, bytes);
+    d->out[i].size = bytes; d->out[i].pts = pts; d->out[i].flags = 0;
+    d->ready[d->nready++] = i;
+}
 static void push_frame(dec *d, const uint8_t *const *planes, const int *stride, int src_fmt, int64_t pts) {
     int i = out_slot(d);
     if (i < 0) { MLOG("decoder %#llx: no free output slot, a frame is dropped", (unsigned long long)d->self); return; }
@@ -151,6 +169,7 @@ static void md_set_rect(uint64_t md, const char *key, int l, int t, int r, int b
     cpu_call64(c, fn, a, 6);
 }
 static void fill_format(const dec *d, uint64_t md) {
+    if (d->audio) { md_set_int(md, "channel-count", d->ch); md_set_int(md, "sample-rate", d->rate); md_set_int(md, "pcm-encoding", 2); return; }
     md_set_int(md, "width", d->w); md_set_int(md, "height", d->h);
     md_set_int(md, "stride", d->fmt == FMT_ARGB ? d->w * 4 : d->w); md_set_int(md, "slice-height", d->h);
     md_set_int(md, "color-format", d->fmt);
@@ -208,6 +227,11 @@ HLE_FORCE("_ZN5movie7Decoder9ConfigureEPNS_9MediaDataE", "movie decoder configur
     if (!d) return ST_NO_IMPL;
     int w = 0, h = 0; md_int(md, "width", &w); md_int(md, "height", &h);
     d->w = w; d->h = h;
+    if (d->type < 1 || d->type > 4) {                                // not a video codec: the audio track. Its decoded frames are silence of the packet's length (there is no audio decoder here)
+        int ch = 0, rate = 0; md_int(md, "channel-count", &ch); md_int(md, "sample-rate", &rate);
+        d->audio = 1; d->ch = ch > 0 && ch <= 8 ? ch : 2; d->rate = rate > 0 ? rate : 48000;
+        MLOG("Configure %#llx: audio type %d, %d channels at %d Hz (asked for %d, %d)", (unsigned long long)self, d->type, d->ch, d->rate, ch, rate);
+    }
     for (int i = 0; i < NIN; i++) { if (!d->in_mem[i]) d->in_mem[i] = pool_take(IN_CAP); d->in_free[i] = i; }
     d->nin_free = NIN;
 #ifdef NX_HAVE_FFMPEG
@@ -281,6 +305,7 @@ HLE_FORCE("_ZN5movie7Decoder23AcquireInputBufferIndexEPiS1_", "movie decoder inp
     if (busy >= NOUT - 2) d->held = 1;                                // the output side is full: input waits, as a hardware decoder's would (ReleaseOutputBufferIndex signals again)
     else if (d->nin_free) { *index = d->in_free[0]; memmove(d->in_free, d->in_free + 1, (size_t)--d->nin_free * sizeof *d->in_free); *left = d->nin_free; r = ST_OK; }
     pthread_mutex_unlock(&g_mu);
+    if (getenv("NX_MOVIE_LOG_ALL")) MLOG("AcquireInputBufferIndex %#llx: status %#x index %d left %d (output busy %d, ready %d)", (unsigned long long)self, r, *index, *left, busy, d->nready);
     return r;
 }
 HLE_FORCE("_ZN5movie7Decoder14GetInputBufferEiPNS_6BufferE", "movie decoder input buffer", int, h_dec_get_in, uint64_t self, int index, mbuf *b) {
@@ -294,6 +319,7 @@ HLE_FORCE("_ZN5movie7Decoder24SendInputBufferForDecodeEiiilj", "movie decoder de
     if (index < 0 || index >= NIN) return ST_BAD_ARG;
     pthread_mutex_lock(&g_mu);
     int before = d->nready;
+    if (d->audio && size > 0 && offset >= 0 && (size_t)offset + (size_t)size <= IN_CAP) push_audio(d, (const uint8_t *)(uintptr_t)d->in_mem[index] + offset, size, pts);
 #ifdef NX_HAVE_FFMPEG
     if (d->av && size > 0 && offset >= 0 && (size_t)offset + (size_t)size <= IN_CAP) av_feed(d, (const uint8_t *)(uintptr_t)d->in_mem[index] + offset, size, pts);
     else if (!d->av && size > 0 && d->w && d->h) push_frame(d, NULL, NULL, 0, pts);
@@ -306,11 +332,11 @@ HLE_FORCE("_ZN5movie7Decoder24SendInputBufferForDecodeEiiilj", "movie decoder de
         if (i >= 0) { d->out[i].size = 0; d->out[i].pts = pts; d->out[i].flags = flags; d->ready[d->nready++] = i; }
     }
     d->in_free[d->nin_free++] = index;
-    int send_fmt = d->nready > before && !d->fmt_sent && d->w;
+    int send_fmt = d->nready > before && !d->fmt_sent && (d->w || d->audio);
     if (send_fmt) d->fmt_sent = 1;
     int got = d->nready > before;
     pthread_mutex_unlock(&g_mu);
-    static unsigned n; if (n++ < 8) MLOG("SendInputBufferForDecode %#llx index %d offset %d size %d pts %lld flags %#x: %d frames ready", (unsigned long long)self, index, offset, size, (long long)pts, flags, d->nready);
+    static unsigned n; if (n++ < (getenv("NX_MOVIE_LOG_ALL") ? ~0u : 8u)) MLOG("SendInputBufferForDecode %#llx index %d offset %d size %d pts %lld flags %#x: %d frames ready", (unsigned long long)self, index, offset, size, (long long)pts, flags, d->nready);
     if (send_fmt) signal_ev(d, EV_FORMAT);
     if (got) signal_ev(d, EV_OUTPUT);
     signal_ev(d, EV_INPUT);
@@ -324,7 +350,7 @@ HLE_FORCE("_ZN5movie7Decoder24AcquireOutputBufferIndexEPiPlPjS1_", "movie decode
     int r = ST_NO_BUFFER;
     if (d->nready) { int i = d->ready[0]; memmove(d->ready, d->ready + 1, (size_t)--d->nready * sizeof *d->ready); *index = i; *pts = d->out[i].pts; *flags = d->out[i].flags; *left = d->nready; r = ST_OK; }
     pthread_mutex_unlock(&g_mu);
-    static unsigned k; if (k++ < 12) MLOG("AcquireOutputBufferIndex %#llx: status %#x index %d pts %lld", (unsigned long long)self, r, *index, (long long)*pts);
+    static unsigned k; if (k++ < (getenv("NX_MOVIE_LOG_ALL") ? ~0u : 12u)) MLOG("AcquireOutputBufferIndex %#llx: status %#x index %d pts %lld", (unsigned long long)self, r, *index, (long long)*pts);
     return r;
 }
 static int get_out(uint64_t self, int index, mbuf *b) {
@@ -335,6 +361,7 @@ static int get_out(uint64_t self, int index, mbuf *b) {
         if (n) memcpy((void *)(uintptr_t)b->base, (const void *)(uintptr_t)d->out[index].mem, n);
     } else { b->base = d->out[index].mem; b->capacity = d->out[index].cap; b->owns = 0; }
     b->offset = 0; b->size = (int32_t)n;
+    if (getenv("NX_MOVIE_LOG_ALL") && n >= 1024) { const uint8_t *m = (const uint8_t *)(uintptr_t)d->out[index].mem; const uint8_t *g = (const uint8_t *)(uintptr_t)b->base; MLOG("GetOutputBuffer %#llx index %d: %zu bytes, source Y %u %u %u (middle %u), destination %#llx Y %u %u %u (middle %u)", (unsigned long long)self, index, n, m[0], m[1], m[2], m[n / 3], (unsigned long long)b->base, g[0], g[1], g[2], g[n / 3]); }
     static unsigned k; if (k++ < 4) MLOG("GetOutputBuffer %#llx index %d: %zu bytes (client memory %s)", (unsigned long long)self, index, n, b->base == d->out[index].mem ? "no" : "yes");
     return ST_OK;
 }
@@ -349,7 +376,7 @@ HLE_FORCE("_ZN5movie7Decoder24ReleaseOutputBufferIndexEi", "movie decoder releas
     if (index < 0 || index >= NOUT) return ST_BAD_ARG;
     pthread_mutex_lock(&g_mu); d->out[index].busy = 0; int held = d->held; d->held = 0; pthread_mutex_unlock(&g_mu);
     if (held) signal_ev(d, EV_INPUT);
-    static unsigned k; if (k++ < 12) MLOG("ReleaseOutputBufferIndex %#llx index %d", (unsigned long long)self, index);
+    static unsigned k; if (k++ < (getenv("NX_MOVIE_LOG_ALL") ? ~0u : 12u)) MLOG("ReleaseOutputBufferIndex %#llx index %d", (unsigned long long)self, index);
     return ST_OK;
 }
 HLE_FORCE("_ZN5movie7Decoder15GetOutputFormatEPNS_9MediaDataE", "movie decoder format", int, h_dec_format, uint64_t self, uint64_t md) {
