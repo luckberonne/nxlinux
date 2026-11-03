@@ -17,7 +17,7 @@ import json, struct, sys
 from pathlib import Path
 
 STAGE = {'vs': 0, 'ps': 1, 'cs': 5}          # NVN_STAGE_VERTEX, FRAGMENT, COMPUTE
-KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF, KIND_C1, KIND_SBUF_UBO = 1, 2, 3, 4, 5, 6, 7, 8
+KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF, KIND_C1, KIND_SBUF_UBO, KIND_TEX_UBO = 1, 2, 3, 4, 5, 6, 7, 8, 9
 C0_SSBO = {'vs': 0x110, 'cs': 0x310, 'gs': 0x410, 'ps': 0x510}      # the stage's storage buffer table in driver segment c[0] (src/gfx/nvn/dmsh_abi.h): 16 slots of 0x10 bytes
 C0_SSBO_SLOTS = 16
 C0_CS_UBO, C0_CS_UBO_SLOTS = 0x210, 16                                 # compute: uniform slot r's address and size at 0x210 + 0x10 r; a shader that reads the slot through global memory has a storage-buffer binding for it (KIND_SBUF_UBO)
@@ -34,6 +34,15 @@ def combined_slot(t):
     if b % 8 or not C2_TEX <= b < C2_SEPTEX: return None
     return (b - C2_TEX) // 8
 NEEDS_C0, NEEDS_C1, NEEDS_C2, NEEDS_SBUF, NEEDS_TEX, NEEDS_IMG, NEEDS_GEOM = 1, 2, 4, 8, 16, 32, 64
+
+
+def ubo_texture(t):
+    """A 1D, 2D, 3D or cube texture whose combined handle the game keeps in one of its own uniform buffers (bindless: constant buffer c[3 + n], byte offset o): returns the draw path's
+    `reg` for it, (o << 8) | n, or None. The host reads the 32-bit handle from the buffer bound to uniform slot n when the draw runs."""
+    h = t['handle']; cs = t['cbuf_slot']
+    if t.get('separate') or t.get('array', 1) > 1 or not 3 <= cs < 3 + 16 or (h >> 28) != 0 or (t['type'] & 0xFF) not in SAMPLER_TYPES or t['type'] & 512 or (t['type'] & 0xFF) == 4 and t['type'] & 256: return None
+    o = (h & 0x3FFF) * 4
+    return (o << 8) | (cs - 3)
 
 
 def uniform_blocks(spirv):
@@ -113,8 +122,9 @@ def entry(key_hex, spirv, res, c1=b''):
         else: needs |= NEEDS_SBUF                                         # an address kept elsewhere
     for t in res.get('textures', []):
         slot = combined_slot(t)
-        if slot is None: needs |= NEEDS_TEX
-        else: binds.append((t['binding'], KIND_TEX, slot, t['type']))
+        if slot is not None: binds.append((t['binding'], KIND_TEX, slot, t['type']))
+        elif (u := ubo_texture(t)) is not None: binds.append((t['binding'], KIND_TEX_UBO, u, t['type']))
+        else: needs |= NEEDS_TEX
     if res.get('images'): needs |= NEEDS_IMG
     if res.get('geometry_stride'): needs |= NEEDS_GEOM
     sb = support_binding(spirv)

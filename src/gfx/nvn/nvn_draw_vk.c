@@ -202,6 +202,14 @@ static uint64_t pkey_hash(const pkey *k) {                 // over the whole key
     return h ^ (h >> 29);
 }
 
+// The texture handle a shader binding samples: the stage's slot in the driver table, or (bindless) the 32-bit word the game keeps in one of its uniform buffers
+static uint32_t bind_handle(int stage, const nvn_shbind *b) {
+    if (b->kind != NVN_SB_TEX_UBO) return S.tex[stage][b->reg];
+    const p_bind_buf *u = &S.ubo[stage][b->reg & 0xff]; uint32_t off = b->reg >> 8, h = 0;
+    if (u->addr && (uint64_t)off + 4 <= u->size) memcpy(&h, (const void *)(uintptr_t)(u->addr + off), 4);
+    return h;
+}
+
 static VkPipelineLayout make_layout(vkctx_t *c, const pkey *k, VkDescriptorSetLayout *dsl_out) {
     VkDescriptorSetLayoutBinding lb[32]; int nb = 0;
     const nvn_shader *sh[2] = {k->vs, k->fs};
@@ -210,7 +218,7 @@ static VkPipelineLayout make_layout(vkctx_t *c, const pkey *k, VkDescriptorSetLa
         for (int i = 0; i < n; i++) {
             VkShaderStageFlags st = si ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
             int j = 0; for (; j < nb; j++) if (lb[j].binding == b[i].binding) break;
-            if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].kind == NVN_SB_TEX ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : b[i].kind == NVN_SB_SBUF ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL}; }
+            if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, (b[i].kind == NVN_SB_TEX || b[i].kind == NVN_SB_TEX_UBO) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : b[i].kind == NVN_SB_SBUF ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL}; }
             lb[j].stageFlags |= st;
         }
     }
@@ -467,20 +475,21 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
         for (int si = 0; si < 2; si++) {
             int n; const nvn_shbind *b = nvn_shader_binds(sh[si], &n);
             for (int i = 0; i < n; i++) {
-                if (b[i].kind != NVN_SB_TEX) continue;
-                if (b[i].reg >= NTEXSLOT || nt == 16) { skip("a shader samples more textures than the draw path binds", &f_ntex); return 0; }
+                if (b[i].kind != NVN_SB_TEX && b[i].kind != NVN_SB_TEX_UBO) continue;
+                const uint32_t th = bind_handle(si, &b[i]);
+                if ((b[i].kind == NVN_SB_TEX && b[i].reg >= NTEXSLOT) || nt == 16) { skip("a shader samples more textures than the draw path binds", &f_ntex); return 0; }
                 { static int dd = -1; static unsigned cnt; if (dd < 0) dd = getenv("NX_DRAW_DETAIL") != NULL;
-                  if (dd && cnt < 24) { cnt++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); uint64_t sr = nvn_vk_desc_serial(S.tex[si][b[i].reg]); size_t tot = 0; char pn[300]; const char *pre = getenv("NX_FRAME_DUMP"); snprintf(pn, sizeof pn, "%s.tex%llu.ppm", pre ? pre : "nvn_draw", (unsigned long long)sr); long lit = sr ? nvn_vk_debug_lit(sr, &tot, pn) : -2;
-                    fprintf(stderr, "[dm] [nvn] draw samples handle %#x (texture id %u, sampler %u) serial %llu: %ld of %zu bytes not zero\n", S.tex[si][b[i].reg], S.tex[si][b[i].reg] & 0xfffff, S.tex[si][b[i].reg] >> 20, (unsigned long long)sr, lit, tot); } }
-                int r = nvn_vk_desc_sampled(S.tex[si][b[i].reg], (int)b[i].aux, &ti[nt]);
+                  if (dd && cnt < 24) { cnt++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); uint64_t sr = nvn_vk_desc_serial(th); size_t tot = 0; char pn[300]; const char *pre = getenv("NX_FRAME_DUMP"); snprintf(pn, sizeof pn, "%s.tex%llu.ppm", pre ? pre : "nvn_draw", (unsigned long long)sr); long lit = sr ? nvn_vk_debug_lit(sr, &tot, pn) : -2;
+                    fprintf(stderr, "[dm] [nvn] draw samples handle %#x (texture id %u, sampler %u) serial %llu: %ld of %zu bytes not zero\n", th, th & 0xfffff, th >> 20, (unsigned long long)sr, lit, tot); } }
+                int r = nvn_vk_desc_sampled(th, (int)b[i].aux, &ti[nt]);
                 { static long fser = -2; if (fser == -2) fser = getenv("NX_DRAW_SERIAL") ? atol(getenv("NX_DRAW_SERIAL")) : -1;   // NX_DRAW_SERIAL=<texture serial>: details of the draws that sample it
-                  extern uint64_t nvn_vk_desc_serial(uint32_t); if (fser >= 0 && nvn_vk_desc_serial(S.tex[si][b[i].reg]) == (uint64_t)fser) { focus = 1;
-                    fprintf(stderr, "[dm] [nvn] focus draw: stage %d slot %u handle %#x sampler type %#x result %d, prim %u, vs %p fs %p keys %016llx %016llx\n", si, b[i].reg, S.tex[si][b[i].reg], b[i].aux, r, prim, (const void *)vs, (const void *)fs, (unsigned long long)__builtin_bswap64(*(const uint64_t *)vs), (unsigned long long)__builtin_bswap64(*(const uint64_t *)fs)); } }
+                  extern uint64_t nvn_vk_desc_serial(uint32_t); if (fser >= 0 && nvn_vk_desc_serial(th) == (uint64_t)fser) { focus = 1;
+                    fprintf(stderr, "[dm] [nvn] focus draw: stage %d slot %u handle %#x sampler type %#x result %d, prim %u, vs %p fs %p keys %016llx %016llx\n", si, b[i].reg, th, b[i].aux, r, prim, (const void *)vs, (const void *)fs, (unsigned long long)__builtin_bswap64(*(const uint64_t *)vs), (unsigned long long)__builtin_bswap64(*(const uint64_t *)fs)); } }
                 { static int dd2 = -1; static unsigned cnt2; if (dd2 < 0) dd2 = getenv("NX_DRAW_DETAIL") != NULL;       // the same texture read again once the draw path has made it ready (the GPU copy)
-                  if (dd2 && cnt2 < 12) { cnt2++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); extern int mtl_tex_gpu_owned(uint64_t); uint64_t sr = nvn_vk_desc_serial(S.tex[si][b[i].reg]); size_t tot = 0; long lit = sr ? nvn_vk_debug_lit(sr, &tot, NULL) : -2;
+                  if (dd2 && cnt2 < 12) { cnt2++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); extern int mtl_tex_gpu_owned(uint64_t); uint64_t sr = nvn_vk_desc_serial(th); size_t tot = 0; long lit = sr ? nvn_vk_debug_lit(sr, &tot, NULL) : -2;
                     fprintf(stderr, "[dm] [nvn] after sampling: serial %llu result %d gpu-owned %d: %ld of %zu bytes not zero\n", (unsigned long long)sr, r, sr ? mtl_tex_gpu_owned(sr) : -1, lit, tot); } }
                 if (r != 1) {
-                    char why[160]; uint32_t h = S.tex[si][b[i].reg];
+                    char why[160]; uint32_t h = th;
                     snprintf(why, sizeof why, r == 3 ? "texture slot %u (id %u) is not the type the shader samples (type %#x)" : "texture slot %u (id %u) has no image the shader can sample and no stand-in for its type %#x", b[i].reg, h & 0xfffff, (unsigned)b[i].aux);
                     skip(why, &f_tex); return 0;
                 }
@@ -643,7 +652,7 @@ static struct cpipe *compute_pipeline(vkctx_t *c, const nvn_shader *sh) {
     VkDescriptorSetLayoutBinding lb[32]; int nb = 0; int n; const nvn_shbind *b = nvn_shader_binds(sh, &n);
     for (int i = 0; i < n; i++) {
         int j = 0; for (; j < nb; j++) if (lb[j].binding == b[i].binding) break;
-        if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].kind == NVN_SB_TEX ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : (b[i].kind == NVN_SB_SBUF || b[i].kind == NVN_SB_SBUF_UBO) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}; }
+        if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, (b[i].kind == NVN_SB_TEX || b[i].kind == NVN_SB_TEX_UBO) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : (b[i].kind == NVN_SB_SBUF || b[i].kind == NVN_SB_SBUF_UBO) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}; }
     }
     VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = (uint32_t)nb, .pBindings = lb};
     VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe;
@@ -675,9 +684,9 @@ void nvn_dispatch(const p_dispatch *d) {
     VkDescriptorImageInfo ti[16]; uint32_t tbind[16]; int nt = 0;
     int n; const nvn_shbind *b = nvn_shader_binds(sh, &n);
     for (int i = 0; i < n; i++) {
-        if (b[i].kind != NVN_SB_TEX) continue;
-        if (b[i].reg >= NTEXSLOT || nt == 16) { skip("a compute shader samples more textures than the dispatch path binds", &f_tex); return; }
-        int r = nvn_vk_desc_sampled(S.tex[5][b[i].reg], (int)b[i].aux, &ti[nt]);
+        if (b[i].kind != NVN_SB_TEX && b[i].kind != NVN_SB_TEX_UBO) continue;
+        if ((b[i].kind == NVN_SB_TEX && b[i].reg >= NTEXSLOT) || nt == 16) { skip("a compute shader samples more textures than the dispatch path binds", &f_tex); return; }
+        int r = nvn_vk_desc_sampled(bind_handle(5, &b[i]), (int)b[i].aux, &ti[nt]);
         if (r != 1) { skip("a compute shader reads a texture that cannot be sampled", &f_tex); return; }
         tbind[nt++] = b[i].binding;
     }

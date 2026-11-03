@@ -42,9 +42,14 @@ class Packer(unittest.TestCase):
         for ty in (1, 5, 3 | 256, 5 | 256, 3 | 1024):             # 1D, cube, 2D array, cube array, a 2D shadow sampler
             [x] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', {'stage': 'ps', 'textures': [{**t, 'type': ty}]})]))
             self.assertEqual((x['needs'], x['binds'][0][3]), (0, ty))
-        for bad in ({'separate': True}, {'cbuf_slot': 3}, {'handle': 8 + (1 << 28)}, {'handle': 9}, {'array': 4}, {'type': 3 | 512}, {'type': 2}, {'type': 4 | 256}):
+        for bad in ({'separate': True}, {'cbuf_slot': 19}, {'handle': 8 + (1 << 28)}, {'handle': 9}, {'array': 4}, {'type': 3 | 512}, {'type': 2}, {'type': 4 | 256}):
             [x] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', {'stage': 'ps', 'textures': [{**t, **bad}]})]))
             self.assertEqual((x['needs'], x['binds']), (shader_pack.NEEDS_TEX, []))
+
+    def test_bindless_texture_from_a_uniform_buffer(self):
+        t = {'binding': 5, 'type': 3, 'handle': 24, 'cbuf_slot': 11, 'array': 1, 'separate': False}       # word 24 = byte 96 of c[11] = the game's uniform slot 8
+        [e] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', {'stage': 'ps', 'textures': [t]})]))
+        self.assertEqual((e['needs'], e['binds']), (0, [(5, shader_pack.KIND_TEX_UBO, (96 << 8) | 8, 3)]))
 
     def test_bad_input(self):
         with self.assertRaises(ValueError): shader_pack.entry('00', b'\0\0\0\0', {'stage': 'ps'})
