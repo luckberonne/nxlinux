@@ -12,7 +12,11 @@ if [ -z "${VK_DRIVER_FILES+x}" ] && [ -z "$NX_GPU" ] && [ -f /usr/share/vulkan/i
     [ -z "${__GLX_VENDOR_LIBRARY_NAME+x}" ] && export __GLX_VENDOR_LIBRARY_NAME=mesa
 fi
 # The shared fonts: the game looks up U+25A1 in every one of them and crashes if none has it, so a font with that glyph (DejaVu Sans, not Noto Sans)
-[ -z "${NX_SHARED_FONT+x}" ] && NX_SHARED_FONT=$(fc-match -f '%{file}' 'sans:charset=25a1' 2>/dev/null) && export NX_SHARED_FONT
+# (work/run/ssbu/switch_ext.ttf, made by tools/make_switch_font.py from it, adds the button icons the game's text uses, U+E0E0 and on; without it they show as squares)
+if [ -z "${NX_SHARED_FONT+x}" ]; then
+    if [ -f work/run/ssbu/switch_ext.ttf ]; then NX_SHARED_FONT=work/run/ssbu/switch_ext.ttf; else NX_SHARED_FONT=$(fc-match -f '%{file}' 'sans:charset=25a1' 2>/dev/null); fi
+    export NX_SHARED_FONT
+fi
 # The 99 add-on contents the user owns (ids from the DLC NSPs, work/run/ssbu/dlc_ids.txt, one id a line): listed to the title as owned, with no data of their own
 AOC=""; if [ -f work/run/ssbu/dlc_ids.txt ]; then for id in $(cat work/run/ssbu/dlc_ids.txt); do AOC="$AOC --aoc $id:"; done; fi
 # The game's text comes from linear glyph atlases the font engine fills after their first use: the CPU writes to them are tracked and uploaded again (hle_nvn.c, NX_TEX_DIRTY_UPLOAD / NX_TEX_LINEAR)

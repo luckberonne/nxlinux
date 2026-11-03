@@ -432,8 +432,8 @@ void nvn_ft_poll(void) {
     { static unsigned nl; static int lg = -1; if (lg < 0) lg = getenv("NX_TEX_LOG") != NULL; if (lg) for (size_t i = 0; i < nhit; i++) if (nl++ < 60) fprintf(stderr, "[dm] [nvn] texture %llu (%dx%d, format %#x) was written by the CPU after its first use: %s\n", (unsigned long long)hit[i].serial, hit[i].d.width, hit[i].d.height, hit[i].d.format, mtl_tex_gpu_owned(hit[i].serial) ? "the GPU owns it, left alone" : "uploaded again"); }
     for (size_t i = 0; i < nhit; i++) {                              // outside g_ft_mu
         if (!mtl_tex_gpu_owned(hit[i].serial)) mtl_tex_cpu_written(&hit[i]);
-        // A glyph atlas goes on being written (a letter at a time, as text shows up): it is registered again, its pages write-protected again, and the next write is seen too
-        if (tex_linear_on() && (hit[i].d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && !mtl_tex_gpu_owned(hit[i].serial)) ft_add(&hit[i]);
+        // A glyph atlas goes on being written (a letter at a time, as text shows up), and so does a picture the title decodes in pieces: it is registered again, its pages write-protected again, and the next write is seen too
+        if (tex_linear_on() && !mtl_tex_gpu_owned(hit[i].serial)) ft_add(&hit[i]);       // (a portrait the title streams in chunks is written more than once as well)
     }
 }
 static void ft_flush(const uint8_t *a, uint64_t n) {
