@@ -116,7 +116,8 @@ static void *sdl_thread(void *arg) {
         }
         if (copy) {
             if (!win) {
-                win = SDL_CreateWindow("nxlinux", (int)w, (int)h, SDL_WINDOW_RESIZABLE);
+                { const char *id = getenv("NX_APP_ID"); if (id && *id) SDL_SetHint(SDL_HINT_APP_ID, id); }     // NX_APP_ID: the desktop file's StartupWMClass finds the window (KDE shows the title's icon), NX_WINDOW_TITLE its name
+                { const char *t = getenv("NX_WINDOW_TITLE"); win = SDL_CreateWindow(t && *t ? t : "nxlinux", (int)w, (int)h, SDL_WINDOW_RESIZABLE); }
                 rr = win ? SDL_CreateRenderer(win, NULL) : NULL;
                 if (!rr) { fprintf(stderr, "[dm] [RED] [nvn] no SDL window or renderer (%s): frames go to memory only\n", SDL_GetError()); goto fail; }
                 { const char *v = getenv("NX_SDL_VSYNC"); SDL_SetRenderVSync(rr, v && *v == '0' ? 0 : 1); }      // NX_SDL_VSYNC=0: present without waiting for the display

@@ -13,4 +13,8 @@ if [ -z "${VK_DRIVER_FILES+x}" ] && [ -z "$NX_GPU" ] && [ -f /usr/share/vulkan/i
 fi
 # The shared fonts: the game looks up U+25A1 in every one of them and crashes if none has it, so a font with that glyph (DejaVu Sans, not Noto Sans)
 [ -z "${NX_SHARED_FONT+x}" ] && NX_SHARED_FONT=$(fc-match -f '%{file}' 'sans:charset=25a1' 2>/dev/null) && export NX_SHARED_FONT
-NX_PRESENT=${NX_PRESENT:-sdl} exec "$B/nxlinux" --manifest work/run/ssbu/modules.txt --romfs work/run/ssbu/extract/RomFS.img --sys-resource 0x1000000 $SH
+# The 99 add-on contents the user owns (ids from the DLC NSPs, work/run/ssbu/dlc_ids.txt, one id a line): listed to the title as owned, with no data of their own
+AOC=""; if [ -f work/run/ssbu/dlc_ids.txt ]; then for id in $(cat work/run/ssbu/dlc_ids.txt); do AOC="$AOC --aoc $id:"; done; fi
+# KDE finds the window by this id (nxlinux-smash.desktop's StartupWMClass) and shows the title's icon
+export NX_APP_ID=${NX_APP_ID:-nxlinux-smash} NX_WINDOW_TITLE=${NX_WINDOW_TITLE:-"Super Smash Bros. Ultimate"}
+NX_PRESENT=${NX_PRESENT:-sdl} exec "$B/nxlinux" --manifest work/run/ssbu/modules.txt --romfs work/run/ssbu/extract/RomFS.img --sys-resource 0x1000000 $SH $AOC

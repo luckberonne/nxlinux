@@ -62,11 +62,14 @@ static uint32_t apm(int session, const ipc_in_t *in, ipc_out_t *out) {
 
 // ---- aoc:u: add-on content. What --aoc gave (an id and its RomFS image, held in memory: the DLC of a title is often only a licence file); index = id - base id.
 typedef struct { const uint8_t *img; uint64_t size; } mem_storage_t;
-static struct { uint64_t id; mem_storage_t st; } g_aoc[32]; static int g_naoc;
+static struct { uint64_t id; mem_storage_t st; } g_aoc[128]; static int g_naoc;
 static uint64_t aoc_base(void) { return mem_default_profile().program_id + 0x1000; }
 int aoc_add(const char *arg) {
     char *end; uint64_t id = strtoull(arg, &end, 16);
-    if (*end != ':' || g_naoc == 32) { fprintf(stderr, "[RED] aoc: --aoc wants <id>:<RomFS image>, got %s\n", arg); return -1; }
+    if (*end != ':' || g_naoc == 128) { fprintf(stderr, "[RED] aoc: --aoc wants <id>:<RomFS image>, got %s\n", arg); return -1; }
+    if (!end[1]) {      // <id>: with no image: the title owns the add-on content (it is listed) but the host has no data for it (a licence only)
+        g_aoc[g_naoc].id = id; g_aoc[g_naoc].st = (mem_storage_t){NULL, 0}; g_naoc++; return 0;
+    }
     FILE *f = fopen(end + 1, "rb");
     if (!f) { fprintf(stderr, "[RED] aoc: cannot open %s\n", end + 1); return -1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
@@ -77,7 +80,7 @@ int aoc_add(const char *arg) {
     fprintf(stderr, "[dm] aoc: add-on content %016llx installed (%ld bytes of RomFS)\n", (unsigned long long)id, n);
     return 0;
 }
-static const mem_storage_t *aoc_storage(uint64_t id) { for (int i = 0; i < g_naoc; i++) if (g_aoc[i].id == id) return &g_aoc[i].st; return NULL; }
+static const mem_storage_t *aoc_storage(uint64_t id) { for (int i = 0; i < g_naoc; i++) if (g_aoc[i].id == id) return g_aoc[i].st.img ? &g_aoc[i].st : NULL; return NULL; }
 static uint32_t aoc(int session, const ipc_in_t *in, ipc_out_t *out) {
     (void)session;
     switch (in->cmd) {
