@@ -187,17 +187,21 @@ static mix_t *mix_by_id(ar_mixer_t *m, int id) {
 uint32_t ar_mixer_update(ar_mixer_t *m, const uint8_t *in, uint32_t in_size, uint8_t *out, uint32_t out_size) {
     if (in_size < HDR) return 0xc01u;
     uint32_t behavior = rd32(in + 4), pools = rd32(in + 8), voices = rd32(in + 12), chans = rd32(in + 16), effects = rd32(in + 20), mixes = rd32(in + 24), sinks = rd32(in + 28), perf = rd32(in + 32);
-    if ((uint64_t)HDR + behavior + pools + chans + voices + effects + mixes + sinks > in_size) return 0xc01u;
+    if ((uint64_t)HDR + behavior + pools + chans + voices + effects + mixes + sinks > in_size) { fprintf(stderr, "[RED] audren: the update (revision word %#x) does not fit its header: %u bytes, sections behavior %u pools %u voices %u channels %u effects %u mixes %u sinks %u\n", rd32(in), in_size, behavior, pools, voices, chans, effects, mixes, sinks); return 0xc01u; }
+    { static int once; if (!once++) fprintf(stderr, "[dm] audren: update revision word %#x (\"%.4s\"), sections behavior %u pools %u voices %u channels %u effects %u mixes %u sinks %u perf %u, %u bytes in, %u out\n", rd32(in), (const char *)in, behavior, pools, voices, chans, effects, mixes, sinks, perf, in_size, out_size); }
     uint32_t npool = pools / MEMPOOL_IN, nvoice = voices / VOICE_IN, nchan = chans / CHAN_IN, neffect = effects / EFFECT_IN, nsink = sinks / SINK_IN;
     if (nvoice > m->nvoice) nvoice = m->nvoice;
     if (nchan > MAX_CHANS) nchan = MAX_CHANS;
     uint32_t o_pool = npool * MEMPOOL_OUT, o_voice = nvoice * VOICE_OUT, o_effect = neffect * EFFECT_OUT, o_sink = nsink * SINK_OUT, o_perf = perf ? PERF_OUT : 0;
-    uint32_t total = HDR + o_pool + o_voice + o_effect + o_sink + o_perf + BEHAVIOR_OUT;
+    // From revision 7 the response carries a render info block too (the frame count the DSP has rendered), after the behaviour block, its size in the header's word 10; the title's own
+    // update tells the revision as 'REV<n>' (0x4e564552 with the digit in the top byte), and a response without the block fails the SDK's check (2153-0041, an abort in Mario Party Superstars)
+    int rev = (int)((rd32(in) >> 24) - '0'); uint32_t o_render = rev >= 7 ? 0x10 : 0;
+    uint32_t total = HDR + o_pool + o_voice + o_effect + o_sink + o_perf + BEHAVIOR_OUT + o_render;
     if (total > out_size) { fprintf(stderr, "[RED] audren: the response (%#x bytes) does not fit the output buffer (%#x)\n", total, out_size); return 0xc01u; }
     const uint8_t *p = in + HDR + behavior;
     memset(out, 0, total);
     uint32_t *oh = (uint32_t *)out;
-    oh[0] = rd32(in); oh[1] = BEHAVIOR_OUT; oh[2] = o_pool; oh[3] = o_voice; oh[5] = o_effect; oh[7] = o_sink; oh[8] = o_perf; oh[15] = total;
+    oh[0] = rd32(in); oh[1] = BEHAVIOR_OUT; oh[2] = o_pool; oh[3] = o_voice; oh[5] = o_effect; oh[7] = o_sink; oh[8] = o_perf; oh[10] = o_render; oh[15] = total;
     // Memory pools: a pool the title asks to attach is attached, one it asks to detach is detached
     for (uint32_t i = 0; i < npool; i++) { uint32_t st = rd32(p + i * MEMPOOL_IN + 0x10); oh[(HDR + i * MEMPOOL_OUT) / 4] = st == 4 ? 5 : st == 2 ? 3 : 0; }
     p += pools;

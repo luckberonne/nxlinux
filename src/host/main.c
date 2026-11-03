@@ -53,6 +53,9 @@ int main(int argc, char **argv) {
     if (arch32) { mp.heap = 0x80000000; mp.app_pool = 0xC0000000; }      // a 32-bit title asks for its heap in one piece (Mario Kart 8 Deluxe: SetMemoryHeapSize(0x78000000))
     else {
         mp.heap = 0xD0000000; mp.app_pool = 0xCD500000; mp.stack = 0x10000000;      // a 64-bit retail title (Mario Kart 8 Deluxe 4.x: SetHeapSize(0xc1c00000)) asks for 3 GB of heap
+        // NX_APP_POOL_MB=<n>: the memory the application may use (what its heap and its modules' images are counted against): Mario Party Superstars asks for a heap of 0xcd000000 and its
+        // modules take 44 MB more, which the 3,285 MB above does not hold (SetHeapSize failed with 0x10801); the heap region itself is 3,328 MB
+        { const char *pm = getenv("NX_APP_POOL_MB"); if (pm && atoll(pm) > 0 && ((uint64_t)atoll(pm) << 20) <= mp.heap) mp.app_pool = (uint64_t)atoll(pm) << 20; }
         // The alias region of a 39-bit process is 64 GB on the console, and the SDK's address region manager (nn::os::AllocateAddressRegion) hands out pieces of it:
         // Super Smash Bros. Ultimate's engine reserves 62 GB there in a static constructor and aborts if it does not get them. Only reserved here (PROT_NONE, MAP_NORESERVE):
         // a page costs memory once the title maps it with MapPhysicalMemory. NX_ALIAS_MB=<n> sets another size (256 MB was the size before).

@@ -94,7 +94,7 @@ static uint32_t renderer(int session, const ipc_in_t *in, ipc_out_t *out) {
     case 2: OUT32(r->p[2]); return 0;                       // GetMixBufferCount
     case 3: OUT32(r->started ? 0 : 1); return 0;            // GetState: 0 started, 1 stopped
     case 4: case 10: {                                      // RequestUpdate / RequestUpdateAuto(input buffer; output and performance buffers)
-        if (!in->nsend || !in->nrecv) return 0xc01u;
+        if (!in->nsend || !in->nrecv) { static int once; if (!once++) { fprintf(stderr, "[RED] audren: RequestUpdate (command %u) came with %u input and %u output buffers; args %u:", in->cmd, in->nsend, in->nrecv, in->nargs); for (unsigned i = 0; i < in->nargs && i < 6; i++) fprintf(stderr, " %#x", in->args[i]); for (unsigned i = 0; i < in->nsend; i++) fprintf(stderr, " in[%#llx+%#x]", (unsigned long long)in->send[i].addr, in->send[i].size); for (unsigned i = 0; i < in->nrecv; i++) fprintf(stderr, " out[%#llx+%#x]", (unsigned long long)in->recv[i].addr, in->recv[i].size); fprintf(stderr, "\n"); } return 0xc01u; }
         pthread_mutex_lock(&r->lock);
         uint32_t rc = ar_mixer_update(r->mix, (const uint8_t *)(uintptr_t)in->send[0].addr, in->send[0].size, (uint8_t *)(uintptr_t)in->recv[0].addr, in->recv[0].size);
         pthread_mutex_unlock(&r->lock);

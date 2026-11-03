@@ -11,6 +11,9 @@ static const Uid k_uid = {{0x78626c0000000001ull, 0x53574e4154495645ull}};   // 
 
 HLE_FORCE("_ZN2nn7account10InitializeEv", "connects to the acc:u0 account service; the host has one fixed local user", void, h_acc_Init, void) {}
 
+// SDK 12's nn::account::Initialize() is one tail branch to this (4 bytes: too short to take over), and this one opens the acc:u0 session
+HLE_FORCE("_ZN2nn7account6detail24InitializeForApplicationEv", "the account service connection that nn::account::Initialize() branches to; the host has one fixed local user (Mario Party Superstars)", void, h_acc_InitApp, void) {}
+
 HLE_FORCE("_ZN2nn7account13ListOpenUsersEPiPNS0_3UidEi", "list of open users; always the one local user", Result, h_acc_ListOpen, int *n, Uid *out, int max) {
     *n = 0;
     if (max > 0) { out[0] = k_uid; *n = 1; }

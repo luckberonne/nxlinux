@@ -227,7 +227,7 @@ enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=
        I_ProgramId=18, I_InitProcIdRange=19, I_UserExcAddr=20, I_TotalNonSys=21, I_UsedNonSys=22, I_IsApplication=23, I_FreeThreadCount=24 };
 
 static uint64_t used_memory(void) {          // caller holds g_map_lock
-    uint64_t v = g_heap_cur + g_p.mem_used;
+    uint64_t v = g_heap_cur + g_p.mem_used + module_image_bytes();      // the code and data of the modules count as used, as SetHeapSize charges them (Mario Party Superstars asks for total - used)
     if (g_p.map_limit) v += (uint64_t)atomic_load(&g_alias_mapped);   // with a pool limit the alias pages count too, as on Horizon
     return v;
 }
