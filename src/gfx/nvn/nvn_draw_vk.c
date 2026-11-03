@@ -54,6 +54,7 @@ static struct {
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
     uint32_t attr[16]; int nattr; vs_st stream[16]; int nstream; NVNbufferRange vbuf[16];
     p_bind_buf ubo[6][16], ssbo[6][16];
+    uint32_t img[6][8];                         // the image handle bound to each image slot of each stage (nvnCommandBufferBindImage)
     uint32_t tex[6][NTEXSLOT];                  // the combined handle (texture id | sampler id << 20) bound to each texture slot of each stage
     float vp[16][6]; int has_vp; float dr[2]; int has_dr; p_poly_offset po; float blend_color[4];
     int st_vmask[2], st_wmask[2], st_ref[2];
@@ -116,6 +117,10 @@ int nvn_draw_state_op(uint32_t op, const void *a) {
             int slot = b->first + i;
             if (b->stage >= 0 && b->stage < 6 && slot >= 0 && slot < NTEXSLOT) S.tex[b->stage][slot] = (uint32_t)h;
         }
+        return 1; }
+    case OP_BIND_IMG: {
+        p_bind_handles tmp; const p_bind_handles *b = bind_rec(op, a, &tmp);
+        for (int i = 0; i < b->n; i++) { int slot = b->first + i; if (b->stage >= 0 && b->stage < 6 && slot >= 0 && slot < 8) S.img[b->stage][slot] = (uint32_t)b->h[i]; }
         return 1; }
     case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) S.ssbo[b->stage][b->index] = *b; return 1; }
     case OP_VIEWPORTS: { const p_viewports *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) memcpy(S.vp[b->first + i], b->v[i], sizeof S.vp[0]); S.has_vp = 1; return 1; }
@@ -211,14 +216,14 @@ static uint32_t bind_handle(int stage, const nvn_shbind *b) {
 }
 
 static VkPipelineLayout make_layout(vkctx_t *c, const pkey *k, VkDescriptorSetLayout *dsl_out) {
-    VkDescriptorSetLayoutBinding lb[32]; int nb = 0;
+    VkDescriptorSetLayoutBinding lb[64]; int nb = 0;
     const nvn_shader *sh[2] = {k->vs, k->fs};
     for (int si = 0; si < 2; si++) {
         int n; const nvn_shbind *b = nvn_shader_binds(sh[si], &n);
         for (int i = 0; i < n; i++) {
             VkShaderStageFlags st = si ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
             int j = 0; for (; j < nb; j++) if (lb[j].binding == b[i].binding) break;
-            if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, (b[i].kind == NVN_SB_TEX || b[i].kind == NVN_SB_TEX_UBO) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : b[i].kind == NVN_SB_SBUF ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL}; }
+            if (j == nb) { if (nb == 64) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].kind == NVN_SB_IMG ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : (b[i].kind == NVN_SB_TEX || b[i].kind == NVN_SB_TEX_UBO) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : b[i].kind == NVN_SB_SBUF ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL}; }
             lb[j].stageFlags |= st;
         }
     }
@@ -469,15 +474,20 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
         skip(why, &f_needs); return 0;
     }
     // Textures first: filling a dirty one copies into its image, which cannot happen inside a render pass (this ends the pass; it is opened below)
-    VkDescriptorImageInfo ti[16]; uint32_t tbind[16]; int nt = 0;
+    VkDescriptorImageInfo ti[32], ii[8]; uint32_t tbind[32], ibind[8]; int nt = 0, ni = 0;
     {
         const nvn_shader *sh[2] = {vs, fs};
         for (int si = 0; si < 2; si++) {
             int n; const nvn_shbind *b = nvn_shader_binds(sh[si], &n);
             for (int i = 0; i < n; i++) {
+                if (b[i].kind == NVN_SB_IMG) {
+                    VkFormat ifmt;
+                    if (b[i].reg >= 8 || ni == 8 || !nvn_vk_desc_storage(S.img[si][b[i].reg], &ii[ni], &ifmt)) {
+                        char why[160]; snprintf(why, sizeof why, "image slot %u (handle %#x) has no storage image the shader can use", b[i].reg, S.img[si][b[i].reg & 7]); skip(why, &f_tex); return 0; }
+                    ibind[ni++] = b[i].binding; continue; }
                 if (b[i].kind != NVN_SB_TEX && b[i].kind != NVN_SB_TEX_UBO) continue;
                 const uint32_t th = bind_handle(si, &b[i]);
-                if ((b[i].kind == NVN_SB_TEX && b[i].reg >= NTEXSLOT) || nt == 16) { skip("a shader samples more textures than the draw path binds", &f_ntex); return 0; }
+                if ((b[i].kind == NVN_SB_TEX && b[i].reg >= NTEXSLOT) || nt == 32) { skip("a shader samples more textures than the draw path binds", &f_ntex); return 0; }
                 { static int dd = -1; static unsigned cnt; if (dd < 0) dd = getenv("NX_DRAW_DETAIL") != NULL;
                   if (dd && cnt < 24) { cnt++; extern uint64_t nvn_vk_desc_serial(uint32_t); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *); uint64_t sr = nvn_vk_desc_serial(th); size_t tot = 0; char pn[300]; const char *pre = getenv("NX_FRAME_DUMP"); snprintf(pn, sizeof pn, "%s.tex%llu.ppm", pre ? pre : "nvn_draw", (unsigned long long)sr); long lit = sr ? nvn_vk_debug_lit(sr, &tot, pn) : -2;
                     fprintf(stderr, "[dm] [nvn] draw samples handle %#x (texture id %u, sampler %u) serial %llu: %ld of %zu bytes not zero\n", th, th & 0xfffff, th >> 20, (unsigned long long)sr, lit, tot); } }
@@ -596,11 +606,11 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
     }
     // uniform buffers: each binding of each shader names a uniform slot of its stage; an unbound slot reads zeros
     {
-        VkDescriptorBufferInfo bi[32]; VkWriteDescriptorSet wr[32]; int nw = 0;
+        VkDescriptorBufferInfo bi[64]; VkWriteDescriptorSet wr[64]; int nw = 0;
         const nvn_shader *sh[2] = {vs, fs};
         for (int si = 0; si < 2; si++) {
             int n; const nvn_shbind *b = nvn_shader_binds(sh[si], &n);
-            for (int i = 0; i < n && nw < 32; i++) {
+            for (int i = 0; i < n && nw < 64; i++) {
                 if (b[i].kind == NVN_SB_SUPPORT || b[i].kind == NVN_SB_DRV0 || b[i].kind == NVN_SB_DRV2) {
                     uint64_t tb = dnow();
                     bi[nw] = driver_buffer(c, (int)b[i].kind, si, vw, vh);
@@ -635,7 +645,9 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
                 nw++;
             }
         }
-        for (int i = 0; i < nt && nw < 32; i++)
+        for (int i = 0; i < ni && nw < 64; i++)
+            wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = ibind[i], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[i]};
+        for (int i = 0; i < nt && nw < 64; i++)
             wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = tbind[i], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ti[i]};
         if (nw) c->CmdPushDescriptorSet(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pe->layout, 0, (uint32_t)nw, wr);
     }
@@ -652,7 +664,7 @@ static struct cpipe *compute_pipeline(vkctx_t *c, const nvn_shader *sh) {
     VkDescriptorSetLayoutBinding lb[32]; int nb = 0; int n; const nvn_shbind *b = nvn_shader_binds(sh, &n);
     for (int i = 0; i < n; i++) {
         int j = 0; for (; j < nb; j++) if (lb[j].binding == b[i].binding) break;
-        if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, (b[i].kind == NVN_SB_TEX || b[i].kind == NVN_SB_TEX_UBO) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : (b[i].kind == NVN_SB_SBUF || b[i].kind == NVN_SB_SBUF_UBO) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}; }
+        if (j == nb) { if (nb == 32) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].kind == NVN_SB_IMG ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : (b[i].kind == NVN_SB_TEX || b[i].kind == NVN_SB_TEX_UBO) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : (b[i].kind == NVN_SB_SBUF || b[i].kind == NVN_SB_SBUF_UBO) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}; }
     }
     VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = (uint32_t)nb, .pBindings = lb};
     VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe;

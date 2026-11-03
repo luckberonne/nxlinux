@@ -17,12 +17,13 @@ import json, struct, sys
 from pathlib import Path
 
 STAGE = {'vs': 0, 'ps': 1, 'cs': 5}          # NVN_STAGE_VERTEX, FRAGMENT, COMPUTE
-KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF, KIND_C1, KIND_SBUF_UBO, KIND_TEX_UBO = 1, 2, 3, 4, 5, 6, 7, 8, 9
+KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF, KIND_C1, KIND_SBUF_UBO, KIND_TEX_UBO, KIND_IMG = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
 C0_SSBO = {'vs': 0x110, 'cs': 0x310, 'gs': 0x410, 'ps': 0x510}      # the stage's storage buffer table in driver segment c[0] (src/gfx/nvn/dmsh_abi.h): 16 slots of 0x10 bytes
 C0_SSBO_SLOTS = 16
 C0_CS_UBO, C0_CS_UBO_SLOTS = 0x210, 16                                 # compute: uniform slot r's address and size at 0x210 + 0x10 r; a shader that reads the slot through global memory has a storage-buffer binding for it (KIND_SBUF_UBO)
 SAMPLER_TYPES = {1, 3, 4, 5}                 # the translator's SamplerType 1D, 2D, 3D and cube; Array (256) and Shadow (1024) may be added, Multisample (512) and buffers (2) may not
-C2_TEX, C2_SEPTEX = 0x20, 0x168               # byte offsets in driver segment c[2] (src/gfx/nvn/dmsh_abi.h): combined handles, and where the separate textures start
+C2_TEX, C2_SEPTEX = 0x20, 0x168
+C2_IMG, C2_IMG_SLOTS = 0x120, 8             # the image table of c[2]: slot r at 0x120 + 8 r               # byte offsets in driver segment c[2] (src/gfx/nvn/dmsh_abi.h): combined handles, and where the separate textures start
 
 
 def combined_slot(t):
@@ -34,6 +35,15 @@ def combined_slot(t):
     if b % 8 or not C2_TEX <= b < C2_SEPTEX: return None
     return (b - C2_TEX) // 8
 NEEDS_C0, NEEDS_C1, NEEDS_C2, NEEDS_SBUF, NEEDS_TEX, NEEDS_IMG, NEEDS_GEOM = 1, 2, 4, 8, 16, 32, 64
+
+
+def image_slot(t):
+    """The c[2] image slot of a plain 2D storage image bound the usual way (nvnCommandBufferBindImage), or None for anything else (arrays, other targets, handles from the game's own buffers)"""
+    h = t['handle']
+    if t.get('separate') or t.get('array', 1) > 1 or t['cbuf_slot'] not in (-1, 2) or (h >> 28) != 0 or t['type'] != 3: return None
+    b = (h & 0x3FFF) * 4
+    if b % 8 or not C2_IMG <= b < C2_IMG + 8 * C2_IMG_SLOTS: return None
+    return (b - C2_IMG) // 8
 
 
 def ubo_texture(t):
@@ -125,7 +135,9 @@ def entry(key_hex, spirv, res, c1=b''):
         if slot is not None: binds.append((t['binding'], KIND_TEX, slot, t['type']))
         elif (u := ubo_texture(t)) is not None: binds.append((t['binding'], KIND_TEX_UBO, u, t['type']))
         else: needs |= NEEDS_TEX
-    if res.get('images'): needs |= NEEDS_IMG
+    for t in res.get('images', []):
+        if (b := image_slot(t)) is not None: binds.append((t['binding'], KIND_IMG, b, t['type']))
+        else: needs |= NEEDS_IMG
     if res.get('geometry_stride'): needs |= NEEDS_GEOM
     sb = support_binding(spirv)
     if sb is not None: binds.append((sb, KIND_SUPPORT, 0, 0))

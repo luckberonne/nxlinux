@@ -1054,6 +1054,33 @@ static VkComponentSwizzle swz_compose(unsigned user, const VkComponentSwizzle fm
 
 // A sampling view of a texture for the draw being prepared: the registered view's levels, layers, format and swizzle on the texture's own target. Fills the image from its storage first
 // when that is dirty, which ends the render pass (a copy cannot happen inside one), so the caller opens the pass after calling this. *code is the SamplerType the view presents.
+// A texture as a 2D storage image for a shader's image binding (nvnCommandBufferBindImage): the view's base level and layer, the image's own format, no swizzle. Cached with the sampling views (swz key ~0).
+int nvn_vk_tex_storage(uint64_t serial, const view_t *v, int has_view, VkImageView *out, VkFormat *fmt_out) {
+    static int bad;
+    vkctx_t *c = nvn_vk_ctx();
+    vktex_t *e = find(serial); touch(e);
+    if (!c || !e || !e->ok || e->is3d || e->astc) return 0;
+    int dirty = !e->inited;
+    for (size_t i = 0; i < (size_t)e->levels * e->nsub && !dirty; i++) dirty = (__atomic_load_n(&e->st[i], __ATOMIC_ACQUIRE) & F_DIRTY) != 0;
+    if (dirty) { VkCommandBuffer cb = nvn_vk_cmd(); if (!cb || !use(e, c, cb)) return 0; }
+    uint32_t l0 = has_view && v->set_levels ? v->base_level : 0, a0 = has_view && v->set_layers ? v->min_layer : 0;
+    if (l0 >= e->levels || a0 >= e->layers) return 0;
+    VkFormat fmt = e->fmt; VkComponentSwizzle fs[4] = {0, 0, 0, 0};
+    if (has_view && v->set_format) { VkFormat vf; VkComponentSwizzle s4[4] = {0, 0, 0, 0}; if (nvn_fmt_to_vk(v->format, &vf, s4) && vf != VK_FORMAT_UNDEFINED) fmt = vf; }
+    fmt = vf_fix(e, fmt);
+    *fmt_out = fmt;
+    for (int i = 0; i < e->nsvs; i++) { typeof(e->svs[0]) *s = &e->svs[i]; if (s->swz == ~0u && s->fmt == fmt && s->l0 == l0 && s->a0 == a0) { *out = s->v; return 1; } }
+    VkImageViewUsageCreateInfo vu = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_STORAGE_BIT};
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &vu, .image = e->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+        .components = {0, 0, 0, 0}, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, l0, 1, a0, 1}};
+    VkImageView iv;
+    if (e->aspect != VK_IMAGE_ASPECT_COLOR_BIT || vkCreateImageView(c->dev, &vi, NULL, &iv)) { red_once(&bad, "no storage view for the texture (the format cannot be a storage image)", e->d.format); return 0; }
+    if (e->nsvs == 8) { nvn_vk_defer_image(VK_NULL_HANDLE, e->svs[0].v, VK_NULL_HANDLE); memmove(&e->svs[0], &e->svs[1], 7 * sizeof e->svs[0]); e->nsvs--; }
+    e->svs[e->nsvs++] = (typeof(e->svs[0])){fmt, l0, 1, a0, 1, (int)VK_IMAGE_VIEW_TYPE_2D, ~0u, iv};
+    *out = iv;
+    return 1;
+}
+
 int nvn_vk_tex_sampled(uint64_t serial, const view_t *v, int has_view, int tex_set_swz, unsigned tex_swz, VkImageView *out, int *code) {
     static int bad;
     vkctx_t *c = nvn_vk_ctx();

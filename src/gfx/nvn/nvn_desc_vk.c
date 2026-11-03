@@ -35,6 +35,9 @@ void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
     pthread_mutex_unlock(&g_mu);
 }
 
+// An image descriptor lives in the texture pool's index space (nvnDeviceGetImageHandle returns the pool index): the same table
+void mtl_reg_image(int id, const tex_t *t, const view_t *v) { mtl_reg_tex(id, t, v); }
+
 void mtl_reg_samp(int id, const samp_par *p) {
     if (id < 0 || id > (1 << 20)) return;
     pthread_mutex_lock(&g_mu);
@@ -160,6 +163,18 @@ static int shadow_dummy_get(vkctx_t *c, VkDescriptorImageInfo *out) {
 // A texture id or sampler id that is not registered reads as an empty slot (zeros through a nearest sampler), as it does on the hardware.
 uint64_t nvn_vk_desc_serial(uint32_t handle) {          // debugging: the texture serial a combined handle names (0 if the descriptor was never registered)
     uint32_t tid = handle & 0xfffff; pthread_mutex_lock(&g_mu); uint64_t r = (int)tid < g_ntex && g_tex[tid].used ? g_tex[tid].serial : 0; pthread_mutex_unlock(&g_mu); return r;
+}
+// A bound image handle (the texture id the game registered with nvnTexturePoolRegisterImage) as a storage image descriptor; 1 = filled
+int nvn_vk_desc_storage(uint32_t handle, VkDescriptorImageInfo *out, VkFormat *fmt) {
+    uint32_t tid = handle & 0xfffff;
+    pthread_mutex_lock(&g_mu);
+    tdesc td = (int)tid < g_ntex ? g_tex[tid] : (tdesc){0};
+    pthread_mutex_unlock(&g_mu);
+    if (!td.used) { static _Atomic int n1; if (atomic_fetch_add(&n1, 1) < 4) fprintf(stderr, "[dm] [nvn] storage image: texture id %u is not registered\n", tid); return 0; }
+    VkImageView iv;
+    if (!nvn_vk_tex_storage(td.serial, &td.v, td.has_view, &iv, fmt)) return 0;
+    *out = (VkDescriptorImageInfo){VK_NULL_HANDLE, iv, VK_IMAGE_LAYOUT_GENERAL};
+    return 1;
 }
 int nvn_vk_desc_sampled(uint32_t handle, int want, VkDescriptorImageInfo *out) {
     vkctx_t *c = nvn_vk_ctx();

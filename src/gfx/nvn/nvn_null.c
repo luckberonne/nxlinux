@@ -52,7 +52,6 @@ void mtl_prog_release(prog_t *p) { (void)p; }
 void mtl_pso_line(char *out, size_t n) { if (n) out[0] = 0; }
 void mtl_queue_activate(uint64_t serial) { (void)serial; }
 void mtl_queue_forget(uint64_t serial) { (void)serial; }
-void mtl_reg_image(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
 void mtl_res_stats(char *out, size_t n) { if (n) out[0] = 0; }
 void mtl_set_frame(uint64_t f) { (void)f; }
 void mtl_set_tex_pool_n(int n) { (void)n; }
