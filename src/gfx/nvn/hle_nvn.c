@@ -360,20 +360,27 @@ NVN(nvnTextureBuilderGetSparseTileLayout, void, const NVNtextureBuilder *b, NVNt
 // textures with content 0, and the G-buffer's base colour came out black. Textures that can hold such data (not render targets, not linear, no packaged layout, in a pool
 // the CPU can write) are registered by address range; a flush that covers part of one marks it CPU-written (mtl_tex_cpu_written: uploaded from guest memory, re-uploaded
 // when its pages change). Off by default: in another game a flushed range could cover an image a shader writes, whose GPU content the upload would replace
+// A title whose profile is not the build's (nxlinux builds for one game, and runs others) turns the tracking on at run time: NX_TEX_DIRTY_UPLOAD=1 (the pages a registered texture
+// lies on are write-protected and a write makes it CPU-written: uploaded again), NX_TEX_LINEAR=1 also registers the linear textures. Super Smash Bros. Ultimate draws its text from linear
+// R8 glyph atlases that the font engine fills glyph by glyph after the atlas was first used: without the tracking only the letters of the first upload show.
+static int tex_env(const char *name) { return getenv(name) != NULL; }
+static int tex_dirty_on(void) { static int v = -1; if (v < 0) v = DM_GAME_TEX_DIRTY_UPLOAD || tex_env("NX_TEX_DIRTY_UPLOAD"); return v; }
+static int tex_flush_on(void) { static int v = -1; if (v < 0) v = DM_GAME_TEX_FLUSH_UPLOAD || tex_dirty_on(); return v; }
+static int tex_linear_on(void) { static int v = -1; if (v < 0) v = tex_env("NX_TEX_LINEAR"); return v; }
 typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; const void *span; } flush_tex;   // stamp: dirty-page generation at registration (tex_dirty_upload); span: its tracked range (nvn_dirty_span), so a check needs no search over every pool
 static flush_tex *g_ft; static size_t g_nft, g_cft; static pthread_mutex_t g_ft_mu = PTHREAD_MUTEX_INITIALIZER;
 static void ft_add(const tex_t *t) {
     // Buffer textures are views onto the pool buffer the GPU reads directly (tex_mtl in nvn_mtl.m); an upload would push Age of Calamity's 1,048,576-texel R32F one through tex_desc, past Metal's 2D limit
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
-        (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE))) return;
+    if (!tex_flush_on() || !t->mem || !t->pool || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+        (t->d.flags & ((tex_linear_on() ? 0 : (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) | NVN_TEXTURE_FLAGS_COMPRESSIBLE))) return;
     pthread_mutex_lock(&g_ft_mu);
     if (g_nft == g_cft && !(g_ft = realloc(g_ft, (g_cft = g_cft ? 2 * g_cft : 1024) * sizeof *g_ft))) die("flush_tex allocation failed");
-    uint64_t st = nvn_dirty_now(); if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
+    uint64_t st = nvn_dirty_now(); if (tex_dirty_on()) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
     g_ft[g_nft++] = (flush_tex){t->mem, t->L.size, *t, st, nvn_dirty_span(t->mem, t->L.size)};
     pthread_mutex_unlock(&g_ft_mu);
 }
 static void ft_del(uint64_t serial) {
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !serial) return;
+    if (!tex_flush_on() || !serial) return;
     pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { g_ft[i] = g_ft[--g_nft]; break; }
     pthread_mutex_unlock(&g_ft_mu);
@@ -382,7 +389,7 @@ static void ft_del(uint64_t serial) {
 // natively; its 121-layer ASTC terrain material arrays, 42 MB each). They stayed GPU-only textures with content 0, which ASTC decodes as the error colour, and the cave came out magenta.
 // ft_add write-protects a registered texture's pages, and on its first resolution (tex_mtl, submit thread) a write since then makes it CPU-written like a flushed one
 int nvn_ft_written(const tex_t *t) {
-    if (!DM_GAME_TEX_DIRTY_UPLOAD || !t->serial) return 0;
+    if (!tex_dirty_on() || !t->serial) return 0;
     int r = 0; pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == t->serial) {
         if (nvn_dirty_since_span(g_ft[i].span, g_ft[i].mem, g_ft[i].size, g_ft[i].stamp)) { r = 1; g_ft[i] = g_ft[--g_nft]; }
@@ -392,7 +399,7 @@ int nvn_ft_written(const tex_t *t) {
     return r;
 }
 int nvn_ft_tracked(uint64_t serial) {   // registered and not resolved yet: its storage holds whatever the CPU has written (nvn_tex_mirror_b2t / nvn_tex_mirror_t2t)
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !serial) return 0;
+    if (!tex_flush_on() || !serial) return 0;
     int r = 0; pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { r = 1; break; }
     pthread_mutex_unlock(&g_ft_mu);
@@ -407,7 +414,7 @@ int nvn_ft_tracked(uint64_t serial) {   // registered and not resolved yet: its 
 // Checking every texture at every submission cost TOTK 0.4 ms of submit CPU per frame on the Mac; this way a texture is picked up a few submissions later at most
 enum { FT_POLL_BYTES = 128 << 20 };
 void nvn_ft_poll(void) {
-    if (!DM_GAME_TEX_DIRTY_UPLOAD) return;
+    if (!tex_dirty_on()) return;
     static uint64_t gen; static size_t cur, left;
     static tex_t *hit; static size_t chit; size_t nhit = 0;
     uint64_t now = nvn_dirty_now(), scanned = 0;
@@ -422,10 +429,15 @@ void nvn_ft_poll(void) {
         } else cur++;
     }
     pthread_mutex_unlock(&g_ft_mu);
-    for (size_t i = 0; i < nhit; i++) if (!mtl_tex_gpu_owned(hit[i].serial)) mtl_tex_cpu_written(&hit[i]);   // outside g_ft_mu: the ownership check takes the replay's serial table lock
+    { static unsigned nl; static int lg = -1; if (lg < 0) lg = getenv("NX_TEX_LOG") != NULL; if (lg) for (size_t i = 0; i < nhit; i++) if (nl++ < 60) fprintf(stderr, "[dm] [nvn] texture %llu (%dx%d, format %#x) was written by the CPU after its first use: %s\n", (unsigned long long)hit[i].serial, hit[i].d.width, hit[i].d.height, hit[i].d.format, mtl_tex_gpu_owned(hit[i].serial) ? "the GPU owns it, left alone" : "uploaded again"); }
+    for (size_t i = 0; i < nhit; i++) {                              // outside g_ft_mu
+        if (!mtl_tex_gpu_owned(hit[i].serial)) mtl_tex_cpu_written(&hit[i]);
+        // A glyph atlas goes on being written (a letter at a time, as text shows up): it is registered again, its pages write-protected again, and the next write is seen too
+        if (tex_linear_on() && (hit[i].d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && !mtl_tex_gpu_owned(hit[i].serial)) ft_add(&hit[i]);
+    }
 }
 static void ft_flush(const uint8_t *a, uint64_t n) {
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !a || !n) return;
+    if (!tex_flush_on() || !a || !n) return;
     pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft;)
         if (g_ft[i].mem < a + n && a < g_ft[i].mem + g_ft[i].size) { mtl_tex_cpu_written(&g_ft[i].t); g_ft[i] = g_ft[--g_nft]; } else i++;
