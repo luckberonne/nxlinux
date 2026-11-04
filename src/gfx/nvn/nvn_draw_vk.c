@@ -406,6 +406,16 @@ static const nvn_shader *find_stage(const prog_t *p, int want) {
     return NULL;
 }
 
+// With NX_SHADER_DUMP set, the stages of a program the library lacks are dumped by their code key, once per program
+static void dump_missing(const prog_t *p) {
+    static int on = -1; if (on < 0) on = getenv("NX_SHADER_DUMP") != NULL;
+    if (!on || !p) return;
+    static uint64_t seen[512]; unsigned h = (unsigned)(p->serial & 511);
+    if (seen[h] == p->serial + 1) return;
+    seen[h] = p->serial + 1;
+    for (unsigned i = 0; i < p->nstage && i < 6; i++) { uint8_t ak[8]; if (prog_alt_key(p, i, ak) && !nvn_shader_find(ak)) nvn_dump_stage(p, i); }
+}
+
 static void skip(const char *why, int *flag) {
     unsigned k = atomic_fetch_add(&g_nskip, 1);
     { static int lg = -1; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;   // NX_SKIP_LOG=1: every skipped draw with its reason, 1 in 64 after the first 400
@@ -475,6 +485,7 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
         }
     }
     if (!vs || !fs) {
+        dump_missing(S.prog); if (S.vprog != S.prog) dump_missing(S.vprog); if (S.fprog != S.prog && S.fprog != S.vprog) dump_missing(S.fprog);
         static int lg = -1; static unsigned nlog; if (lg < 0) lg = getenv("NX_SKIP_LOG") != NULL;
         if (lg && nlog++ < 1600 && nlog % 16 == 1) {                                     // NX_SKIP_LOG: the state of each stage of the program (the keys found, and what a stage without one holds)
             fprintf(stderr, "[dm] [nvn] no vs/fs pair: %d stage(s), %d key(s), vs %p fs %p", S.prog->nstage, S.nkeys, (const void *)vs, (const void *)fs);

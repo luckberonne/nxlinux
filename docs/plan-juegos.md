@@ -13,7 +13,7 @@ Medido con la misma prueba en Smash (2 minutos headless, pulsaciones de A, `NX_S
 - Dibujos saltados por "shaders not in the registry": 540 antes de reconstruir la librería, 0 después (commit actual `734ec50`). La causa fue cobertura: la captura no había visitado algunas escenas.
 - Dibujos saltados en Mario Party: 146 shaders con `NVN_NEED_TEX`, todos del suelo.
 
-Un salto aislado reapareció una vez en Smash (400 dibujos, un fragment shader con clave de código `6d584e4b235acd6b` que no está en la librería). Dos volcados nuevos (una corrida de 24000 frames y una de 150 s con la misma secuencia) no lo reprodujeron ni capturaron shaders nuevos (siguen 6302), así que parece depender del momento exacto de un menú. Si vuelve, la forma segura de capturarlo es volcar el shader en el propio punto del salto (`no vs/fs pair` en `nvn_draw_vk.c`), no repetir corridas.
+Un salto aislado reapareció una vez en Smash (400 dibujos, un fragment shader con clave de código `6d584e4b235acd6b` que no está en la librería). Dos volcados nuevos (una corrida de 24000 frames y una de 150 s con la misma secuencia) no lo reprodujeron ni capturaron shaders nuevos (siguen 6302), así que parece depender del momento exacto de un menú. Para capturarlo si vuelve: con `NX_SHADER_DUMP` puesto, un draw que no encuentra sus shaders ahora los vuelca por su clave de código (`dump_missing` en `nvn_draw_vk.c`, `nvn_dump_stage` en `hle_nvn.c`); basta una corrida con `NX_SHADER_DUMP` y reconstruir la librería. Probado: escribe los archivos con la clave que el draw busca; todavía no se vio el caso real.
 
 Medido en MPS: un frame entero tarda 90-100 ms en la prueba headless con capturas. Esa cifra no sirve para medir velocidad (las capturas la frenan); está pendiente medirla sin capturas.
 

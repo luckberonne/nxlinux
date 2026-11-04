@@ -757,6 +757,12 @@ int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
     shader_dump(&p->sd[st], key);          // NX_SHADER_DUMP: the code is in place by the first draw
     return 1;
 }
+// NX_SHADER_DUMP: a stage of a program a draw could not find in the library, written under its code key (prog_alt_key), the key the draw looks it up by. The dump at prog_key keeps the
+// normal key, computed once and possibly before the code is complete, so the final code of a shader can miss the dump (Smash: one fragment shader, once)
+void nvn_dump_stage(const prog_t *p, unsigned st) {
+    uint8_t ak[8];
+    if (st < p->nstage && prog_alt_key(p, st, ak)) shader_dump(&p->sd[st], ak);
+}
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("[RED] ProgramSetShaders stage count %d", n); return 0; }
