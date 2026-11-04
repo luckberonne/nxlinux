@@ -51,6 +51,15 @@ class Packer(unittest.TestCase):
         [e] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', {'stage': 'ps', 'textures': [t]})]))
         self.assertEqual((e['needs'], e['binds']), (0, [(5, shader_pack.KIND_TEX_UBO, (96 << 8) | 8, 3)]))
 
+    def test_texture_and_sampler_arrays_indexed_by_pool_id(self):
+        arr = {'array': 32, 'cbuf_slot': 0, 'handle': 1 << 30, 'separate': True}
+        res = {'stage': 'ps', 'textures': [{**arr, 'binding': 71, 'type': 1029}, {**arr, 'binding': 103, 'separate': False, 'type': 0}]}
+        [e] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', res)]))
+        self.assertEqual((e['needs'], e['binds']), (0, [(71, shader_pack.KIND_TEXA, 0, 1029), (103, shader_pack.KIND_SAMPA, 0, 0)]))
+        for bad in ({'array': 16}, {'cbuf_slot': 2}, {'handle': (1 << 30) + 4}, {'type': 2}):
+            [x] = shader_pack.unpack(shader_pack.pack([shader_pack.entry('0123456789abcdef', b'\0\0\0\0', {'stage': 'ps', 'textures': [{**arr, 'binding': 71, 'type': 3, **bad}]})]))
+            self.assertEqual((x['needs'], x['binds']), (shader_pack.NEEDS_TEX, []))
+
     def test_bad_input(self):
         with self.assertRaises(ValueError): shader_pack.entry('00', b'\0\0\0\0', {'stage': 'ps'})
         with self.assertRaises(ValueError): shader_pack.entry('0123456789abcdef', b'\0\0\0', {'stage': 'ps'})

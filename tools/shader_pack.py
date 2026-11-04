@@ -17,7 +17,7 @@ import json, struct, sys
 from pathlib import Path
 
 STAGE = {'vs': 0, 'ps': 1, 'cs': 5}          # NVN_STAGE_VERTEX, FRAGMENT, COMPUTE
-KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF, KIND_C1, KIND_SBUF_UBO, KIND_TEX_UBO, KIND_IMG = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+KIND_CBUF, KIND_TEX, KIND_SUPPORT, KIND_DRV0, KIND_DRV2, KIND_SBUF, KIND_C1, KIND_SBUF_UBO, KIND_TEX_UBO, KIND_IMG, KIND_TEXA, KIND_SAMPA = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
 C0_SSBO = {'vs': 0x110, 'cs': 0x310, 'gs': 0x410, 'ps': 0x510}      # the stage's storage buffer table in driver segment c[0] (src/gfx/nvn/dmsh_abi.h): 16 slots of 0x10 bytes
 C0_SSBO_SLOTS = 16
 C0_CS_UBO, C0_CS_UBO_SLOTS = 0x210, 16                                 # compute: uniform slot r's address and size at 0x210 + 0x10 r; a shader that reads the slot through global memory has a storage-buffer binding for it (KIND_SBUF_UBO)
@@ -44,6 +44,15 @@ def image_slot(t):
     b = (h & 0x3FFF) * 4
     if b % 8 or not C2_IMG <= b < C2_IMG + 8 * C2_IMG_SLOTS: return None
     return (b - C2_IMG) // 8
+
+
+def texture_array_kind(t):
+    """The 32-entry arrays a shader indexes by a texture or sampler ID the game keeps in a storage buffer (Ryujinx's fallback: `fp_t2d_cb0_40000000`, element = min(ID, 31)).
+    The draw path fills element k with the texture (KIND_TEXA, aux = its sampler type) or the sampler (KIND_SAMPA) that has ID k in the pool. None for anything else."""
+    if t['array'] != 32 or t['cbuf_slot'] != 0 or (t['handle'] >> 28) != 4 or (t['handle'] & 0x0FFFFFFF): return None
+    if t.get('separate') and (t['type'] & 0xFF) in SAMPLER_TYPES: return KIND_TEXA
+    if not t.get('separate') and t['type'] == 0: return KIND_SAMPA
+    return None
 
 
 def ubo_texture(t):
@@ -134,6 +143,7 @@ def entry(key_hex, spirv, res, c1=b''):
         slot = combined_slot(t)
         if slot is not None: binds.append((t['binding'], KIND_TEX, slot, t['type']))
         elif (u := ubo_texture(t)) is not None: binds.append((t['binding'], KIND_TEX_UBO, u, t['type']))
+        elif (k := texture_array_kind(t)) is not None: binds.append((t['binding'], k, 0, t['type']))
         else: needs |= NEEDS_TEX
     for t in res.get('images', []):
         if (b := image_slot(t)) is not None: binds.append((t['binding'], KIND_IMG, b, t['type']))

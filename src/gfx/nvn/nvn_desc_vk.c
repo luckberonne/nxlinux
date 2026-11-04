@@ -165,6 +165,27 @@ uint64_t nvn_vk_desc_serial(uint32_t handle) {          // debugging: the textur
     uint32_t tid = handle & 0xfffff; pthread_mutex_lock(&g_mu); uint64_t r = (int)tid < g_ntex && g_tex[tid].used ? g_tex[tid].serial : 0; pthread_mutex_unlock(&g_mu); return r;
 }
 // A bound image handle (the texture id the game registered with nvnTexturePoolRegisterImage) as a storage image descriptor; 1 = filled
+// Element k of a 32-entry texture array the shader indexes by pool ID: the texture of ID k as the shader samples it, or the zero texture of its type (1 = filled)
+int nvn_vk_desc_array_tex(uint32_t id, int want, VkImageView *out) {
+    VkDescriptorImageInfo tmp;
+    if (nvn_vk_desc_sampled(id, want, &tmp) == 1) { *out = tmp.imageView; return 1; }
+    vkctx_t *c = nvn_vk_ctx();
+    if (!c || !dummy_get(c, want & ~1024, &tmp)) return 0;
+    *out = tmp.imageView; return 1;
+}
+// Element k of a 32-entry sampler array: the sampler of ID k, or a default one
+VkSampler nvn_vk_desc_sampler_id(uint32_t sid) {
+    vkctx_t *c = nvn_vk_ctx();
+    if (!c) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_mu);
+    sdesc *sd = (int)sid < g_nsamp && g_samp[sid].used ? &g_samp[sid] : NULL;
+    if (sd && !sd->s) sd->s = make_sampler(c, &sd->p);
+    VkSampler smp = sd ? sd->s : VK_NULL_HANDLE;
+    pthread_mutex_unlock(&g_mu);
+    if (smp) return smp;
+    VkDescriptorImageInfo tmp;
+    return dummy_get(c, 3, &tmp) ? tmp.sampler : VK_NULL_HANDLE;
+}
 int nvn_vk_desc_storage(uint32_t handle, VkDescriptorImageInfo *out, VkFormat *fmt) {
     uint32_t tid = handle & 0xfffff;
     pthread_mutex_lock(&g_mu);

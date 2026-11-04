@@ -7,7 +7,7 @@ Próximos pasos para optimizar, mejorar y reutilizar lo hecho en Super Smash Bro
 | Juego | Llega a | Sin resolver |
 |---|---|---|
 | Smash Ultimate 1.0.0 (NSZ + 99 DLC) | título, menús, selección de reglas y de luchadores, pelea | retratos de resultados en silueta (la tarjeta se dibuja, el retrato sale plano, sin capa de color); "Challenger approaching" sin verificar; audio de las películas en silencio; escenas 3D parciales |
-| Mario Party Superstars 1.0.0 | título, menú, selección de jugadores, cinemática con escenario | suelo gris (fix de arrays implementado, sin verificar; ver B); sonido sin probar; juegos de tablero sin probar |
+| Mario Party Superstars 1.0.0 | título, menú, selección de jugadores, cinemática con escenario | salto de una textura 2D donde el shader espera 3D en la escena siguiente (ver B); la tubería y el suelo ya se dibujan; sonido sin probar; juegos de tablero sin probar |
 
 Medido con la misma prueba en Smash (2 minutos headless, pulsaciones de A, `NX_SKIP_LOG=1`):
 - Dibujos saltados por "shaders not in the registry": 540 antes de reconstruir la librería, 0 después (commit actual `734ec50`). La causa fue cobertura: la captura no había visitado algunas escenas.
@@ -51,13 +51,14 @@ El intento de llenar los 32 elementos en push descriptors tumbó el proceso porq
 2. **Un set bindless global** (PARTIALLY_BOUND, UPDATE_AFTER_BIND, ya habilitado en `vkctx.c`): se llena cuando cambia el registro de texturas, no por draw. Más trabajo inicial, mejor rendimiento. Sirve también para otros juegos con arrays bindless.
 3. **Reescribir el SPIR-V** para que el índice no recorte a 31 y use el ID real. Solo si los dos anteriores no bastan.
 
-Estado (opción 1 implementada, sin commit todavía):
+Estado (hecho y verificado el 4 de noviembre):
 
-- Se volvió a aplicar la parte buena del intento descartado (`work/run/mps/texarray_push_overflow.patch`): los tipos `NVN_SB_TEXA` / `NVN_SB_SAMPA` (`nvn_shader_vk.h`), el llenado por ID de pool (`array_fill` en el draw, `nvn_vk_desc_array_tex` / `nvn_vk_desc_sampler_id` en `nvn_desc_vk.c`) y `shader_pack.py` (`texture_array_kind`, `KIND_TEXA` / `KIND_SAMPA`).
-- Opción 1: en `make_layout`, si algún binding es array (`TEXA` / `SAMPA`), el layout ya no es de push: se crea un layout de set normal, se reserva un `VkDescriptorSet` del pool nuevo de `vkctx` (`c->desc_pool`, creado ahí al primer uso) y en el draw `prepare` llena el set con `vkUpdateDescriptorSets` (cada array va en una escritura de 32 elementos) y lo enlaza con `vkCmdBindDescriptorSets`. Las canales sin arrays siguen por push descriptors, sin cambios en su código. Con esto deja de importar `maxPushDescriptors = 32`.
-- Un dispatch de compute con array bindings se salta con su mensaje propio (igual que antes, no lo toca el cambio).
-- Compila en `build-opencode`; los 21 tests de ctest pasan. MK8D título headless (`NX_PRESENT=null NX_FRAME_EVERY=60`): arranca y dibuja hasta el frame 6960 sin saltos nuevos ni errores.
-- Pendiente para cerrar B: carrera de MK8D; correr MPS y comprobar el criterio de éxito; reconfirmar Smash. El `mps.nxsl` del 3 de nov se empaquetó con este parche puesto, así que sus shaders del suelo deberían salir ya como `TEXA` y no `NEED_TEX` (verificarlo al arrancar). Nada commiteado: los archivos con el cambio son `src/gfx/nvn/nvn_draw_vk.c`, `nvn_desc_vk.c`, `nvn_shader_vk.h`, `nvn_vk_priv.h`, `src/gfx/vk/vkctx.{c,h}` y `tools/shader_pack.py`.
+- Tipos `NVN_SB_TEXA` / `NVN_SB_SAMPA` (`nvn_shader_vk.h`), llenado por ID de pool (`array_fill` en el draw, `nvn_vk_desc_array_tex` / `nvn_vk_desc_sampler_id` en `nvn_desc_vk.c`) y `texture_array_kind` en `shader_pack.py`, con su test.
+- Un draw con arrays usa un set normal, uno **por draw**: `nvn_vk_alloc_set` (en `nvn_vk.c`) saca los sets de un anillo de pools atado al fence de timeline, igual que el arena de uniformes transitorios. Se resetea un pool cuando la GPU terminó el submit que lo usó. Los draws sin arrays siguen por push descriptors, sin cambios.
+- Por qué no un set por pipeline: los comandos se graban y se ejecutan después; si cada draw reescribe el mismo set, todos los draws de ese pipeline ven el último contenido, incluidos los uniform buffers, que cambian por draw. La primera versión (un set por pipeline, escrituras sin `dstSet`) además caía con SIGSEGV en RADV a los pocos segundos. Se conserva como `work/run/mps/opencode_texarray_full.patch` (fuera de git).
+- Verificado: la cinemática de Mario Party ya dibuja la tubería verde con su sombreado (0 shaders con `NVN_NEED_TEX`); sin caídas en 4 corridas; MK8D (título y carrera) y Smash (título, reglas, selección de luchadores) siguen igual; los 21 tests de ctest pasan.
+- Queda en Mario Party un salto nuevo en la escena siguiente: una textura 2D donde el shader espera 3D (`texture slot ... is not the type the shader samples (type 0x4)`).
+- Cada draw con arrays llama 6 veces a `array_fill` (32 elementos con mutex): medir su costo antes de optimizar (sección E). Una caché por generación del pool de texturas evitaría llenar los sets en cada draw.
 
 Criterio de éxito: `NVN_NEED_TEX` = 0 en MPS, el suelo se dibuja y MK8D y Smash no cambian (21 tests de ctest y las capturas de título y carrera).
 

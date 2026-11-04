@@ -5,7 +5,8 @@
 #include <stdint.h>
 
 enum { NVN_STAGE_VERTEX = 0, NVN_STAGE_FRAGMENT = 1, NVN_STAGE_GEOMETRY = 2, NVN_STAGE_TESS_CONTROL = 3, NVN_STAGE_TESS_EVAL = 4, NVN_STAGE_COMPUTE = 5 };   // NVNshaderStage
-enum { NVN_SB_CBUF = 1, NVN_SB_TEX = 2, NVN_SB_SUPPORT = 3, NVN_SB_DRV0 = 4, NVN_SB_DRV2 = 5, NVN_SB_SBUF = 6, NVN_SB_C1 = 7, NVN_SB_SBUF_UBO = 8, NVN_SB_TEX_UBO = 9, NVN_SB_IMG = 10 };   // IMG: a 2D storage image, reg = its slot in the image table (nvnCommandBufferBindImage)
+enum { NVN_SB_CBUF = 1, NVN_SB_TEX = 2, NVN_SB_SUPPORT = 3, NVN_SB_DRV0 = 4, NVN_SB_DRV2 = 5, NVN_SB_SBUF = 6, NVN_SB_C1 = 7, NVN_SB_SBUF_UBO = 8, NVN_SB_TEX_UBO = 9, NVN_SB_IMG = 10, NVN_SB_TEXA = 11, NVN_SB_SAMPA = 12 };   // TEXA / SAMPA: a 32-entry array of sampled textures / of samplers, element k = the texture (sampler) of pool ID k; aux = the sampler type of TEXA
+//   // IMG: a 2D storage image, reg = its slot in the image table (nvnCommandBufferBindImage)
 //    // TEX_UBO: a texture whose handle the game keeps in its uniform slot (reg & 0xff) at byte offset reg >> 8; aux = the sampler type
 //   // C1: the shader's own constant segment c[1], from the library   // SBUF: reg = the slot of the stage's storage buffer table in c[0], aux = the translator's flags (bit 0: written)    // binding kinds (dmsh_abi.h DMSH_KIND_*); more as the draw path grows: storage buffers, the driver segments
 

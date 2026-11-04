@@ -105,6 +105,37 @@ int nvn_vk_transient(size_t size, VkDescriptorBufferInfo *out, void **map) {
     return 0;
 }
 
+// ---- descriptor sets for draws that cannot use push descriptors (arrays of 32 textures: this GPU allows 32 push descriptors per set). A ring of pools; a pool is tagged with the last
+// submission that took a set from it and reset once that one completed, as the transient uniform arena above does
+enum { DS_POOLS = 16, DS_SETS = 128 };
+static struct { VkDescriptorPool p; uint32_t used; uint64_t fence; } g_ds[DS_POOLS]; static int g_nds, g_dscur = -1;
+static pthread_mutex_t g_ds_mu = PTHREAD_MUTEX_INITIALIZER;
+VkDescriptorSet nvn_vk_alloc_set(VkDescriptorSetLayout dsl) {
+    if (!gpu()) return VK_NULL_HANDLE;
+    uint64_t fence = nvn_vk_next_fence();
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_ds_mu);
+    for (int attempt = 0; attempt < 2 && !set; attempt++) {
+        if (g_dscur >= 0 && g_ds[g_dscur].used >= DS_SETS) g_dscur = -1;
+        if (g_dscur < 0) {
+            uint64_t done = nvn_gpu_completed();
+            for (int i = 0; i < g_nds && g_dscur < 0; i++) if (g_ds[i].fence <= done) { vkResetDescriptorPool(G.c.dev, g_ds[i].p, 0); g_ds[i].used = 0; g_dscur = i; }
+            if (g_dscur < 0 && g_nds < DS_POOLS) {
+                VkDescriptorPoolSize sz[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, DS_SETS * 16}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, DS_SETS * 16}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, DS_SETS * 32},
+                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, DS_SETS * 8}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, DS_SETS * 192}, {VK_DESCRIPTOR_TYPE_SAMPLER, DS_SETS * 64}};
+                VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = DS_SETS, .poolSizeCount = 6, .pPoolSizes = sz};
+                if (!vkCreateDescriptorPool(G.c.dev, &pi, NULL, &g_ds[g_nds].p)) { g_ds[g_nds].used = 0; g_ds[g_nds].fence = 0; g_dscur = g_nds++; }
+            }
+            if (g_dscur < 0) break;                      // every pool is still in flight
+        }
+        VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_ds[g_dscur].p, .descriptorSetCount = 1, .pSetLayouts = &dsl};
+        if (vkAllocateDescriptorSets(G.c.dev, &ai, &set)) { set = VK_NULL_HANDLE; g_dscur = -1; continue; }   // the pool is full (or out of one kind of descriptor): the next one
+        g_ds[g_dscur].used++; g_ds[g_dscur].fence = fence;
+    }
+    pthread_mutex_unlock(&g_ds_mu);
+    return set;
+}
+
 void nvn_vk_keep(const vkbuf_t *b) {
     if (G.nstg == G.capstg) { G.capstg = G.capstg ? G.capstg * 2 : 8; G.stg = realloc(G.stg, (size_t)G.capstg * sizeof *G.stg); }
     G.stg[G.nstg++] = *b;

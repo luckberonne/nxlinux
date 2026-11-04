@@ -52,6 +52,9 @@ int nvn_vk_tex_attach(uint64_t serial, const view_t *v, int has_view, nvn_attach
 // A sampling view of a texture (it fills a dirty image first, which ends the render pass), and the SamplerType it presents (nvn_tex_vk.c)
 // Texture and sampler descriptors registered by the game (nvn_desc_vk.c): a bound handle (texture id | sampler id << 20) as a descriptor for a binding that samples SamplerType `want`.
 // 1 = filled (an unregistered id reads as a 1x1 texture of zeros); 0 = no usable texture and no stand-in; 3 = the texture is of another type
+VkDescriptorSet nvn_vk_alloc_set(VkDescriptorSetLayout dsl);      // a descriptor set for one draw, valid until the submission that uses it completes (NULL: none available)
+int nvn_vk_desc_array_tex(uint32_t id, int want, VkImageView *out);
+VkSampler nvn_vk_desc_sampler_id(uint32_t sid);
 int nvn_vk_desc_storage(uint32_t handle, VkDescriptorImageInfo *out, VkFormat *fmt);
 int nvn_vk_desc_sampled(uint32_t handle, int want, VkDescriptorImageInfo *out);
 int nvn_vk_tex_storage(uint64_t serial, const view_t *v, int has_view, VkImageView *out, VkFormat *fmt_out);

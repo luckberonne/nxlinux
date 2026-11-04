@@ -190,7 +190,7 @@ typedef struct {
     uint8_t nattr, nbind; struct { VkFormat fmt; uint32_t off; uint8_t binding; } at[16]; struct { uint32_t stride; uint8_t inst; } bd[16];
 } pkey;
 
-typedef struct pipe_entry { pkey key; uint64_t hash; VkPipeline pipe; VkPipelineLayout layout; VkDescriptorSetLayout dsl; struct pipe_entry *next, *hnext; } pipe_entry;
+typedef struct pipe_entry { pkey key; uint64_t hash; VkPipeline pipe; VkPipelineLayout layout; VkDescriptorSetLayout dsl; int uses_set; struct pipe_entry *next, *hnext; } pipe_entry;
 static pipe_entry *g_pipes;
 enum { PIPE_BUCKETS = 4096 };                             // a course builds thousands of pipelines, and every draw looks one up: a chain of four at most, not a walk over all of them
 static pipe_entry *g_pbuck[PIPE_BUCKETS];
@@ -215,24 +215,45 @@ static uint32_t bind_handle(int stage, const nvn_shbind *b) {
     return h;
 }
 
-static VkPipelineLayout make_layout(vkctx_t *c, const pkey *k, VkDescriptorSetLayout *dsl_out) {
+// The 32 elements of an array binding the shader indexes by pool ID (Ryujinx's fallback arrays, element = min(ID, 31)): element k is the texture (sampler) of pool ID k
+static void array_fill(const nvn_shbind *b, VkDescriptorImageInfo *out) {
+    for (uint32_t k = 0; k < 32; k++) {
+        if (b->kind == NVN_SB_TEXA) { VkImageView v = VK_NULL_HANDLE; nvn_vk_desc_array_tex(k, (int)b->aux, &v); out[k] = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL}; }
+        else out[k] = (VkDescriptorImageInfo){nvn_vk_desc_sampler_id(k), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+    }
+}
+
+static VkPipelineLayout make_layout(vkctx_t *c, const pkey *k, pipe_entry *e) {
     VkDescriptorSetLayoutBinding lb[64]; int nb = 0;
     const nvn_shader *sh[2] = {k->vs, k->fs};
+    int narr = 0;                                    // does any binding index a 32-entry texture (or sampler) array?
     for (int si = 0; si < 2; si++) {
         int n; const nvn_shbind *b = nvn_shader_binds(sh[si], &n);
         for (int i = 0; i < n; i++) {
             VkShaderStageFlags st = si ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
             int j = 0; for (; j < nb; j++) if (lb[j].binding == b[i].binding) break;
-            if (j == nb) { if (nb == 64) continue; lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].kind == NVN_SB_IMG ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : (b[i].kind == NVN_SB_TEX || b[i].kind == NVN_SB_TEX_UBO) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : b[i].kind == NVN_SB_SBUF ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL}; }
+            if (j == nb) { if (nb == 64) continue; VkDescriptorType dt = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                if (b[i].kind == NVN_SB_IMG) dt = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; else if (b[i].kind == NVN_SB_TEX || b[i].kind == NVN_SB_TEX_UBO) dt = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; else if (b[i].kind == NVN_SB_SBUF) dt = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                if (b[i].kind == NVN_SB_TEXA) dt = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; else if (b[i].kind == NVN_SB_SAMPA) dt = VK_DESCRIPTOR_TYPE_SAMPLER;
+                lb[nb++] = (VkDescriptorSetLayoutBinding){b[i].binding, dt, (b[i].kind == NVN_SB_TEXA || b[i].kind == NVN_SB_SAMPA) ? 32u : 1u, 0, NULL}; }
             lb[j].stageFlags |= st;
+            if (b[i].kind == NVN_SB_TEXA || b[i].kind == NVN_SB_SAMPA) narr = 1;
         }
     }
-    VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = nb, .pBindings = lb};
     VkDescriptorSetLayout dsl; VkPipelineLayout pl;
+    if (narr) {                                       // a push layout cannot carry a 32-element array: go through a normal descriptor set
+        VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = 0, .bindingCount = nb, .pBindings = lb};
+        if (vkCreateDescriptorSetLayout(c->dev, &di, NULL, &dsl)) return VK_NULL_HANDLE;
+        VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl};
+        if (vkCreatePipelineLayout(c->dev, &li, NULL, &pl)) { vkDestroyDescriptorSetLayout(c->dev, dsl, NULL); return VK_NULL_HANDLE; }
+        e->uses_set = 1; e->dsl = dsl;
+        return pl;
+    }
+    VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = nb, .pBindings = lb};
     if (vkCreateDescriptorSetLayout(c->dev, &di, NULL, &dsl)) return VK_NULL_HANDLE;
     VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl};
     if (vkCreatePipelineLayout(c->dev, &li, NULL, &pl)) { vkDestroyDescriptorSetLayout(c->dev, dsl, NULL); return VK_NULL_HANDLE; }
-    *dsl_out = dsl;
+    e->uses_set = 0; e->dsl = dsl;
     return pl;
 }
 
@@ -245,7 +266,7 @@ static pipe_entry *get_pipeline(vkctx_t *c, const pkey *k) {
     for (pipe_entry *e = g_pbuck[b]; e; e = e->hnext) if (e->hash == h && !memcmp(&e->key, k, sizeof *k)) { pthread_mutex_unlock(&g_pmu); return last = e; }
     pthread_mutex_unlock(&g_pmu);
     pipe_entry *e = calloc(1, sizeof *e); e->key = *k;
-    e->layout = make_layout(c, k, &e->dsl);
+    e->layout = make_layout(c, k, e);
     if (!e->layout) { free(e); return NULL; }
     VkPipelineShaderStageCreateInfo st[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = nvn_shader_module((nvn_shader *)k->vs), .pName = "main"},
@@ -649,7 +670,13 @@ static int prepare(unsigned prim, pipe_entry **pe_out) {
             wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = ibind[i], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[i]};
         for (int i = 0; i < nt && nw < 64; i++)
             wr[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = tbind[i], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ti[i]};
-        if (nw) c->CmdPushDescriptorSet(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pe->layout, 0, (uint32_t)nw, wr);
+        if (pe->uses_set) {                                               // a normal set, one per draw: the commands run later, so a set the next draw rewrites would show it the last contents
+            VkDescriptorSet ds = nvn_vk_alloc_set(pe->dsl);
+            if (!ds) { skip("no descriptor set for a draw that indexes a texture array", &f_pipe); return 0; }
+            for (int i = 0; i < nw; i++) wr[i].dstSet = ds;
+            vkUpdateDescriptorSets(c->dev, (uint32_t)nw, wr, 0, NULL);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pe->layout, 0, 1, &ds, 0, NULL);
+        } else if (nw) c->CmdPushDescriptorSet(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pe->layout, 0, (uint32_t)nw, wr);
     }
     *pe_out = pe;
     return 1;
