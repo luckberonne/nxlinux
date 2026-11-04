@@ -498,7 +498,7 @@ static uint32_t pl(int session, const ipc_in_t *in, ipc_out_t *out) {
 static struct { uint64_t addr, size; module_t *mod; } g_nro_map[128]; static int g_nro_n;
 static uint32_t ldr_ro(int session, const ipc_in_t *in, ipc_out_t *out) {
     (void)session;
-    unsigned o = in->nargs >= 10 ? 2 : 0;                    // SDK 3+ sends a process id placeholder first
+    unsigned o = (in->cmd == 1 ? in->nargs >= 4 : in->nargs >= 10) ? 2 : 0;       // SDK 3+ sends a process id placeholder first (Map: 10 words; Unmap: 4, the placeholder and the address. Reading Unmap with the Map rule took the placeholder for the address, so no NRO was ever unregistered)
     #define ARG64(i) ((uint64_t)in->args[o + 2 * (i)] | ((uint64_t)in->args[o + 2 * (i) + 1] << 32))
     switch (in->cmd) {
     case 0: {
@@ -507,6 +507,13 @@ static uint32_t ldr_ro(int session, const ipc_in_t *in, ipc_out_t *out) {
         if (in->nargs < o + 8 || !nro || !nsz) return 0xCC01u;      // ro ResultInvalidAddress-like: a malformed request
         cpu_invalidate(NULL, nro, nsz); if (bsz) cpu_invalidate(NULL, bss, bsz);
         module_t *nm = NULL;
+        // An NRO mapped over addresses of one that was never unmapped (a title may free the memory without telling nn::ro): the old entry would answer QueryMemory for the new code with its own sizes, and
+        // the SDK's unwinder would read a wrong module start. The old module is dropped (its struct is kept, a reader may hold it).
+        for (int i = 0; i < g_nro_n; i++) if (g_nro_map[i].addr < nro + nsz && nro < g_nro_map[i].addr + g_nro_map[i].size) {
+            static unsigned stale; if (stale++ < 8) fprintf(stderr, "[dm] ldr:ro: NRO %#llx (%#llx bytes) overlaps %#llx (%#llx bytes) that was never unmapped: the old one is dropped\n", (unsigned long long)nro, (unsigned long long)nsz, (unsigned long long)g_nro_map[i].addr, (unsigned long long)g_nro_map[i].size);
+            if (g_nro_map[i].mod) module_unregister(g_nro_map[i].mod);
+            g_nro_map[i] = g_nro_map[--g_nro_n]; i--;
+        }
         if (g_nro_n < 128 && nsz >= 0x80 && *(const uint32_t *)(uintptr_t)(nro + 0x10) == 0x304f524eu) {      // "NRO0": the segments say where the code, the read-only data and the data are
             // The SDK's exception unwinding (nn::ro::detail::GetExceptionInfo) finds the module of a program counter by walking QueryMemory regions back over Code to the module start, so
             // the NRO is a module of the registry like the ExeFS ones: code [0, ro) RX, read-only [ro, data) R, data and bss [data, end) RW. (Without it a C++ exception thrown in the
@@ -516,13 +523,15 @@ static uint32_t ldr_ro(int session, const ipc_in_t *in, ipc_out_t *out) {
             nm->ro_off = h[0x28 / 4]; nm->data_off = h[0x30 / 4]; nm->nro = 1; module_register(nm);
         }
         if (g_nro_n < 128) { g_nro_map[g_nro_n].addr = nro; g_nro_map[g_nro_n].mod = nm; g_nro_map[g_nro_n++].size = nsz; }
-        static unsigned seen; if (seen++ < 6) fprintf(stderr, "[dm] ldr:ro: NRO mapped at %#llx (%#llx bytes, bss %#llx + %#llx)\n", (unsigned long long)nro, (unsigned long long)nsz, (unsigned long long)bss, (unsigned long long)bsz);
+        static unsigned seen; if (seen++ < 60) fprintf(stderr, "[dm] ldr:ro: NRO #%u mapped (%d live) at %#llx (%#llx bytes, bss %#llx + %#llx)\n", seen, g_nro_n, (unsigned long long)nro, (unsigned long long)nsz, (unsigned long long)bss, (unsigned long long)bsz);
         OUT64(nro); return 0;
     }
     case 1: {                                                // UnmapManualLoadModuleMemory(pid placeholder, nro address)
         uint64_t nro = ARG64(0);
         extern void cpu_invalidate(cpu_t *, uint64_t, uint64_t);
-        for (int i = 0; i < g_nro_n; i++) if (g_nro_map[i].addr == nro) { cpu_invalidate(NULL, nro, g_nro_map[i].size); if (g_nro_map[i].mod) { module_unregister(g_nro_map[i].mod); free(g_nro_map[i].mod); } g_nro_map[i] = g_nro_map[--g_nro_n]; break; }
+        int found = 0;
+        for (int i = 0; i < g_nro_n; i++) if (g_nro_map[i].addr == nro) { found = 1; cpu_invalidate(NULL, nro, g_nro_map[i].size); if (g_nro_map[i].mod) module_unregister(g_nro_map[i].mod); g_nro_map[i] = g_nro_map[--g_nro_n]; break; }   // the module_t is kept, not freed: a reader may hold it
+        { static unsigned un; if (un++ < 60) fprintf(stderr, "[dm] ldr:ro: NRO unmapped at %#llx (%s, %d live)\n", (unsigned long long)nro, found ? "known" : "NEVER MAPPED", g_nro_n); }
         return 0;
     }
     case 2: case 3: case 10: return 0;      // RegisterModuleInfo / UnregisterModuleInfo / RegisterModuleInfoWithUserProcessHandle

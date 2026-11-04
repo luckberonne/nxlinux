@@ -1,4 +1,5 @@
 #include "module.h"
+#include <pthread.h>
 #include "guest_mem.h"
 #include "hle_stub.h"
 #include <stdio.h>
@@ -97,16 +98,28 @@ int module_relocate(module_t *m, module_t **loaded, int nloaded) {
 #define MAX_MODULES 128
 static module_t *g_modules[MAX_MODULES];
 static int g_nmodules;
-void module_register(module_t *m) { if (g_nmodules < MAX_MODULES) g_modules[g_nmodules++] = m; }
-void module_unregister(module_t *m) { for (int i = 0; i < g_nmodules; i++) if (g_modules[i] == m) { g_modules[i] = g_modules[--g_nmodules]; return; } }
+// The registry changes while the title runs (nn::ro maps and unmaps NROs on a loader thread) and is read by every thread that asks QueryMemory or unwinds an exception: one lock around it.
+// A module_t that was unregistered is never freed by the caller, since a reader may still hold the pointer module_of gave it.
+static pthread_mutex_t g_modmu = PTHREAD_MUTEX_INITIALIZER;
+void module_register(module_t *m) { pthread_mutex_lock(&g_modmu); if (g_nmodules < MAX_MODULES) g_modules[g_nmodules++] = m; pthread_mutex_unlock(&g_modmu); }
+void module_unregister(module_t *m) {
+    pthread_mutex_lock(&g_modmu);
+    for (int i = 0; i < g_nmodules; i++) if (g_modules[i] == m) { memmove(&g_modules[i], &g_modules[i + 1], (size_t)(g_nmodules - i - 1) * sizeof g_modules[0]); g_nmodules--; break; }   // order kept: the first match wins in module_of
+    pthread_mutex_unlock(&g_modmu);
+}
 uint64_t module_next_base(uint64_t addr) {   // the lowest module base above addr, or 0 if none
     uint64_t best = 0;
+    pthread_mutex_lock(&g_modmu);
     for (int i = 0; i < g_nmodules; i++) if (g_modules[i]->base > addr && (!best || g_modules[i]->base < best)) best = g_modules[i]->base;
+    pthread_mutex_unlock(&g_modmu);
     return best;
 }
 module_t *module_of(uint64_t addr) {
-    for (int i = 0; i < g_nmodules; i++) if (addr >= g_modules[i]->base && addr - g_modules[i]->base < g_modules[i]->size) return g_modules[i];
-    return NULL;
+    module_t *r = NULL;
+    pthread_mutex_lock(&g_modmu);
+    for (int i = 0; i < g_nmodules && !r; i++) if (addr >= g_modules[i]->base && addr - g_modules[i]->base < g_modules[i]->size) r = g_modules[i];
+    pthread_mutex_unlock(&g_modmu);
+    return r;
 }
 uint64_t module_image_bytes(void) { uint64_t n = 0; for (int i = 0; i < g_nmodules; i++) n += g_modules[i]->size; return (n + 0x1fffff) & ~0x1fffffull; }
 

@@ -17,6 +17,10 @@ Un salto aislado reapareció una vez en Smash (400 dibujos, un fragment shader c
 
 Medido en MPS: un frame entero tarda 90-100 ms en la prueba headless con capturas. Esa cifra no sirve para medir velocidad (las capturas la frenan); está pendiente medirla sin capturas.
 
+### Cierres de Smash jugando (corregido, falta que lo confirmes jugando)
+
+El juego se cerraba solo (código 42) con una aserción sin texto. El trazado del aborto (`abort called from sdk+0xb6bbc ...`, ahora siempre impreso) lo ubica en `nn::ro::detail::GetExceptionInfo`, que el SDK llama al desenrollar una excepción de C++ (las de `app::sv_animcmd`, del lua del juego): toma el inicio del módulo de la dirección y comprueba la firma `MOD0` en su cabecera. Causa: `ldr:ro` UnmapManualLoadModuleMemory leía mal su argumento (el marcador de proceso en vez de la dirección), así que ningún NRO se desregistraba nunca; en la 10.ª carga de NRO uno nuevo se solapó con uno viejo y `module_of` devolvía el viejo, con otro tamaño, y el SDK recibía un inicio de módulo equivocado. Arreglo en `ipc_services.c` (el argumento), más tres protecciones en `module.c` e `ipc_services.c`: el registro lleva un cerrojo, un NRO nuevo retira las entradas viejas que se solapen, y un módulo desregistrado ya no se libera. Cada carga y descarga se registra (`ldr:ro: NRO #n mapped ... / unmapped ... (known | NEVER MAPPED)`); si aparece `NEVER MAPPED` u `overlaps`, algo vuelve a fallar.
+
 ## 2. Lo que se reutiliza
 
 Estas piezas ya no son de un solo juego. Cualquier juego nuevo las usa:
