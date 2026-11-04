@@ -6,6 +6,7 @@
 #include "kernel.h"
 #include "cpu.h"
 #include "guest_mem.h"
+#include "module.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -57,10 +58,17 @@ static void abort_note(const char *kind, uint64_t expr, uint64_t func, uint64_t 
     if (func && in_guest(func, 1)) snprintf(fn, sizeof fn, "%.150s", (const char *)func);
     if (file && in_guest(file, 1)) snprintf(fl, sizeof fl, "%.190s", (const char *)file);
     if (fmt && in_guest(fmt, 1)) snprintf(m, sizeof m, "%.500s", (const char *)fmt);
-    if (getenv("NX_BREAK_STACK")) {     // where it was called from: the frame chain of the calling thread
+    {   // where it was called from: the frame chain of the calling thread, as module+offset (a retail title's assertions carry no text, so this is all there is to go on)
         cpu_t *c = kernel_cpu();
-        if (c) { uint64_t fp = cpu_get_x(c, 29); fprintf(stderr, "[RED]   abort called from lr=%#llx, frames:", (unsigned long long)cpu_get_x(c, 30));
-                 for (int i = 0; i < 16 && fp && in_guest(fp, 16); i++) { uint64_t *f = (uint64_t *)(uintptr_t)fp; fprintf(stderr, " %#llx", (unsigned long long)f[1]); fp = f[0]; } fprintf(stderr, "\n"); }
+        if (c) {
+            uint64_t fp = cpu_get_x(c, 29), lr = cpu_get_x(c, 30), pcs[18]; int n = 0;
+            pcs[n++] = lr;
+            for (int i = 0; i < 16 && fp && in_guest(fp, 16); i++) { uint64_t *f = (uint64_t *)(uintptr_t)fp; pcs[n++] = f[1]; fp = f[0]; }
+            fprintf(stderr, "[RED]   abort called from");
+            for (int i = 0; i < n; i++) { module_t *m = pcs[i] ? module_of(pcs[i]) : NULL;
+                if (m) fprintf(stderr, " %s+%#llx", m->name, (unsigned long long)(pcs[i] - m->base)); else fprintf(stderr, " %#llx", (unsigned long long)pcs[i]); }
+            fprintf(stderr, "\n");
+        }
     }
     fprintf(stderr, "[RED] the title aborted (%s): \"%s\" in %s at %s:%d%s%s\n", kind, e, fn, fl, line, m[0] ? ", message: " : "", m);
     _exit(42);
