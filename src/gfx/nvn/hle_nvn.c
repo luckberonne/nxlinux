@@ -158,6 +158,7 @@ static const int g_devinfo[] = {
 // The NVN API version the game's own driver would report follows its SDK: games check it and create no device on a mismatch. SDK 10 and older are API 53 (Super Mario 3D World 10.4,
 // Age of Calamity 9.6, Link's Awakening 8, Odyssey 7.3, Three Houses 6.5); SDK 11 and later take 55.15
 __attribute__((weak)) int dm_sdk_major(void) { return 0; }   // loader.c; graphics unit tests have no loader
+__attribute__((weak)) int dm_switch2_gfx;                    // hle_gs.c (nxsvc); the graphics unit tests link without it
 __attribute__((weak)) int dm_glslc_gpu_code(int *major, int *minor) { *major = *minor = 0; return 0; }   // hle_glslc.c: the game's own GLSLC's GPU code version
 static void nvn_api(int api[2]) {
     // NX_NVN_API=<major>.<minor>: what the game's driver would report, for a title whose SDK differs from the game profile's (Mario Kart 8 Deluxe 1.0.0 needs 52.32+ and gives up on 55.15)
@@ -166,6 +167,7 @@ static void nvn_api(int api[2]) {
 #ifdef DM_GAME_NVN_API_MAJOR
     api[0] = DM_GAME_NVN_API_MAJOR; api[1] = DM_GAME_NVN_API_MINOR; LOG("[nvn] device API %d.%d (game profile device_api)", api[0], api[1]);
 #else
+    if (dm_switch2_gfx) { api[0] = 231; api[1] = 40; LOG("[nvn] device API 231.40 (Switch 2: the title boots nn::gs)"); return; }
     int m = dm_sdk_major(); api[0] = DM_SDK_OLD(m) ? 53 : g_devinfo[0]; api[1] = DM_SDK_OLD(m) ? 313 : g_devinfo[1]; LOG("[nvn] device API %d.%d (SDK %d)", api[0], api[1], m);
 #endif
 }

@@ -36,6 +36,10 @@ static inline int dm_host_thread_join(pthread_t thread, void **result) {
 // SDK major version from the sdk module's version string; 0 = unknown. SDK 10 and older: NVN API 53, the shared-font address points at the TTF itself
 int dm_sdk_major(void);
 #define DM_SDK_OLD(major) ((major) > 0 && (major) <= 10)
+// A title whose SDK boots a graphics supervisor (nn::gs::sdk::BootGraphicsSystem, system 20+ SDKs) is a Switch 2 title: its NVN is the second
+// generation driver, which reports API 231.x instead of the 53/55 of the first one (Ocarina of Time checks major == 231 and minor >= 40 before it
+// builds its renderer, and on a mismatch it returns early and crashes later on the renderer object it never created)
+extern int dm_switch2_gfx;
 
 // Diagnostic switches: read once from environment variables when the host starts
 extern uint64_t g_t0_ns;   // Host start time (now_ns), used for relative times in the log
