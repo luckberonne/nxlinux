@@ -2,6 +2,7 @@
 """Run a title: extract an NSP (and its update) with the vendored nx_extract, turn each ExeFS module into a memory image with tools/nso.py, write the manifest, start nxlinux.
 
   run_title.py --keys prod.keys --nsp game.nsp [--update upd.nsp] [--work DIR] [--entry SYMBOL] [--shaders LIB.nxsl] [--no-run]
+  run_title.py --nup game.nup [same options]     (a NUP container: no keys; base and update are in the one file)
 
 The keys and the dumps come from your own console (Lockpick_RCM, nxdumptool) and stay wherever you keep them: nothing is copied into the repository, and the extracted files go
 under --work (default work/run/<title>, which git ignores). Modules load in the order the Switch's loader does: rtld, main, subsdk0..9, sdk."""
@@ -15,36 +16,102 @@ import nso
 ORDER = ['rtld', 'main'] + [f'subsdk{i}' for i in range(10)] + ['sdk']
 
 
+def read_module(path):
+    """nso.cli_read, after turning an NSO whose segments are ZBIC (flag bit 7, system 22.0.0+: Nintendo's zstd variant, frames that start with 'ZBIC' and carry their
+    FSE tables in binary interpolative coding, which no standard zstd reads) into one with plain segments. tools/nso.py reads LZ4 and plain segments only; the segment
+    hashes are of the plain bytes, so it still checks them. tools/zbic_to_zstd.py does the decoding."""
+    d = Path(path).read_bytes()
+    if d[:4] != b'NSO0' or len(d) < 0x100 or not struct.unpack_from('<I', d, 0xc)[0] & nso.NSO_ZSTD:
+        return nso.cli_read(path)
+    import zbic_to_zstd as zbic
+    flags = struct.unpack_from('<I', d, 0xc)[0]
+    hdr, body = bytearray(d[:0x100]), bytearray()
+    for i in range(3):
+        fo, mo, sz = struct.unpack_from('<III', d, 0x10 + i * 0x10)
+        raw = d[fo:fo + (struct.unpack_from('<I', d, 0x60 + 4 * i)[0] if flags >> i & 1 else sz)]
+        if flags >> i & 1:
+            try: raw = zbic.decompress(raw)
+            except zbic.Error as e: sys.exit(f'[RED] {path}: segment {i} does not decompress ({e})')
+        struct.pack_into('<I', hdr, 0x10 + i * 0x10, 0x100 + len(body)); struct.pack_into('<I', hdr, 0x60 + 4 * i, len(raw))
+        body += raw
+    struct.pack_into('<I', hdr, 0xc, flags & ~(nso.NSO_ZSTD | 7))
+    try: return nso.load(bytes(hdr + body), str(path))
+    except nso.Error as e: sys.exit(f'[RED] {e}')
+
+
+def plain_returns(image, text_end):
+    """Rewrite the authenticated returns (RETAA, RETAB: ARMv8.3 pointer authentication; the register forms PACIB, AUTIB and the like become NOPs, which system 20+ titles are built with) in a module's text as RET, in place,
+    and return how many. The CPU here does not sign return addresses (PACIBSP and AUTIBSP are hints and do nothing), so the plain return is the same control flow; an
+    undecoded RETAB would stop the first function that returns."""
+    n = 0
+    for word in (b'\xff\x0b\x5f\xd6', b'\xff\x0f\x5f\xd6'):
+        at = image.find(word, 0, text_end)
+        while at >= 0:
+            if at % 4 == 0:
+                image[at:at + 4] = b'\xc0\x03\x5f\xd6'; n += 1
+            at = image.find(word, at + 1, text_end)
+    # The register forms of pointer authentication (PACIA/PACIB/PACDA/PACDB, AUTIA/AUTIB/AUTDA/AUTDB, their Z forms, XPACI/XPACD: setjmp and longjmp use them) are not decoded
+    # by the Jit either. Nothing is signed here, so each leaves its register as it is: a NOP.
+    for at in range(0, min(text_end, len(image)) - 3, 4):
+        w = int.from_bytes(image[at:at + 4], 'little')
+        if (w & 0xFFFFC000) == 0xDAC10000 or (w & 0xFFFFFBE0) == 0xDAC143E0:      # 1-source opcodes 0..15 of group 0xDAC1, and XPACI/XPACD
+            image[at:at + 4] = b'\x1f\x20\x03\xd5'; n += 1
+        elif (w & 0xFFE0FC00) == 0x9AC03000:      # PACGA Xd, Xn, Xm: a keyed checksum that setjmp stores and longjmp recomputes and compares; any constant is as good, so Xd = 0
+            image[at:at + 4] = (0xAA1F03E0 | (w & 31)).to_bytes(4, 'little'); n += 1
+    return n
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--keys', required=True); ap.add_argument('--nsp', required=True); ap.add_argument('--update')
+    ap.add_argument('--keys'); ap.add_argument('--nsp'); ap.add_argument('--update')
+    ap.add_argument('--nup', help='a NUP (.nup) container instead of --keys/--nsp: its ExeFS and RomFS are already plain, so no keys are needed (tools/nup_extract.py)')
     ap.add_argument('--work'); ap.add_argument('--entry'); ap.add_argument('--shaders'); ap.add_argument('--mem-mb', type=int)
     ap.add_argument('--nx-extract', default=str(REPO / 'work' / 'nx_extract' / 'nx_extract'))
     ap.add_argument('--exe', default=str(REPO / 'build' / 'nxlinux'))
     ap.add_argument('--no-run', action='store_true')
+    ap.add_argument('--reuse', action='store_true', help='use the extraction already in the work directory instead of extracting again (a large RomFS takes minutes)')
     ap.add_argument('--nvn-api', help='the NVN API version nvnDeviceGetInteger reports, major.minor (a game checks it against the SDK it was built with)')
     ap.add_argument('--romfs-image', action='store_true', help='build the RomFS as one image the host serves through its file system service, instead of leaving a directory of files')
     a = ap.parse_args(argv)
-    for what, p in (('keys', a.keys), ('NSP', a.nsp), ('nx_extract', a.nx_extract)):
+    if a.nup and (a.nsp or a.keys or a.update):
+        sys.exit('[RED] --nup replaces --nsp, --keys and --update: give one or the other')
+    if not a.nup and not (a.keys and a.nsp):
+        sys.exit('[RED] give --keys and --nsp, or --nup')
+    source = a.nup or a.nsp
+    checks = [('NUP', a.nup)] if a.nup else [('keys', a.keys), ('NSP', a.nsp), ('nx_extract', a.nx_extract)]
+    for what, p in checks:
         if not Path(p).is_file(): sys.exit(f'[RED] {what} not found: {p}')
     if not a.no_run and not Path(a.exe).is_file(): sys.exit(f'[RED] {a.exe} is not built (cmake --build build --target nxlinux)')
-    work = Path(a.work) if a.work else REPO / 'work' / 'run' / re.sub(r'\W+', '_', Path(a.nsp).stem)
+    work = Path(a.work) if a.work else REPO / 'work' / 'run' / re.sub(r'\W+', '_', Path(source).stem)
     out = work / 'extract'
-    shutil.rmtree(out, ignore_errors=True); work.mkdir(parents=True, exist_ok=True)
-    p = subprocess.run([a.nx_extract, a.keys, a.nsp, a.update or '-', str(out)], capture_output=True, text=True)
-    if p.returncode:
-        sys.exit('[RED] nx_extract failed (are the keys the ones for this dump?):\n' + p.stdout + p.stderr)
-    if a.romfs_image:       # one standard RomFS image for the host's file system service; the extracted files are not needed once it is built
-        import romfs_build
-        nd, nf = romfs_build.build(str(out / 'RomFS'), str(out / 'RomFS.img'))
-        print(f'RomFS.img: {nd} directories, {nf} files')
-        shutil.rmtree(out / 'RomFS')
+    work.mkdir(parents=True, exist_ok=True)
+    if a.reuse and (out / 'ExeFS').is_dir():
+        print(f'reusing {out}')
+    else:
+        shutil.rmtree(out, ignore_errors=True)
+        if a.nup:
+            import nup_extract
+            try:
+                nup_extract.extract(a.nup, out, log=print)
+            except nup_extract.NupError as e:
+                sys.exit(f'[RED] {a.nup}: {e}')
+        else:
+            p = subprocess.run([a.nx_extract, a.keys, a.nsp, a.update or '-', str(out)], capture_output=True, text=True)
+            if p.returncode:
+                sys.exit('[RED] nx_extract failed (are the keys the ones for this dump?):\n' + p.stdout + p.stderr)
+        if a.romfs_image:       # one standard RomFS image for the host's file system service; the extracted files are not needed once it is built
+            import romfs_build
+            nd, nf = romfs_build.build(str(out / 'RomFS'), str(out / 'RomFS.img'))
+            print(f'RomFS.img: {nd} directories, {nf} files')
+            shutil.rmtree(out / 'RomFS')
     exefs = out / 'ExeFS'
     names = [n for n in ORDER if (exefs / n).is_file()]
     if not names: sys.exit(f'[RED] no code modules in {exefs}')
     lines = []
     for n in names:
-        m = nso.cli_read(exefs / n)
+        m = read_module(exefs / n)
+        nret = plain_returns(m.image, m.text_end)
+        if nret: print(f'{n}: {nret} authenticated returns rewritten as RET')
         img = work / f'{n}.img'
         img.write_bytes(bytes(m.image))
         with open(img, 'r+b') as f: f.truncate(len(m.image) + m.bss)       # bss as a sparse zero tail: the host reads (file size - bss) bytes of image

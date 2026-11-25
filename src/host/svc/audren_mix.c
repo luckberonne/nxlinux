@@ -4,11 +4,16 @@
 // resampling into the mix buffers its channel resources point at, routes submixes into their destinations through their volume matrices, and maps the
 // final mix through the device sink to 5.1, downmixed to stereo. Effects run on their mix before it is routed on, in processing order: auxiliary sends
 // (the title's own effect code reads its send ring and fills the return ring), delays; a reverb is not rendered, its input buffers are cleared. The answer tells the title how many samples and wave buffers each voice has played, which is what paces its streaming.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "audren_mix.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 enum { HDR = 0x40, MEMPOOL_IN = 0x20, MEMPOOL_OUT = 0x10, CHAN_IN = 0x70, VOICE_IN = 0x170, VOICE_OUT = 0x10, EFFECT_IN = 0xc0, EFFECT_OUT = 0x10,
        MIX_IN = 0x930, SINK_IN = 0x140, SINK_OUT = 0x20, PERF_OUT = 0x10, BEHAVIOR_OUT = 0xb0 };
@@ -113,6 +118,12 @@ static void voice_flush(voice_t *v, int n) {   // drops n queued wave buffers fr
     for (int k = 0; k < n && v->valid[v->cur]; k++) { v->valid[v->cur] = 0; v->consumed++; v->cur = (v->cur + 1) & 3; v->fresh = 1; }
 }
 
+// The ADPCM coefficients are read from a guest address the title sent; a stride that does not match the title's voice structure (the Switch 2 SDK's are 0x188 bytes) turns the
+// fields into garbage, and reading an unmapped address would take the whole host down: process_vm_readv on ourselves fails with EFAULT instead
+static int copy_guest(void *dst, uint64_t addr, size_t n) {
+    struct iovec l = {dst, n}, r = {(void *)(uintptr_t)addr, n};
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
+}
 static void voice_update(voice_t *v, const uint8_t *in) {
     int used = in[9];
     if (!used) { v->used = 0; return; }
@@ -124,7 +135,7 @@ static void voice_update(voice_t *v, const uint8_t *in) {
     v->mix = (int)rd32(in + 0x58);
     for (int c = 0; c < 6; c++) v->chan[c] = rd32(in + 0x140 + 4 * c);
     uint64_t extra = rd64(in + 0x48), extra_sz = rd64(in + 0x50);
-    if (v->fmt == FMT_ADPCM && extra && extra_sz >= sizeof v->coef) memcpy(v->coef, (const void *)(uintptr_t)extra, sizeof v->coef);
+    if (v->fmt == FMT_ADPCM && extra && extra_sz >= sizeof v->coef) copy_guest(v->coef, extra, sizeof v->coef);
     for (int i = 0; i < 4; i++) {                // a wave buffer the client has not sent before joins the queue
         const uint8_t *w = in + 0x60 + 0x38 * i;
         if (w[0x1a]) continue;                   // sent_to_server
@@ -189,10 +200,16 @@ uint32_t ar_mixer_update(ar_mixer_t *m, const uint8_t *in, uint32_t in_size, uin
     uint32_t behavior = rd32(in + 4), pools = rd32(in + 8), voices = rd32(in + 12), chans = rd32(in + 16), effects = rd32(in + 20), mixes = rd32(in + 24), sinks = rd32(in + 28), perf = rd32(in + 32);
     if ((uint64_t)HDR + behavior + pools + chans + voices + effects + mixes + sinks > in_size) { fprintf(stderr, "[RED] audren: the update (revision word %#x) does not fit its header: %u bytes, sections behavior %u pools %u voices %u channels %u effects %u mixes %u sinks %u\n", rd32(in), in_size, behavior, pools, voices, chans, effects, mixes, sinks); return 0xc01u; }
     { static int once; if (!once++) fprintf(stderr, "[dm] audren: update revision word %#x (\"%.4s\"), sections behavior %u pools %u voices %u channels %u effects %u mixes %u sinks %u perf %u, %u bytes in, %u out\n", rd32(in), (const char *)in, behavior, pools, voices, chans, effects, mixes, sinks, perf, in_size, out_size); }
-    uint32_t npool = pools / MEMPOOL_IN, nvoice = voices / VOICE_IN, nchan = chans / CHAN_IN, neffect = effects / EFFECT_IN, nsink = sinks / SINK_IN;
+    // The Switch 2 SDK's revision word is 'REV@' (0x40 where the digit goes): its voices are 0x188 bytes each, not 0x170 (OoT: 37632 bytes of voices = 96 x 0x188; read with 0x170 that is 102.3 voices)
+    uint32_t voice_in = (int)((rd32(in) >> 24) - '0') >= 16 ? 0x188 : VOICE_IN;
+    uint32_t npool = pools / MEMPOOL_IN, nvoice = voices / voice_in, nchan = chans / CHAN_IN, neffect = effects / EFFECT_IN, nsink = sinks / SINK_IN;
     if (nvoice > m->nvoice) nvoice = m->nvoice;
     if (nchan > MAX_CHANS) nchan = MAX_CHANS;
-    uint32_t o_pool = npool * MEMPOOL_OUT, o_voice = nvoice * VOICE_OUT, o_effect = neffect * EFFECT_OUT, o_sink = nsink * SINK_OUT, o_perf = perf ? PERF_OUT : 0;
+    // The Switch 2 SDK's revision word is 'REV@' (0x40 where the digit goes): its effect status entries are 0x90 bytes, not 0x10 (nn::audio::EffectManager::UpdateEffectOutStatus steps 144
+    // bytes per effect and checks the section size against it). The input structures changed too: the voices are 0x188 bytes each, not 0x170.
+    int rev0 = (int)((rd32(in) >> 24) - '0');
+    uint32_t effect_out = rev0 >= 16 ? 0x90 : EFFECT_OUT;
+    uint32_t o_pool = npool * MEMPOOL_OUT, o_voice = nvoice * VOICE_OUT, o_effect = neffect * effect_out, o_sink = nsink * SINK_OUT, o_perf = perf ? PERF_OUT : 0;
     // From revision 7 the response carries a render info block too (the frame count the DSP has rendered), after the behaviour block, its size in the header's word 10; the title's own
     // update tells the revision as 'REV<n>' (0x4e564552 with the digit in the top byte), and a response without the block fails the SDK's check (2153-0041, an abort in Mario Party Superstars)
     int rev = (int)((rd32(in) >> 24) - '0'); uint32_t o_render = rev >= 7 ? 0x10 : 0;
@@ -213,7 +230,7 @@ uint32_t ar_mixer_update(ar_mixer_t *m, const uint8_t *in, uint32_t in_size, uin
     p += chans;
     static int trace = -1; if (trace < 0) trace = getenv("NX_AUDREN_TRACE") != NULL;
     for (uint32_t i = 0; i < nvoice; i++) {
-        const uint8_t *in = p + i * VOICE_IN; voice_t *v = &m->voice[i];
+        const uint8_t *in = p + i * voice_in; voice_t *v = &m->voice[i];
         voice_update(v, in);
         if (!trace || !in[8] || !in[9]) continue;    // a new voice: what it plays and where it goes
         fprintf(stderr, "[audren] voice %u: format %d, %u Hz, %d channels, pitch %.3f, volume %.3f, state %d, mix %d:", rd32(in), v->fmt, v->rate, v->nch, v->pitch, v->volume, in[10], v->mix);

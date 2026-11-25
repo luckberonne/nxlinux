@@ -106,6 +106,8 @@ static uint32_t renderer(int session, const ipc_in_t *in, ipc_out_t *out) {
     case 8: return 0;                                       // SetRenderingTimeLimit
     case 9: OUT32(100); return 0;                           // GetRenderingTimeLimit
     case 11: return 0;                                      // ExecuteAudioRendererRendering
+    case 12: return 0;                                      // SetVoiceDropParameter(float): the title sends 0.9; nothing is dropped here
+    case 13: OUT32(0x3f666666); return 0;                   // GetVoiceDropParameter → 0.9f
     default: fprintf(stderr, "[RED] ipc: audren IAudioRenderer command %u is not implemented\n", in->cmd); return R_NOT_IMPL;
     }
 }
@@ -125,6 +127,15 @@ static uint32_t device(int session, const ipc_in_t *in, ipc_out_t *out) {
         return 0;
     case 4: case 11: case 12: out->copy[out->ncopy++] = kernel_event_new(0); return 0;   // QueryAudioDeviceSystemEvent / InputEvent / OutputEvent
     case 5: OUT32(2); return 0;                             // GetActiveChannelCount
+    case 13:                                                // GetActiveAudioOutputDeviceName (Switch 2 SDK): a 0x100-byte name
+        if (in->nrecv) { memset((void *)(uintptr_t)in->recv[0].addr, 0, in->recv[0].size); memcpy((void *)(uintptr_t)in->recv[0].addr, "AudioTvOutput", sizeof "AudioTvOutput" <= in->recv[0].size ? sizeof "AudioTvOutput" : in->recv[0].size); }
+        return 0;
+    case 19: return 0;                                      // SetDeviceOutputVolumeAutoTuneModeEnabled(bool)
+    case 17: return 0;                                      // not known (arguments: a number and 0x20); accepted
+    case 20: OUT32(0); return 0;                            // IsDeviceOutputVolumeAutoTuneModeEnabled (nn::audio, Switch 2 SDK) → false
+    case 14:                                                // ListAudioOutputDeviceName (Switch 2 SDK; the title passes the count 3 and a 0x300-byte buffer of 0x100-byte names) → how many: one, the TV
+        if (in->nrecv) { memset((void *)(uintptr_t)in->recv[0].addr, 0, in->recv[0].size); if (in->recv[0].size >= 0x100) memcpy((void *)(uintptr_t)in->recv[0].addr, "AudioTvOutput", sizeof "AudioTvOutput"); }
+        OUT32(1); return 0;
     default: fprintf(stderr, "[RED] ipc: audren IAudioDevice command %u is not implemented\n", in->cmd); return R_NOT_IMPL;
     }
 }
@@ -152,7 +163,34 @@ static uint32_t manager(int session, const ipc_in_t *in, ipc_out_t *out) {
     }
 }
 
+// The Switch 2 SDK (nn::audio::CreateUserClientSessionByHipc) opens "aud:u", the root of the audio services. Command 2 (arguments: 'IFCS' tag, 1, the process id) hands out the
+// interface the renderer manager has (GetWorkBufferSize is the next thing the title sends to it); the rest of the root is not known.
+static uint32_t aud_root(int session, const ipc_in_t *in, ipc_out_t *out) {
+    (void)session;
+    switch (in->cmd) {
+    case 2: out->move[out->nmove++] = ipc_new_session("IAudioRendererManager", manager); return 0;
+    default: fprintf(stderr, "[RED] ipc: aud:u command %u is not implemented\n", in->cmd); return R_NOT_IMPL;
+    }
+}
+
+// "auddmg:u" is nn::audio::devmgr::IUserSessionManager, the audio device manager the Switch 2 SDK asks for when it lists the virtual input devices
+// (nn::audio::detail::ListVirtualInputDevices). Command 0 (arguments: 2, 0, the process id, ...) opens an IUserSession, whose commands (ListVirtualDeviceNames, GetDefaultVirtualDeviceName,
+// IsVirtualDeviceAvailable, GetVirtualDeviceProfile, AttachStream, ...) are not numbered here yet: each is logged and answered with success and a zero, which reads as "no devices".
+static uint32_t auddmg_session(int session, const ipc_in_t *in, ipc_out_t *out) {
+    (void)session;
+    fprintf(stderr, "[RED] ipc: auddmg IUserSession command %u (%u args, %u in, %u out buffers) is not known: answered with success and a zero count\n", in->cmd, in->nargs, in->nsend, in->nrecv);
+    OUT32(0); return 0;
+}
+static uint32_t auddmg(int session, const ipc_in_t *in, ipc_out_t *out) {
+    (void)session;
+    if (in->cmd == 0) { out->move[out->nmove++] = ipc_new_session("IUserSession", auddmg_session); return 0; }
+    fprintf(stderr, "[RED] ipc: auddmg:u command %u is not implemented\n", in->cmd);
+    return R_NOT_IMPL;
+}
+
 __attribute__((constructor)) static void register_audren(void) {
     ipc_register_service("audren:u", manager);
     ipc_register_service("audren:a", manager);
+    ipc_register_service("aud:u", aud_root);
+    ipc_register_service("auddmg:u", auddmg);
 }

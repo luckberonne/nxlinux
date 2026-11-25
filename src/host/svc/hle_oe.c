@@ -5,6 +5,7 @@
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
 #include <stdatomic.h>
+#include <time.h>
 static _Atomic int g_opmode = -1;
 int dm_opmode(void) {
     int m = g_opmode;
@@ -84,6 +85,11 @@ HLE_FORCE("_ZN2nn2oe44SetUserInactivityDetectionTimeExtendedUnsafeEb", "inactivi
 HLE_FORCE("_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb", "inactivity extension mode 1 or 0; the host never turns the screen off", void, h_oe_InactivityExtSafe, unsigned on) { g_inactivity_mode = on & 1; }
 HLE_FORCE("_ZN2nn2oe43GetUserInactivityDetectionTimeExtensionModeEv", "inactivity extension mode requested by the application", int, h_oe_InactivityMode, void) { return g_inactivity_mode; }
 HLE_FORCE("_ZN2nn6applet15SetCpuBoostModeEi", "CPU boost mode request (a title asks for the faster CPU while it loads); the SDK calls an applet service object that oe::Initialize, taken over, never set up (Mario Party Superstars)", int, h_applet_CpuBoost, int mode) { (void)mode; return 0; }
+HLE_FORCE("_ZN2nn2oe25GetProgramTotalActiveTimeEv", "how long the program has been running (an nn::TimeSpan in nanoseconds): the host's monotonic clock since the first call", int64_t, h_oe_ActiveTime, void) {
+    static int64_t t0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec; if (!t0) t0 = now;
+    return now - t0;
+}
 HLE_FORCE("_ZN2nn2oe15EnableRecordingEv", "video recording switch; the host has no system recording", void, h_oe_EnableRec, void) {}
 // Applet resource user ID (ARUID, the number am assigns to this process): the host has no am, and the SDK's own getter returns 0. SDK 20's OpenAudioRenderer (the CPU rendering + manual execution path, sdk+0x221730)
 //   aborts when it gets 0 (The Legend of Zelda: Breath of the Wild 1.9.0); SDK 16 did not check. Report a fixed non-zero ID, used only as an identifier
@@ -227,6 +233,9 @@ HLE_FORCE("_ZN2nn2oe28SetResumeNotificationEnabledEb", "resume notification swit
 // of these (main+0x8da0bc for 16, main+0x8da080 for 15 with InFocus): without one, the two-player character select stood still forever.
 void dm_applet_returned(void) { if (atomic_load(&g_ntf_resume)) mq_push(MSG_RESUME); else if (focus_notifies()) mq_push(MSG_FOCUS); }
 HLE_FORCE("_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb", "operation mode change notification switch", void, h_oe_SetOpModeNtf, unsigned on) { g_ntf_opmode = on & 0xff; }
+HLE_FORCE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", "graphics scale change notification switch (system 20+ SDKs); the host never changes the scale, so none is sent", void, h_oe_SetGfxScaleNtf, unsigned on) { (void)on; }
+typedef struct { uint64_t a; uint32_t b; } gfx_scaling_t;
+HLE_FORCE("_ZN2nn2oe28GetGraphicsScalingParametersEv", "graphics scaling parameters (system 20+ SDKs), 12 bytes: the first word is the scale in tenths, which GetCurrentGraphicsScale accepts as 10, 20 or 30 and aborts on otherwise; the rest is not known here", gfx_scaling_t, h_oe_GetGfxScaling, void) { return (gfx_scaling_t){10, 0}; }
 HLE_FORCE("_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb", "performance mode change notification switch", void, h_oe_SetPerfModeNtf, unsigned on) { g_ntf_perfmode = on & 0xff; }
 
 // nn::settings::LanguageCode = struct { char string[8]; }, 8 bytes returned by value in x0

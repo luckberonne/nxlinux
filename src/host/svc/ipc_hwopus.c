@@ -56,7 +56,7 @@ static uint32_t decoder(int session, const ipc_in_t *in, ipc_out_t *out) {
     case 0: return decode(in, out, 0, 0);                          // DecodeInterleavedOld
     case 2: return decode(in, out, 0, 0);                          // DecodeInterleavedForMultiStreamOld
     case 4: case 5: return decode(in, out, 0, 1);                  // ...WithPerfOld
-    case 6: case 7: return decode(in, out, in->nargs && (in->args[0] & 1), 1);     // DecodeInterleaved(ForMultiStream)(bool reset) -> consumed, samples, performance
+    case 6: case 7: case 8: case 9: return decode(in, out, in->nargs && (in->args[0] & 1), 1);     // DecodeInterleaved(ForMultiStream)(bool reset), the PerfAndReset form (6, 7) and the current one (8, 9) -> consumed, samples, performance
     case 1: case 3: return 0;                                      // SetContext(ForMultiStream): nothing to keep
     default: fprintf(stderr, "[RED] ipc: hwopus IHardwareOpusDecoder command %u is not implemented\n", in->cmd); return R_NOT_IMPL;
     }
@@ -75,7 +75,7 @@ static uint32_t manager(int session, const ipc_in_t *in, ipc_out_t *out) {
         out->move[out->nmove++] = ipc_new_session_owned("hwopus.d", decoder, d, dec_fin);
         return 0;
     }
-    case 1: case 5: OUT32(work_size((int)in->args[1])); return 0;  // GetWorkBufferSize(Ex)(OpusParameters)
+    case 1: case 5: case 8: OUT32(work_size((int)in->args[1])); return 0;  // GetWorkBufferSize(Ex)(ExEx)(OpusParameters {sample rate, channels; flags})
     case 2: case 6: {                                              // OpenHardwareOpusDecoderForMultiStream(Ex)(parameters in a buffer, work buffer size; transfer memory)
         if (!in->nsend || in->send[0].size < 16) return R_INVALID;
         const int32_t *pm = (const int32_t *)(uintptr_t)in->send[0].addr;     // sample rate, channels, total streams, stereo streams, then a mapping of 0x100 bytes
@@ -86,7 +86,7 @@ static uint32_t manager(int session, const ipc_in_t *in, ipc_out_t *out) {
         out->move[out->nmove++] = ipc_new_session_owned("hwopus.d", decoder, d, dec_fin);
         return 0;
     }
-    case 3: case 7: {                                              // GetWorkBufferSizeForMultiStream(Ex)
+    case 3: case 7: case 9: {                                      // GetWorkBufferSizeForMultiStream(Ex)(ExEx)
         const int32_t *pm = in->nsend ? (const int32_t *)(uintptr_t)in->send[0].addr : NULL;
         OUT32(work_size(pm ? pm[1] : 2) + 0x1000); return 0;
     }

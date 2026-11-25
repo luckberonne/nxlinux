@@ -192,6 +192,23 @@ namespace Ryujinx.Graphics.Shader.Translation
             }
         }
 
+        // The Sm86 frontend's entry (Translation/Sm86): the operations come from its emit callback instead of the Maxwell decoder's blocks.
+        internal ShaderProgram TranslateCustom(System.Action<EmitterContext> emit, FeatureFlags usedFeatures, byte clipDistancesWritten)
+        {
+            ResourceManager resourceManager = CreateResourceManager(false);
+
+            resourceManager.SetCurrentLocalMemory(_localMemorySize, usedFeatures.HasFlag(FeatureFlags.LocalMemory));
+
+            if (Stage == ShaderStage.Compute)
+            {
+                resourceManager.SetCurrentSharedMemory(GpuAccessor.QueryComputeSharedMemorySize(), usedFeatures.HasFlag(FeatureFlags.SharedMemory));
+            }
+
+            FunctionCode[] code = { Translator.EmitCustom(this, resourceManager, _program, emit) };
+
+            return Translate(code, resourceManager, usedFeatures, clipDistancesWritten, false);
+        }
+
         public ShaderProgram Translate(bool asCompute = false)
         {
             ResourceManager resourceManager = CreateResourceManager(asCompute);

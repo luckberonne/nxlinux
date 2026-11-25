@@ -7,6 +7,10 @@
 // A submission is one primary command buffer, recorded between mtl_sub_begin and mtl_sub_commit and submitted with a timeline semaphore
 // signal. The fence value of a submission is the timeline value it signals: it completes when the GPU has actually reached it, and every
 // visible effect of "GPU completion" waits for that, as nxnative's ordering convention requires.
+#include <unistd.h>
+#include <sys/uio.h>
+#include <sys/mman.h>
+#include <execinfo.h>
 #include "nvn_obj.h"
 #include "nvn_mtl.h"
 #include "nvn_vk.h"
@@ -34,13 +38,19 @@ typedef struct {
     uint64_t base, size;               // as the game gave it
     uint64_t abase, asize;             // widened to the import alignment: what Vulkan sees
     VkBuffer buf; VkDeviceMemory mem; VkDeviceAddress gpu;
+    void *cmap; uint64_t cfence;       // NX_POOL_COPY: the pool's private copy (mapped) and the submission it was last refreshed for
     int tried;                         // the memory is imported when the GPU first needs the pool, not when the game makes it (pool_ensure): most pools are never used by the GPU
+    int placed;                        // NX_POOL_PLACED: the pool's pages are device memory mapped at the pool's own address (pool_place), not an import of the guest's pages
 } gpool_t;
+
+uint8_t g_cs_keys[1 << 18][8]; unsigned g_cs_n;       // compute program keys dispatched since the last submit
+void nvn_cs_note(const uint8_t *k) { memcpy(g_cs_keys[g_cs_n & ((1 << 18) - 1)], k, 8); g_cs_n++; }
 
 static struct {
     pthread_once_t once; vkctx_t c; int ok;
     VkSemaphore tl;
     pthread_mutex_t pool_mu; gpool_t pool[MAX_POOLS]; int npool;
+    struct dev_ent { uint64_t gpu, end, abase; } *dev; int ndev, cdev, dev_dirty;   // the imported pools by device address (nvn_gpu_addr_in)
     VkCommandBuffer cur;                                 // the submission being recorded
     struct { VkCommandBuffer cb; uint64_t value; } flight[MAX_INFLIGHT]; int nflight;
     _Atomic uint64_t submitted;                          // last timeline value handed to the queue
@@ -94,7 +104,7 @@ int nvn_vk_transient(size_t size, VkDescriptorBufferInfo *out, void **map) {
     if (g_trcur < 0) {
         uint64_t done = nvn_gpu_completed();
         for (int i = 0; i < g_ntr && g_trcur < 0; i++) if (g_tr[i].fence <= done) { g_trcur = i; g_tr[i].used = 0; }
-        if (g_trcur < 0 && g_ntr < TR_MAX && !vkbuf_create(&G.c, &g_tr[g_ntr].b, TR_CHUNK, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 1)) { g_tr[g_ntr].used = 0; g_trcur = g_ntr++; }
+        if (g_trcur < 0 && g_ntr < TR_MAX && !vkbuf_create(&G.c, &g_tr[g_ntr].b, TR_CHUNK, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 1)) { g_tr[g_ntr].used = 0; g_trcur = g_ntr++; }
         if (g_trcur < 0) { pthread_mutex_unlock(&g_tr_mu); return -1; }   // every chunk is still in flight: the caller makes its own buffer
     }
     size_t off = (g_tr[g_trcur].used + align - 1) & ~(align - 1);
@@ -201,6 +211,35 @@ static void pool_import(gpool_t *p) {
     uint64_t al = G.c.host_import_align ? G.c.host_import_align : 4096;
     p->abase = p->base & ~(al - 1); p->asize = ((p->base + p->size + al - 1) & ~(al - 1)) - p->abase;
     void *host = (void *)(uintptr_t)p->abase;
+    if (getenv("NX_POOL_MAPS") && p->asize >= (1u << 20)) {      // NX_POOL_MAPS=1 (diagnosis): how the host's address space covers a pool of 1 MB or more: mapped bytes, holes, and any range that is not read-write
+        FILE *mf = fopen("/proc/self/maps", "r"); char ln[512]; uint64_t cov = 0, lo = p->abase, hi = p->abase + p->asize, bad = 0; int n = 0;
+        while (mf && fgets(ln, sizeof ln, mf)) { unsigned long long a, b; char pr[8] = {0}; if (sscanf(ln, "%llx-%llx %7s", &a, &b, pr) != 3 || b <= lo || a >= hi) continue;
+            uint64_t x = a > lo ? a : lo, y = b < hi ? b : hi; cov += y - x; n++; if (pr[0] != 'r' || pr[1] != 'w') { bad += y - x; fprintf(stderr, "[dm] [nvn]   pool %#llx+%#llx: %#llx-%#llx is %s\n", (unsigned long long)p->base, (unsigned long long)p->size, (unsigned long long)x, (unsigned long long)y, pr); } }
+        if (mf) fclose(mf);
+        fprintf(stderr, "[dm] [nvn] pool %#llx+%#llx: %d mapping(s) cover %#llx of %#llx bytes%s%s\n", (unsigned long long)p->base, (unsigned long long)p->size, n, (unsigned long long)cov, (unsigned long long)p->asize, cov != p->asize ? ", HOLES" : "", bad ? ", NOT READ-WRITE" : "");
+    }
+    {   // NX_POOL_COPY=<bytes> (diagnosis): pools of that size up to 64 MB are not imported by host pointer; the GPU gets a private copy, refreshed from the guest's memory once per submission (reads only)
+        static long minc = -2; if (minc == -2) { const char *e = getenv("NX_POOL_COPY"); minc = e ? atol(e) : -1; }
+        if (minc >= 0 && p->asize >= (uint64_t)minc && p->asize <= (64u << 20)) {
+            VkBufferCreateInfo cb = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, .size = p->asize, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+            VkMemoryRequirements mr; void *map = NULL;
+            if (!vkCreateBuffer(G.c.dev, &cb, NULL, &p->buf)) {
+                vkGetBufferMemoryRequirements(G.c.dev, p->buf, &mr);
+                uint32_t mt = vkctx_memtype(&G.c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+                VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fi, mr.size, mt};
+                if (mt != UINT32_MAX && !nx_vk_alloc(G.c.dev, &ai, &p->mem) && !vkBindBufferMemory(G.c.dev, p->buf, p->mem, 0) && !vkMapMemory(G.c.dev, p->mem, 0, VK_WHOLE_SIZE, 0, &map)) {
+                    VkBufferDeviceAddressInfo di = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = p->buf};
+                    p->gpu = vkGetBufferDeviceAddress(G.c.dev, &di); p->cmap = map; p->cfence = 0; G.dev_dirty = 1;
+                    fprintf(stderr, "[dm] [nvn] pool %#llx+%#llx: a private copy stands in for the import (NX_POOL_COPY)\n", (unsigned long long)p->base, (unsigned long long)p->size);
+                    return;
+                }
+                vkDestroyBuffer(G.c.dev, p->buf, NULL); p->buf = VK_NULL_HANDLE; p->mem = VK_NULL_HANDLE;
+            }
+        }
+    }
     VkMemoryHostPointerPropertiesEXT hp = {VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     VkResult r = G.c.GetMemoryHostPointerProperties(G.c.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &hp);
     if (r) { fprintf(stderr, "[dm] [RED] [nvn] pool %#llx+%#llx: the host pointer cannot be imported (%d)\n", (unsigned long long)p->base, (unsigned long long)p->size, (int)r); return; }
@@ -221,12 +260,68 @@ static void pool_import(gpool_t *p) {
     }
     VkBufferDeviceAddressInfo di = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = p->buf};
     p->gpu = vkGetBufferDeviceAddress(G.c.dev, &di);
+    G.dev_dirty = 1;
+}
+// NX_POOL_PLACED=1 (needs VK_EXT_map_memory_placed): a pool the game makes gets device memory of its own, mapped over the pool's address range with the bytes the game had put
+// there, so the game, the host and the GPU all use the same pages. An imported host pointer is a userptr object to amdgpu, whose pages the kernel walks and revalidates on every
+// submission (with bufferDeviceAddress every object is in every submission): 1.6 GB of imported pools cost the Radeon 660M 6-17 ms per vkQueueSubmit, a few per frame. Device memory
+// costs a fraction of that. Done when the pool is made (before its dirty tracking starts and while no other guest thread uses the memory); pools whose start or size is not page
+// aligned, or whose memory cannot be read, are imported as before.
+static int placed_mode(void) { static int on = -1; if (on < 0) on = getenv("NX_POOL_PLACED") && G.c.has_map_placed ? atoi(getenv("NX_POOL_PLACED")) : 0; if (on < 0) on = 0; return on; }   // 2: log every placed pool and its device addresses
+static int pool_place(gpool_t *p) {
+    const uint64_t pg = 4096;
+    // Small pools stay imported (NX_POOL_PLACED_MIN, default 1 MB): OoT reads past the end of an 8 KB pool at the world load; an import puts other memory after it, a placed
+    // pool has an unmapped hole there and the GPU faults (device lost). The small pools hold few of the bytes that make a submission slow.
+    static long minb = -1; if (minb < 0) { const char *e = getenv("NX_POOL_PLACED_MIN"); minb = e ? atol(e) : 1l << 20; }
+    if ((p->base & (pg - 1)) || (p->size & (pg - 1)) || !p->size || p->size < (uint64_t)minb) return 0;
+    void *tmp = malloc(p->size); if (!tmp) return 0;
+    struct iovec l = {tmp, p->size}, r = {(void *)(uintptr_t)p->base, p->size};
+    if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) != (ssize_t)p->size) { free(tmp); return 0; }       // a hole or an unreadable page: not a plain range of memory
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, .size = p->size, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+    VkBuffer buf; if (vkCreateBuffer(G.c.dev, &bi, NULL, &buf)) { free(tmp); return 0; }
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(G.c.dev, buf, &mr);
+    uint32_t mt = vkctx_memtype(&G.c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fi, mr.size, mt};
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (mr.size != p->size || mt == UINT32_MAX || nx_vk_alloc(G.c.dev, &ai, &mem) || vkBindBufferMemory(G.c.dev, buf, mem, 0)) {      // a larger allocation would map over the memory after the pool
+        if (mem) nx_vk_free(G.c.dev, mem); vkDestroyBuffer(G.c.dev, buf, NULL); free(tmp); return 0;
+    }
+    VkMemoryMapPlacedInfoEXT pl = {VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, NULL, (void *)(uintptr_t)p->base};
+    VkMemoryMapInfoKHR mi = {VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, &pl, VK_MEMORY_MAP_PLACED_BIT_EXT, mem, 0, VK_WHOLE_SIZE};
+    void *at = NULL;
+    if (G.c.MapMemory2(G.c.dev, &mi, &at) || at != (void *)(uintptr_t)p->base) {
+        static int said; if (!said++) fprintf(stderr, "[dm] [RED] [nvn] pool %#llx+%#llx: placed mapping failed, the pool is imported instead\n", (unsigned long long)p->base, (unsigned long long)p->size);
+        if (at && at != (void *)(uintptr_t)p->base) { VkMemoryUnmapInfoKHR ui = {VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR, NULL, 0, mem}; G.c.UnmapMemory2(G.c.dev, &ui); }
+        nx_vk_free(G.c.dev, mem); vkDestroyBuffer(G.c.dev, buf, NULL); free(tmp); return 0;      // a failed placed map leaves the range as it was
+    }
+    memcpy(at, tmp, p->size); free(tmp);
+    VkBufferDeviceAddressInfo di = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = buf};
+    p->abase = p->base; p->asize = p->size; p->buf = buf; p->mem = mem; p->gpu = vkGetBufferDeviceAddress(G.c.dev, &di); p->placed = 1; G.dev_dirty = 1;
+    if (placed_mode() >= 2) { extern uint64_t nvn_present_count(void); fprintf(stderr, "[dm] [nvn] placed pool %#llx+%#llx: device %#llx-%#llx at present %llu\n", (unsigned long long)p->base, (unsigned long long)p->size, (unsigned long long)p->gpu, (unsigned long long)(p->gpu + p->size), (unsigned long long)nvn_present_count()); }
+    static _Atomic uint64_t nplaced, bplaced; uint64_t k = atomic_fetch_add(&nplaced, 1) + 1, b = atomic_fetch_add(&bplaced, p->size) + p->size;
+    if ((k & (k - 1)) == 0) fprintf(stderr, "[dm] [nvn] placed pools: %llu so far, %llu MB\n", (unsigned long long)k, (unsigned long long)(b >> 20));
+    return 1;
+}
+static void pool_unplace(gpool_t *p) {      // the pool goes away: its bytes go back into ordinary memory at the same address (the game owns that memory again)
+    if (placed_mode() >= 2) { extern uint64_t nvn_present_count(void); fprintf(stderr, "[dm] [nvn] unplaced pool %#llx+%#llx: device %#llx-%#llx at present %llu\n", (unsigned long long)p->base, (unsigned long long)p->size, (unsigned long long)p->gpu, (unsigned long long)(p->gpu + p->size), (unsigned long long)nvn_present_count()); }
+    void *tmp = malloc(p->size); if (tmp) memcpy(tmp, (void *)(uintptr_t)p->base, p->size);
+    VkMemoryUnmapInfoKHR ui = {VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR, NULL, VK_MEMORY_UNMAP_RESERVE_BIT_EXT, p->mem};
+    G.c.UnmapMemory2(G.c.dev, &ui);                                     // the range stays reserved, so nothing else can be mapped there in between
+    void *a = mmap((void *)(uintptr_t)p->base, p->size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (a == MAP_FAILED) { fprintf(stderr, "[dm] [RED] [nvn] pool %#llx: the memory could not be given back after its placed mapping\n", (unsigned long long)p->base); abort(); }
+    if (tmp) { memcpy(a, tmp, p->size); free(tmp); }
+    p->placed = 0;
 }
 static void pool_release(gpool_t *p) {
     if (!p->buf) return;
     vkDeviceWaitIdle(G.c.dev);                            // the GPU may still read it: the guest is about to reuse or free this memory
+    if (p->placed) pool_unplace(p);
     vkDestroyBuffer(G.c.dev, p->buf, NULL); nx_vk_free(G.c.dev, p->mem);
-    p->buf = VK_NULL_HANDLE; p->mem = VK_NULL_HANDLE;
+    p->buf = VK_NULL_HANDLE; p->mem = VK_NULL_HANDLE; G.dev_dirty = 1;
 }
 
 static int pool_slot(uint64_t base) {                     // the first entry whose base is >= base: caller holds pool_mu
@@ -234,8 +329,9 @@ static int pool_slot(uint64_t base) {                     // the first entry who
     while (lo < hi) { int m = (lo + hi) / 2; if (G.pool[m].base < base) lo = m + 1; else hi = m; }
     return lo;
 }
-void mtl_pool_add(const void *mem, uint64_t size) {
+static void pool_add(const void *mem, uint64_t size, int placed) {
     int on = gpu();
+    if (getenv("NX_POOL_LOG2")) { extern uint64_t nvn_present_count(void); fprintf(stderr, "[dm] [nvn] pool add %p %#llx at present %llu\n", mem, (unsigned long long)size, (unsigned long long)nvn_present_count()); }       // NX_POOL_LOG2=1: every pool made or dropped, with the present number
     pthread_mutex_lock(&G.pool_mu);
     uint64_t base = (uint64_t)(uintptr_t)mem;
     int i = pool_slot(base);                              // the table is sorted by base, for pool_find's binary search
@@ -245,11 +341,15 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     if (!same) { memmove(&G.pool[i + 1], &G.pool[i], (size_t)(G.npool - i) * sizeof G.pool[0]); G.npool++; }
     gpool_t *p = &G.pool[i];
     memset(p, 0, sizeof *p); p->base = base; p->size = size;
-    if (on && getenv("NX_POOL_EAGER")) { p->tried = 1; pool_import(p); }       // NX_POOL_EAGER=1: import at creation, as before
+    if (on && placed && placed_mode()) { if (pool_place(p)) p->tried = 1; }
+    else if (on && getenv("NX_POOL_EAGER")) { p->tried = 1; pool_import(p); }       // NX_POOL_EAGER=1: import at creation, as before
     pthread_mutex_unlock(&G.pool_mu);
 }
+void mtl_pool_add(const void *mem, uint64_t size) { pool_add(mem, size, 0); }
+void mtl_pool_add_owned(const void *mem, uint64_t size) { pool_add(mem, size, 1); }       // a pool over memory the game handed to NVN (not an alias of another pool's pages): it may be placed
 void mtl_pool_del(const void *mem) {
     int on = gpu();
+    if (getenv("NX_POOL_LOG2")) { extern uint64_t nvn_present_count(void); fprintf(stderr, "[dm] [nvn] pool del %p at present %llu\n", mem, (unsigned long long)nvn_present_count()); }
     pthread_mutex_lock(&G.pool_mu);
     int i = pool_slot((uint64_t)(uintptr_t)mem);
     if (i < G.npool && G.pool[i].base == (uint64_t)(uintptr_t)mem) {
@@ -269,7 +369,15 @@ static gpool_t *pool_find_raw(uint64_t addr, uint64_t len) {
     return NULL;
 }
 static void pool_ensure(gpool_t *p) { if (p && !p->tried) { p->tried = 1; if (gpu()) pool_import(p); } }     // caller holds pool_mu
-static gpool_t *pool_find(uint64_t addr, uint64_t len) { gpool_t *p = pool_find_raw(addr, len); pool_ensure(p); return p; }
+static void pool_refresh(gpool_t *p) {                    // NX_POOL_COPY pools: the guest's bytes, once per submission (unreadable pages stay as they were)
+    uint64_t f = atomic_load(&G.submitted) + 1;
+    if (!p->cmap || p->cfence == f) return;
+    p->cfence = f;
+    struct iovec l = {p->cmap, p->asize}, r = {(void *)(uintptr_t)p->abase, p->asize};
+    if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) != (ssize_t)p->asize)
+        for (uint64_t o = 0; o < p->asize; o += 4096) { struct iovec l2 = {(char *)p->cmap + o, 4096}, r2 = {(void *)(uintptr_t)(p->abase + o), 4096}; process_vm_readv(getpid(), &l2, 1, &r2, 1, 0); }
+}
+static gpool_t *pool_find(uint64_t addr, uint64_t len) { gpool_t *p = pool_find_raw(addr, len); pool_ensure(p); if (p) pool_refresh(p); return p; }
 int nvn_vk_pool_buffer(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     pthread_mutex_lock(&G.pool_mu);
     gpool_t *p = pool_find(addr, len);
@@ -277,6 +385,74 @@ int nvn_vk_pool_buffer(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize 
     if (ok) { *buf = p->buf; *off = addr - p->abase; }
     pthread_mutex_unlock(&G.pool_mu);
     return ok;
+}
+// The Vulkan device address of [addr, addr+len) when it lies in a memory pool, else 0: what a shader that reads memory through a raw pointer needs in place of the guest's address
+uint64_t nvn_vk_device_address(uint64_t addr, uint64_t len) {
+    pthread_mutex_lock(&G.pool_mu);
+    gpool_t *p = pool_find(addr, len);
+    uint64_t a = p && p->buf ? p->gpu + (addr - p->abase) : 0;
+    pthread_mutex_unlock(&G.pool_mu);
+    return a;
+}
+
+// ---- NVN addresses of a Switch 2 title are device addresses. The title stores the addresses it gets from nvnBufferGetAddress and friends inside its own data (indirect
+// arguments, descriptor tables, linked lists a compute shader walks), so a shader sees them as raw pointers: they must already be what the GPU resolves. Everything inside
+// this layer keeps working with the guest's pointers; the translation happens where an address crosses the NVN API (nvn_gpu_addr_out / nvn_gpu_addr_in).
+extern int dm_switch2_gfx __attribute__((weak));
+static int dev_addrs(void) { static int on = -1; if (on < 0) on = (&dm_switch2_gfx && dm_switch2_gfx && !getenv("NX_HOST_ADDRS")) ? 1 : 0; return on; }
+static int dev_cmp(const void *a, const void *b) { uint64_t x = ((const struct dev_ent *)a)->gpu, y = ((const struct dev_ent *)b)->gpu; return x < y ? -1 : x > y; }
+static _Atomic uint64_t g_dev_lo, g_dev_hi;           // the span of the device addresses handed out (nvn_gpu_addr_in's quick test)
+static void dev_rebuild(void) {                           // caller holds pool_mu
+    if (G.cdev < G.npool) { G.cdev = G.npool + 256; G.dev = realloc(G.dev, (size_t)G.cdev * sizeof *G.dev); }
+    G.ndev = 0;
+    for (int i = 0; i < G.npool; i++) if (G.pool[i].buf && G.pool[i].gpu) G.dev[G.ndev++] = (struct dev_ent){G.pool[i].gpu, G.pool[i].gpu + G.pool[i].asize, G.pool[i].abase};
+    qsort(G.dev, (size_t)G.ndev, sizeof *G.dev, dev_cmp);
+    atomic_store(&g_dev_lo, G.ndev ? G.dev[0].gpu : 0); uint64_t hi = 0; for (int i = 0; i < G.ndev; i++) if (G.dev[i].end > hi) hi = G.dev[i].end; atomic_store(&g_dev_hi, hi);
+    G.dev_dirty = 0;
+}
+// The device address the title is given for a guest address in a memory pool (the pool is imported now: its address is only known once it is)
+uint64_t nvn_gpu_addr_out(uint64_t addr) {
+    if (!addr || !gpu() || !dev_addrs()) return addr;
+    pthread_mutex_lock(&G.pool_mu);
+    gpool_t *p = pool_find_raw(addr, 1);
+    uint64_t r = addr;
+    if (p) { pool_ensure(p); if (p->buf) r = p->gpu + (addr - p->abase); }
+    pthread_mutex_unlock(&G.pool_mu);
+    if (r == addr) { static int n; if (n++ < 20) fprintf(stderr, "[dm] [RED] [nvn] address %#llx is in no usable memory pool: the title gets it as it is\n", (unsigned long long)addr); }
+    return r;
+}
+// The guest address of a device address the title hands back (an address that is not one, such as 0 or a guest pointer, is returned as it is)
+// RADV hands out device addresses at the top of the address space (0xffff8...), the NVIDIA driver low ones (0x5f610000): an address is taken for a device address when it lies in
+// the span of the pools' device addresses and is not itself inside a pool as a guest address (the guest window and the device span do not meet on either driver)
+uint64_t nvn_gpu_addr_in(uint64_t a) {
+    if (!a || !gpu() || !dev_addrs()) return a;
+    if (!G.dev_dirty && (a < atomic_load(&g_dev_lo) || a >= atomic_load(&g_dev_hi))) return a;
+    pthread_mutex_lock(&G.pool_mu);
+    if (G.dev_dirty) dev_rebuild();
+    if (a < atomic_load(&g_dev_lo) || a >= atomic_load(&g_dev_hi) || pool_find_raw(a, 1)) { pthread_mutex_unlock(&G.pool_mu); return a; }
+    int lo = 0, hi = G.ndev;                              // the last entry whose gpu is <= a
+    while (lo < hi) { int m = (lo + hi) / 2; if (G.dev[m].gpu <= a) lo = m + 1; else hi = m; }
+    uint64_t r = a;
+    if (lo > 0 && a < G.dev[lo - 1].end) r = G.dev[lo - 1].abase + (a - G.dev[lo - 1].gpu);
+    pthread_mutex_unlock(&G.pool_mu);
+    if (r == a) { static int n; if (n++ < 20) fprintf(stderr, "[dm] [RED] [nvn] device address %#llx is in no memory pool\n", (unsigned long long)a); }
+    return r;
+}
+// Debugging: the pool that holds addr, as the game gave it and as Vulkan sees it (0 if none)
+int nvn_vk_pool_describe(uint64_t addr, uint64_t out[6]) {
+    pthread_mutex_lock(&G.pool_mu);
+    gpool_t *p = pool_find_raw(addr, 1); int r = 0;
+    if (p) { out[0] = p->base; out[1] = p->size; out[2] = p->abase; out[3] = p->asize; out[4] = (uint64_t)p->gpu; out[5] = p->buf != VK_NULL_HANDLE; r = 1; }
+    pthread_mutex_unlock(&G.pool_mu);
+    return r;
+}
+// Does [addr, addr+len) overlap a memory pool? (debugging: a guest unmap of memory the GPU was given by host pointer invalidates the buffer)
+int nvn_vk_pool_overlap(uint64_t addr, uint64_t len) {
+    pthread_mutex_lock(&G.pool_mu);
+    int i = pool_slot(addr + len) - 1, r = 0;
+    if (i >= 0) { gpool_t *p = &G.pool[i]; r = p->base < addr + len && p->base + p->size > addr; }
+    pthread_mutex_unlock(&G.pool_mu);
+    return r;
 }
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     pthread_mutex_lock(&G.pool_mu);
@@ -406,6 +582,7 @@ int nvn_vk_oneshot_submit(VkCommandBuffer cb, VkFence *fence) {
     pthread_mutex_lock(&G.vk_mu);
     VkResult r = vkCreateFence(G.c.dev, &fi, NULL, fence);
     if (!r) r = vkQueueSubmit(G.c.queue, 1, &si, *fence);
+    { static int sy = -1; if (sy < 0) sy = getenv("NX_SUBMIT_SYNC") != NULL; if (sy && !r) { r = vkQueueWaitIdle(G.c.queue); if (r) { fprintf(stderr, "[dm] [RED] [nvn] a one-shot submit lost the device (%d); called from:\n", (int)r); void *bt[16]; int nb = backtrace(bt, 16); backtrace_symbols_fd(bt, nb, 2); } } }
     pthread_mutex_unlock(&G.vk_mu);
     { struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1); atomic_fetch_add(&g_oneshot_ns, (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec))); atomic_fetch_add(&g_oneshot_n, 1); }
     return r ? -1 : 0;
@@ -446,10 +623,18 @@ uint64_t mtl_sub_commit(void) {
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = G.tl, .value = value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = G.cur ? 1 : 0, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
     if (G.cur) vkEndCommandBuffer(G.cur);
+    { static const char *fn = (const char *)-1; static unsigned par; if (fn == (const char *)-1) fn = getenv("NX_CMD_DUMP");       // NX_CMD_DUMP=<path>: the shaders of each submit, in two files that alternate, written before the GPU runs them (a hang report aborts the process)
+      if (fn && G.cur && g_cs_n) { char nm[512]; snprintf(nm, sizeof nm, "%s.%u", fn, par++ & 1); FILE *f = fopen(nm, "w"); if (f) { for (unsigned i = 0; i < g_cs_n && i < (1u << 18); i++) fprintf(f, "%u %02x%02x%02x%02x%02x%02x%02x%02x\n", i, g_cs_keys[i][0], g_cs_keys[i][1], g_cs_keys[i][2], g_cs_keys[i][3], g_cs_keys[i][4], g_cs_keys[i][5], g_cs_keys[i][6], g_cs_keys[i][7]); fclose(f); } } }
     pthread_mutex_lock(&G.vk_mu);
     VkResult r = vkQueueSubmit2(G.c.queue, 1, &si, VK_NULL_HANDLE);
     pthread_mutex_unlock(&G.vk_mu);
-    if (r) fprintf(stderr, "[dm] [RED] [nvn] vkQueueSubmit2 failed (%d)\n", (int)r);
+    { static int sy = -1; if (sy < 0) sy = getenv("NX_SUBMIT_SYNC") != NULL; if (sy && !r) { r = vkQueueWaitIdle(G.c.queue); if (!r) { extern void nvn_vk_tex_read_flush(void); nvn_vk_tex_read_flush(); } } }
+    { static uint8_t pk[1 << 18][8]; static unsigned pn; static int shown;           // RADV cancels the submit after the one that faulted: the guilty one is the previous
+      if (r) { if (!shown++) { fprintf(stderr, "[dm] [RED] [nvn] vkQueueSubmit2 failed (%d); the shaders of the submit before it (the one that faulted), the last 40:", (int)r); for (unsigned i = pn > 40 ? pn - 40 : 0; i < pn; i++) { const uint8_t *k = pk[i & ((1 << 18) - 1)]; fprintf(stderr, " %02x%02x%02x%02x", k[0], k[1], k[2], k[3]); } fprintf(stderr, " (%u in all)\n", pn); }
+               else fprintf(stderr, "[dm] [RED] [nvn] vkQueueSubmit2 failed (%d)\n", (int)r);
+               { const char *fn = getenv("NX_CMD_DUMP"); if (fn && shown == 1) { FILE *f = fopen(fn, "w"); if (f) { for (unsigned i = 0; i < pn && i < (1u << 18); i++) fprintf(f, "%u %02x%02x%02x%02x\n", i, pk[i][0], pk[i][1], pk[i][2], pk[i][3]); fclose(f); } } } }
+      else { static int on = -1; if (on < 0) on = getenv("NX_SUBMIT_SYNC") != NULL; if (on) { memcpy(pk, g_cs_keys, sizeof pk); pn = g_cs_n; } } }
+    g_cs_n = 0;
     if (G.cur) { if (G.nflight < MAX_INFLIGHT) { G.flight[G.nflight].cb = G.cur; G.flight[G.nflight++].value = value; } else { vkQueueWaitIdle(G.c.queue); vkFreeCommandBuffers(G.c.dev, G.c.pool, 1, &G.cur); } }
     G.cur = NULL;
     atomic_store(&G.submitted, value);

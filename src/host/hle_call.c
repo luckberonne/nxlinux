@@ -32,6 +32,7 @@ __asm__(
     "    mov $8, %eax\n"
     "    call *%r11\n"
     "    mov %rax, 0(%rbx)\n"
+    "    mov %rdx, 8(%rbx)\n"
     "    movq %xmm0, 64(%rbx)\n"
     "    lea -16(%rbp), %rsp\n"
     "    pop %r12\n"

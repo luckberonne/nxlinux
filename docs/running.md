@@ -8,6 +8,10 @@ python3 tools/run_title.py --keys PATH/prod.keys --nsp "PATH/Mario Kart 8 Deluxe
 `sdk`) into a memory image with `tools/nso.py`, writes `work/run/<title>/modules.txt`, and starts `build/nxlinux --manifest ...`. The keys and dumps stay where you keep them.
 `NX_PRESENT=memory` runs without a window; `--entry SYMBOL` starts at a symbol instead of offset 0 of the first module (the synthetic test titles).
 
+A NUP container (`.nup`, the format of github.com/a55uka/nup, unencrypted, base and updates in one file) needs no keys:
+`python3 tools/run_title.py --nup PATH/game.nup [--romfs-image]` extracts its ExeFS and RomFS with `tools/nup_extract.py` (the update is applied over the base), then continues as above.
+`python3 tools/nup_extract.py PATH/game.nup --info` lists its packages. The reader checks the TOC hash and each file's SHA-256; add-ons are not extracted.
+
 Mario Kart 8 Deluxe 4.0.1 (a 64-bit process) boots and shows its title splash: the exact steps, the debugging switches and what is still missing are in
 [mk8d-bringup.md](mk8d-bringup.md); `tools/run_mk8d.sh` starts it once the extraction and the shader library exist. An update that comes as `.nsz` is turned into an NSP with
 `tools/nsz_to_nsp.py` first. `run_title.py` starts a 32-bit title (the 1.0.0 base) with `--arch32` on its own and takes `--nvn-api` for the version the device reports.

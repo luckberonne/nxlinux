@@ -143,6 +143,12 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             Add(Instruction.VoteAll,                  GenerateVoteAll);
             Add(Instruction.VoteAllEqual,             GenerateVoteAllEqual);
             Add(Instruction.VoteAny,                  GenerateVoteAny);
+            Add(Instruction.AtomicAddF32,             GenerateAtomicAddF32);
+            Add(Instruction.ReduceAdd,                           GenerateReduceAdd);
+            Add(Instruction.ReduceMaxS32,                        GenerateReduceMaxS32);
+            Add(Instruction.ReduceMaxU32,                        GenerateReduceMaxU32);
+            Add(Instruction.ReduceMinS32,                        GenerateReduceMinS32);
+            Add(Instruction.ReduceMinU32,                        GenerateReduceMinU32);
 #pragma warning restore IDE0055
         }
 
@@ -1703,6 +1709,32 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             return new OperationResult(AggregateType.Bool, result);
         }
 
+        private static OperationResult GenerateAtomicAddF32(CodeGenContext context, AstOperation operation)
+        {
+            SpvInstruction lo = context.Get(AggregateType.U32, operation.GetSource(0));
+            SpvInstruction hi = context.Get(AggregateType.U32, operation.GetSource(1));
+            SpvInstruction pair = context.CompositeConstruct(context.TypeVector(context.TypeU32(), 2), lo, hi);
+            SpvInstruction address = context.Bitcast(context.TypeInt(64, false), pair);
+            SpvInstruction pointer = context.ConvertUToPtr(context.TypePointer(StorageClass.PhysicalStorageBuffer, context.TypeFP32()), address);
+            SpvInstruction value = context.Get(AggregateType.FP32, operation.GetSource(2));
+            SpvInstruction one = context.Constant(context.TypeU32(), 1);
+            SpvInstruction zero = context.Constant(context.TypeU32(), 0);
+
+            return new OperationResult(AggregateType.FP32, GuardedPhysical(context, hi, context.TypeFP32(), () => context.AtomicFAddEXT(context.TypeFP32(), pointer, one, zero, value), context.Constant(context.TypeFP32(), 0f)));
+        }
+
+        private static OperationResult GenerateReduce(CodeGenContext context, AstOperation operation, AggregateType type, Func<SpvInstruction, SpvInstruction, GroupOperation, SpvInstruction, SpvInstruction, SpvInstruction> emit)
+        {
+            SpvInstruction execution = context.Constant(context.TypeU32(), Scope.Subgroup);
+            return new OperationResult(type, emit(context.GetType(type), execution, GroupOperation.Reduce, context.Get(type, operation.GetSource(0)), null));
+        }
+
+        private static OperationResult GenerateReduceAdd(CodeGenContext context, AstOperation operation) => GenerateReduce(context, operation, AggregateType.U32, context.GroupNonUniformIAdd);
+        private static OperationResult GenerateReduceMaxS32(CodeGenContext context, AstOperation operation) => GenerateReduce(context, operation, AggregateType.S32, context.GroupNonUniformSMax);
+        private static OperationResult GenerateReduceMaxU32(CodeGenContext context, AstOperation operation) => GenerateReduce(context, operation, AggregateType.U32, context.GroupNonUniformUMax);
+        private static OperationResult GenerateReduceMinS32(CodeGenContext context, AstOperation operation) => GenerateReduce(context, operation, AggregateType.S32, context.GroupNonUniformSMin);
+        private static OperationResult GenerateReduceMinU32(CodeGenContext context, AstOperation operation) => GenerateReduce(context, operation, AggregateType.U32, context.GroupNonUniformUMin);
+
         private static OperationResult GenerateVoteAny(CodeGenContext context, AstOperation operation)
         {
             SpvInstruction execution = context.Constant(context.TypeU32(), Scope.Subgroup);
@@ -1755,12 +1787,29 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             AstOperation operation,
             Func<SpvInstruction, SpvInstruction, SpvInstruction, SpvInstruction, SpvInstruction, SpvInstruction> emitU)
         {
-            SpvInstruction elemPointer = GetStoragePointer(context, operation, out AggregateType varType);
+            AggregateType varType;
+            SpvInstruction elemPointer;
+
+            if (operation.StorageKind == StorageKind.PhysicalMemory)
+            {
+                elemPointer = GetPhysicalPointer(context, operation);
+                varType = AggregateType.U32;
+            }
+            else
+            {
+                elemPointer = GetStoragePointer(context, operation, out varType);
+            }
 
             SpvInstruction value = context.Get(varType, operation.GetSource(operation.SourcesCount - 1));
 
             SpvInstruction one = context.Constant(context.TypeU32(), 1);
             SpvInstruction zero = context.Constant(context.TypeU32(), 0);
+
+            if (operation.StorageKind == StorageKind.PhysicalMemory)
+            {
+                SpvInstruction physHi = context.Get(AggregateType.U32, operation.GetSource(1));
+                return new OperationResult(varType, GuardedPhysical(context, physHi, context.GetType(varType), () => emitU(context.GetType(varType), elemPointer, one, zero, value), context.Constant(context.GetType(varType), 0)));
+            }
 
             return new OperationResult(varType, emitU(context.GetType(varType), elemPointer, one, zero, value));
         }
@@ -1778,8 +1827,84 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             return new OperationResult(varType, context.AtomicCompareExchange(context.GetType(varType), elemPointer, one, zero, zero, value1, value0));
         }
 
+        // Runs `access` only when the 64-bit address has a high word (below 4 GB nothing is mapped: a table whose base is empty); otherwise the result is `whenNull`. Every operand
+        // must already have been evaluated: the access is the only thing in its block, which is what the Phi relies on.
+        private static SpvInstruction GuardedPhysical(CodeGenContext context, SpvInstruction hi, SpvInstruction resultType, Func<SpvInstruction> access, SpvInstruction whenNull)
+        {
+            SpvInstruction boolType = context.TypeBool();
+            SpvInstruction mapped = context.INotEqual(boolType, hi, context.Constant(context.TypeU32(), 0));
+            SpvInstruction validLabel = context.Label();
+            SpvInstruction nullLabel = context.Label();
+            SpvInstruction mergeLabel = context.Label();
+            context.SelectionMerge(mergeLabel, SelectionControlMask.MaskNone);
+            context.BranchConditional(mapped, validLabel, nullLabel);
+            context.AddLabel(validLabel);
+            SpvInstruction result = access();
+            context.Branch(mergeLabel);
+            context.AddLabel(nullLabel);
+            context.Branch(mergeLabel);
+            context.AddLabel(mergeLabel);
+            return context.Phi(resultType, result, validLabel, whenNull, nullLabel);
+        }
+
+        private static SpvInstruction GetPhysicalPointer(CodeGenContext context, AstOperation operation)
+        {
+            SpvInstruction lo = context.Get(AggregateType.U32, operation.GetSource(0));
+            SpvInstruction hi = context.Get(AggregateType.U32, operation.GetSource(1));
+
+            SpvInstruction u32 = context.TypeU32();
+            SpvInstruction u64 = context.TypeInt(64, false);
+            SpvInstruction pair = context.CompositeConstruct(context.TypeVector(u32, 2), lo, hi);
+            SpvInstruction address = context.Bitcast(u64, pair);
+
+            return context.ConvertUToPtr(context.TypePointer(StorageClass.PhysicalStorageBuffer, u32), address);
+        }
+
         private static OperationResult GenerateLoadOrStore(CodeGenContext context, AstOperation operation, bool isStore)
         {
+            if (operation.StorageKind == StorageKind.PhysicalMemory)
+            {
+                // The first 4 GB of the address space are never mapped: a program that walks a pointer table whose last rows are empty reads zero from there and goes on (the
+                // console's GPU does not stop on it), where a device fault would kill the context. Loads give 0 and stores are dropped.
+                // (every operand is evaluated first: an operand may hold a guarded load of its own, and that opens blocks)
+                SpvInstruction hi = context.Get(AggregateType.U32, operation.GetSource(1));
+                SpvInstruction lo = context.Get(AggregateType.U32, operation.GetSource(0));
+                SpvInstruction physical = GetPhysicalPointer(context, operation);
+                SpvInstruction storeValue = isStore ? context.Get(AggregateType.U32, operation.GetSource(2)) : null;
+                SpvInstruction boolType = context.TypeBool();
+                SpvInstruction u32Type = context.TypeU32();
+                SpvInstruction mapped = context.INotEqual(boolType, hi, context.Constant(u32Type, 0));      // an address below 4 GB: null plus an offset (a table whose base is empty)
+                SpvInstruction validLabel = context.Label();
+                SpvInstruction nullLabel = context.Label();
+                SpvInstruction mergeLabel = context.Label();
+                context.SelectionMerge(mergeLabel, SelectionControlMask.MaskNone);
+                context.BranchConditional(mapped, validLabel, nullLabel);
+                context.AddLabel(validLabel);
+
+                SpvInstruction loaded = null;
+
+                if (isStore)
+                {
+                    context.StoreAligned(physical, storeValue, 4);
+                }
+                else
+                {
+                    loaded = context.LoadAligned(u32Type, physical, 4);
+                }
+
+                context.Branch(mergeLabel);
+                context.AddLabel(nullLabel);
+                context.Branch(mergeLabel);
+                context.AddLabel(mergeLabel);
+
+                if (isStore)
+                {
+                    return OperationResult.Invalid;
+                }
+
+                return new OperationResult(AggregateType.U32, context.Phi(u32Type, loaded, validLabel, context.Constant(u32Type, 0), nullLabel));
+            }
+
             SpvInstruction pointer = GetStoragePointer(context, operation, out AggregateType varType);
 
             if (isStore)

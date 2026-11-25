@@ -45,7 +45,28 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             context.AddCapability(Capability.Shader);
 
-            context.SetMemoryModel(AddressingModel.Logical, MemoryModel.GLSL450);
+            if (info.UsesPhysicalMemory)
+            {
+                context.SetMemoryModel(AddressingModel.PhysicalStorageBuffer64, MemoryModel.GLSL450);
+                context.AddCapability(Capability.PhysicalStorageBufferAddresses);
+                context.AddCapability(Capability.Int64);
+                context.AddExtension("SPV_KHR_physical_storage_buffer");
+            }
+            else
+            {
+                context.SetMemoryModel(AddressingModel.Logical, MemoryModel.GLSL450);
+            }
+
+            if (info.UsesSubgroupArithmetic)
+            {
+                context.AddCapability(Capability.GroupNonUniformArithmetic);
+            }
+
+            if (info.UsesAtomicFloatAdd)
+            {
+                context.AddCapability(Capability.AtomicFloat32AddEXT);
+                context.AddExtension("SPV_EXT_shader_atomic_float_add");
+            }
 
             context.AddCapability(Capability.GroupNonUniformBallot);
             context.AddCapability(Capability.GroupNonUniformShuffle);
@@ -53,6 +74,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             context.AddCapability(Capability.ImageBuffer);
             context.AddCapability(Capability.ImageGatherExtended);
             context.AddCapability(Capability.ImageQuery);
+            context.AddCapability(Capability.StorageImageWriteWithoutFormat);       // a SUST of the Sm86 frontend stores to an image whose format the shader does not state
             context.AddCapability(Capability.SampledBuffer);
 
             if (parameters.HostCapabilities.SupportsShaderFloat64)

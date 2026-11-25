@@ -22,6 +22,10 @@ typedef struct {
     PFN_vkCmdBeginTransformFeedbackEXT CmdBeginTransformFeedback;
     PFN_vkCmdEndTransformFeedbackEXT CmdEndTransformFeedback;
     PFN_vkCmdBindTransformFeedbackBuffersEXT CmdBindTransformFeedbackBuffers;
+    int has_sg32;                   // subgroupSizeControl with a required subgroup size of 32 for compute: a Switch 2 compute program assumes 32 threads to a warp (SR_LANEID, VOTE, SHFL, REDUX), the AMD default is 64
+    int has_map_placed;             // VK_EXT_map_memory_placed with memoryMapPlaced and memoryUnmapReserve: device memory mapped at an address of our choosing
+    PFN_vkMapMemory2KHR MapMemory2;
+    PFN_vkUnmapMemory2KHR UnmapMemory2;
 } vkctx_t;
 
 // NX_GPU=<index> picks a physical device (default 0). Returns 0 on success; prints what is missing on failure.

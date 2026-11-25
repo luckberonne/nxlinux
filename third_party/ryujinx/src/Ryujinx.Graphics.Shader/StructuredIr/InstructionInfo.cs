@@ -133,6 +133,12 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             Add(Instruction.VoteAll,                  AggregateType.Bool,   AggregateType.Bool);
             Add(Instruction.VoteAllEqual,             AggregateType.Bool,   AggregateType.Bool);
             Add(Instruction.VoteAny,                  AggregateType.Bool,   AggregateType.Bool);
+            Add(Instruction.ReduceAdd,                           AggregateType.U32,   AggregateType.U32);
+            Add(Instruction.ReduceMaxS32,                        AggregateType.S32,   AggregateType.S32);
+            Add(Instruction.ReduceMaxU32,                        AggregateType.U32,   AggregateType.U32);
+            Add(Instruction.ReduceMinS32,                        AggregateType.S32,   AggregateType.S32);
+            Add(Instruction.ReduceMinU32,                        AggregateType.U32,   AggregateType.U32);
+            Add(Instruction.AtomicAddF32,             AggregateType.FP32,   AggregateType.S32,     AggregateType.S32,     AggregateType.FP32);
 #pragma warning restore IDE0055
         }
 

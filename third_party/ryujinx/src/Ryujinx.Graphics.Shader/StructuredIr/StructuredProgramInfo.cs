@@ -10,6 +10,12 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
         public HelperFunctionsMask HelperFunctionsMask { get; set; }
 
+        public bool UsesPhysicalMemory { get; set; }
+
+        public bool UsesSubgroupArithmetic { get; set; }
+
+        public bool UsesAtomicFloatAdd { get; set; }
+
         public StructuredProgramInfo()
         {
             Functions = new List<StructuredFunction>();

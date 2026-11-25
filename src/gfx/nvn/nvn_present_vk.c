@@ -17,6 +17,7 @@
 #include <unistd.h>
 #ifdef NX_HAVE_SDL3
 #include <SDL3/SDL.h>
+static int nvn_peek_nonzero(unsigned long long a) { const uint64_t *q = (const uint64_t *)(uintptr_t)a; for (int i = 0; i < 32; i++) if (q[i]) return 1; return 0; }
 #endif
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -294,13 +295,14 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             extern int nvn_draw_trace_targets(uint64_t *, int); extern int nvn_vk_debug_info(uint64_t, unsigned *, unsigned *, unsigned *, unsigned *, unsigned *); extern long nvn_vk_debug_lit(uint64_t, size_t *, const char *);
             {   // the textures the traced draws sampled (not only the ones they drew into): the GPU's decoded view of each, <prefix>.<n+1>.tex<serial>.ppm
                 extern int nvn_trace_request_count(void); if (nvn_trace_request_count() <= 1) { extern int nvn_draw_trace_sampled(uint64_t *, int); extern int nvn_vk_debug_gpu_ppm(uint64_t, const char *); uint64_t ss[400]; int nsm = nvn_draw_trace_sampled(ss, 400);
-                for (int i = 0; i < nsm; i++) if (ss[i]) { char fn[640]; snprintf(fn, sizeof fn, "%s.%ld.tex%llu.ppm", getenv("NX_FRAME_DUMP"), tf + 1, (unsigned long long)ss[i]); nvn_vk_debug_gpu_ppm(ss[i], fn); } } }
+                for (int i = 0; i < nsm; i++) if (ss[i]) { char fn[640]; snprintf(fn, sizeof fn, "%s.%ld.tex%llu.ppm", getenv("NX_FRAME_DUMP"), tf + 1, (unsigned long long)ss[i]); int gr = nvn_vk_debug_gpu_ppm(ss[i], fn); if (gr) fprintf(stderr, "[dm] [nvn] GPU view of sampled texture serial %llu failed (%d)\n", (unsigned long long)ss[i], gr); } } }
             uint64_t ser[600]; int ns = nvn_draw_trace_targets(ser, 600);
             for (int i = 0; i < ns; i++) { unsigned f = 0, tw = 0, th = 0, lv = 0, dd = 0; if (!nvn_vk_debug_info(ser[i], &f, &tw, &th, &lv, &dd)) { fprintf(stderr, "[dm] [nvn] trace target serial %llu: not in the table\n", (unsigned long long)ser[i]); continue; }
                 char fn[640]; snprintf(fn, sizeof fn, "%s.%ld.rt%llu.ppm", getenv("NX_FRAME_DUMP"), tf + 1, (unsigned long long)ser[i]); size_t tot = 0; long lit = nvn_vk_debug_lit(ser[i], &tot, fn);
                 { extern int nvn_vk_debug_mem(uint64_t, uint64_t *, uint64_t *); uint64_t mm = 0, ms = 0; nvn_vk_debug_mem(ser[i], &mm, &ms); fprintf(stderr, "[dm] [nvn] trace target serial %llu: %ux%u format %#x levels %u%s, %ld of %zu bytes not zero, storage %#llx +%#llx\n", (unsigned long long)ser[i], tw, th, f, lv, dd ? " (finalized)" : "", lit, tot, (unsigned long long)mm, (unsigned long long)ms); } }
         }
     }
+    { static const char *pk = (const char *)-1; if (pk == (const char *)-1) pk = getenv("NX_PEEK"); static unsigned npk; if (pk && npk < 3000) { unsigned long long a = strtoull(pk, NULL, 16); if (nvn_peek_nonzero(a) && npk++ < 40) fprintf(stderr, "[dm] [nvn] peek %#llx at present: nonzero (%08x %08x %08x %08x)\n", a, ((uint32_t *)(uintptr_t)a)[0], ((uint32_t *)(uintptr_t)a)[1], ((uint32_t *)(uintptr_t)a)[2], ((uint32_t *)(uintptr_t)a)[3]); } }       // NX_PEEK=<guest address>: reports when the first 256 bytes there are not all zero at a present
     pthread_mutex_lock(&g_mu);
     sink_init();
     { fbuf_t *b = &g_fb[g_ib[FB_F]]; fb_fit(b, (size_t)w * h * 4);

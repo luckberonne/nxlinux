@@ -18,6 +18,7 @@ extern "C" { uint64_t guest_mem_base(void) __attribute__((weak)); uint64_t guest
 #include <mutex>
 #include <vector>
 #include <thread>
+#include <type_traits>
 #include <chrono>
 #include <sys/mman.h>
 
@@ -69,6 +70,7 @@ struct cpu {
     int nested = 0;                           // cpu_call64 depth
     bool watch_hit = false, watch_skip = false; uint64_t watch_value = 0;       // see NX_WATCH
     uint64_t bad_addr = 0;                    // the address of the access that stopped this thread
+    bool bad_addr_set = false;                // the access was outside the guest window: bad_addr is then the address (0 is a valid address, hence the flag)
     std::atomic<jitenv *> running{nullptr};   // the Jit this cpu is on right now, null while outside Run()
     jitenv *last = nullptr;                   // the Jit it ran on before: taken again without the pool's lock when free (see acquire)
     uint32_t v_dirty = ~0u;                   // which vector registers changed outside the Jit (bit i: v<i>; cpu_set_v, cpu_call64's restore): those must be loaded again
@@ -90,7 +92,7 @@ struct jitenv final : UserCallbacks {
     // An access outside the guest window is a guest bug (a NULL pointer, a stale address): it stops this thread, with the registers, instead of faulting in the host
     bool ok(uint64_t a, size_t n) {
         if (!guest_mem_base || !guest_mem_end || (a >= guest_mem_base() && a < guest_mem_end() && n <= guest_mem_end() - a)) return true;
-        cur->bad_addr = a; cur->faulted = true;
+        cur->bad_addr = a; cur->bad_addr_set = true; cur->faulted = true;
         jit->HaltExecution(HaltReason::MemoryAbort);
         return false;
     }
@@ -127,10 +129,15 @@ struct jitenv final : UserCallbacks {
     }
     std::optional<std::uint32_t> MemoryReadCode(VAddr a) override {
         last_code.store(a, std::memory_order_relaxed); ncode.fetch_add(1, std::memory_order_relaxed);
+        if (g_pc_trace) { std::lock_guard<std::mutex> lk(g_pc_mu); g_pc_log.push_back(a); }      // traced before the window check: a code address outside the guest is the one that stops the translation
         if (guest_mem_base && guest_mem_end && !(a >= guest_mem_base() && a < guest_mem_end() && 4 <= guest_mem_end() - a)) {      // code outside the guest window (a jump through a wild pointer): dynarmic then raises a fault for the block instead of merging zero words for ever
-            cur->bad_addr = a; cur->faulted = true; return std::nullopt;
+            if (getenv("NX_BRANCH_TRACE")) {     // who jumped here: the branch is the last instruction of the block being translated, so the registers still hold its operands
+                fprintf(stderr, "[RED] cpu: code read outside the guest window: pc=%#llx jit_pc=%#llx sp=%#llx\n", (unsigned long long)a, (unsigned long long)jit->GetPC(), (unsigned long long)jit->GetSP());
+                for (int i = 0; i < 30; i++) fprintf(stderr, "  x%-2d = %#018llx%s", i, (unsigned long long)jit->GetRegister(i), (i % 3 == 2) ? "\n" : "");
+                fprintf(stderr, "\n");
+            }
+            cur->bad_addr = a; cur->bad_addr_set = true; cur->faulted = true; return std::nullopt;
         }
-        if (g_pc_trace) { std::lock_guard<std::mutex> lk(g_pc_mu); g_pc_log.push_back(a); }
         return MemoryRead32(a);
     }
     uint8_t MemoryRead8(VAddr a) override { return rd<uint8_t>(a); }
@@ -151,8 +158,94 @@ struct jitenv final : UserCallbacks {
         unsigned __int128 vv, ee; memcpy(&vv, &v, 16); memcpy(&ee, &e, 16);
         return excl(a, vv, ee);
     }
-    void InterpreterFallback(VAddr pc, size_t) override { fault(pc, 1); }
-    void ExceptionRaised(VAddr pc, Exception) override { fault(pc, 2); }
+    // ARMv8.1 atomics (LSE: CAS, CASP, SWP, LDADD, LDCLR, LDEOR, LDSET, LDSMAX, LDSMIN, LDUMAX, LDUMIN), which dynarmic does not decode and titles built for system 20+ use
+    // for every lock and reference count. One is run here on the host, on the guest's memory, and the Jit goes on at the next instruction. Register 31 is SP as the
+    // base and the zero register elsewhere.
+    uint64_t xr(unsigned r) { return r == 31 ? 0 : jit->GetRegister(r); }
+    void xw(unsigned r, uint64_t v) { if (r != 31) jit->SetRegister(r, v); }
+    template <class T> bool lse_cas(uint64_t a, unsigned rs, unsigned rt) {
+        if (!ok(a, sizeof(T))) return false;
+        T expected = (T)xr(rs);
+        __atomic_compare_exchange_n((T *)a, &expected, (T)xr(rt), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        xw(rs, (uint64_t)expected);        // the value that was in memory, zero-extended
+        return true;
+    }
+    template <class T, class P> bool lse_casp(uint64_t a, unsigned rs, unsigned rt) {      // a pair of T as one P, the first register at the lower address
+        if (!ok(a, sizeof(P)) || (rs & 1) || (rt & 1)) return false;
+        const int sh = 8 * sizeof(T);
+        P expected = (P)(T)xr(rs) | (P)(T)xr(rs + 1) << sh, desired = (P)(T)xr(rt) | (P)(T)xr(rt + 1) << sh;
+        __atomic_compare_exchange_n((P *)a, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        xw(rs, (uint64_t)(T)expected); xw(rs + 1, (uint64_t)(T)(expected >> sh));
+        return true;
+    }
+    template <class T> bool lse_rmw(uint64_t a, unsigned op, unsigned rs, unsigned rt) {     // op: 0 add, 1 clear, 2 eor, 3 set, 4 smax, 5 smin, 6 umax, 7 umin, 8 swap
+        if (!ok(a, sizeof(T))) return false;
+        typedef typename std::make_signed<T>::type S;
+        const T v = (T)xr(rs);
+        T old = __atomic_load_n((T *)a, __ATOMIC_SEQ_CST), now;
+        do {
+            switch (op) {
+            case 0: now = old + v; break;
+            case 1: now = old & ~v; break;
+            case 2: now = old ^ v; break;
+            case 3: now = old | v; break;
+            case 4: now = (S)old > (S)v ? old : v; break;
+            case 5: now = (S)old < (S)v ? old : v; break;
+            case 6: now = old > v ? old : v; break;
+            case 7: now = old < v ? old : v; break;
+            default: now = v; break;
+            }
+        } while (!__atomic_compare_exchange_n((T *)a, &old, now, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+        xw(rt, (uint64_t)old);
+        return true;
+    }
+    bool lse(uint64_t pc) {
+        if (!ok(pc, 4)) return false;
+        const uint32_t w = rd<uint32_t>(pc);
+        const unsigned size = w >> 30, rs = w >> 16 & 31, rn = w >> 5 & 31, rt = w & 31;
+        const uint64_t a = rn == 31 ? jit->GetSP() : jit->GetRegister(rn);
+        bool done = false;
+        if ((w & 0x3FA07C00) == 0x08A07C00)            // CAS, CASA, CASL, CASAL and the byte and halfword forms
+            done = size == 0 ? lse_cas<uint8_t>(a, rs, rt) : size == 1 ? lse_cas<uint16_t>(a, rs, rt) : size == 2 ? lse_cas<uint32_t>(a, rs, rt) : lse_cas<uint64_t>(a, rs, rt);
+        else if ((w & 0xBFA07C00) == 0x08207C00)       // CASP and its forms: two registers
+            done = (w >> 30 & 1) ? lse_casp<uint64_t, unsigned __int128>(a, rs, rt) : lse_casp<uint32_t, uint64_t>(a, rs, rt);
+        else if ((w & 0x3F200C00) == 0x38200000 && (w & 0x3FFFFC00) != 0x38BFC000) {     // SWP and the LD<op> family (LDAPR, below, shares the pattern)
+            const unsigned opc = w >> 12 & 7, o3 = w >> 15 & 1;
+            if (o3 && opc) return false;
+            const unsigned op = o3 ? 8 : opc;
+            done = size == 0 ? lse_rmw<uint8_t>(a, op, rs, rt) : size == 1 ? lse_rmw<uint16_t>(a, op, rs, rt) : size == 2 ? lse_rmw<uint32_t>(a, op, rs, rt) : lse_rmw<uint64_t>(a, op, rs, rt);
+        }
+        else if ((w & 0x3FFFFC00) == 0x38BFC000) {     // LDAPR, LDAPRH, LDAPRB (ARMv8.3 RCPC): a load; every load here is already ordered as the host orders it
+            if (!ok(a, 1u << size)) return false;
+            xw(rt, size == 0 ? rd<uint8_t>(a) : size == 1 ? rd<uint16_t>(a) : size == 2 ? rd<uint32_t>(a) : rd<uint64_t>(a));
+            done = true;
+        } else if ((w & 0x3F200C00) == 0x19000000) {   // STLUR, LDAPUR and the sign-extending LDAPURS forms (ARMv8.4 RCPC), at base + a signed 9-bit offset
+            const unsigned opc = w >> 22 & 3;
+            const uint64_t b = a + (uint64_t)((int64_t)((uint64_t)(w >> 12 & 0x1FF) << 55) >> 55);
+            if (!ok(b, 1u << size)) return false;
+            if (opc == 0) { const uint64_t v = xr(rt); if (size == 0) wr<uint8_t>(b, (uint8_t)v); else if (size == 1) wr<uint16_t>(b, (uint16_t)v); else if (size == 2) wr<uint32_t>(b, (uint32_t)v); else wr<uint64_t>(b, v); }
+            else {
+                if (size == 3 && opc != 1) return false;
+                if (size == 2 && opc == 3) return false;
+                uint64_t v = size == 0 ? rd<uint8_t>(b) : size == 1 ? rd<uint16_t>(b) : size == 2 ? rd<uint32_t>(b) : rd<uint64_t>(b);
+                if (opc >= 2) {                         // sign-extend to 64 bits (opc 2) or to 32 (opc 3)
+                    const int sh = 64 - (8 << size);
+                    v = (uint64_t)((int64_t)(v << sh) >> sh);
+                    if (opc == 3) v = (uint32_t)v;
+                }
+                xw(rt, v);
+            }
+            done = true;
+        }
+        if (done) jit->SetPC(pc + 4);
+        return done;
+    }
+    void InterpreterFallback(VAddr pc, size_t) override { if (!lse(pc)) fault(pc, 1); }
+    void ExceptionRaised(VAddr pc, Exception e) override {
+        // The hint instructions (WFI, WFE, SEV, SEVL, YIELD: a spin loop's pause) do nothing here; the Jit has already moved to the next instruction
+        if (e == Exception::WaitForInterrupt || e == Exception::WaitForEvent || e == Exception::SendEvent || e == Exception::SendEventLocal || e == Exception::Yield) return;
+        fprintf(stderr, "[RED] cpu: exception %d raised by the Jit at pc=%#llx (dynarmic's A64 Exception)\n", (int)e, (unsigned long long)pc); fault(pc, 2);
+    }
     void AddTicks(uint64_t) override {}
     uint64_t GetTicksRemaining() override { return 1ull << 40; }
     uint64_t GetCNTPCT() override { return cur->ops.cntpct(); }
@@ -203,6 +296,7 @@ static std::unique_ptr<jitenv> make_env(unsigned id) {
         cfg.fastmem_exclusive_access = true;     // the global monitor is ignored only by the inline exclusives; through the callbacks every exclusive store still took the monitor's spinlock and
     }                                            // CheckAndClear (3.5 % of a 2P race). Measured inline before only with the monitor kept, where it was no faster (below)
     cfg.fastmem_address_space_bits = 48;
+    if (const char *mb = getenv("NX_JIT_CACHE_MB")) cfg.code_cache_size = (size_t)atoi(mb) << 20;       // NX_JIT_CACHE_MB=<n>: the JIT code cache of each guest core (dynarmic's default 128); its patch tables grow with it, about 2.5 times its size per core after a long run
     cfg.silently_mirror_fastmem = false;
     if (!cfg.unsafe_optimizations) cfg.fastmem_exclusive_access = false;       // exact mode: exclusives go through MemoryWriteExclusive* (compare-exchange). Inline ones (true) were measured in the race: no faster (19.7-20.5 ms against 18.7-20.6), and dynarmic warns that they do not reproduce ABA
     cfg.tpidr_el0 = &e->tpidr;
@@ -211,6 +305,7 @@ static std::unique_ptr<jitenv> make_env(unsigned id) {
     cfg.enable_cycle_counting = false;
     cfg.global_monitor = &monitor();
     cfg.processor_id = id;
+    cfg.very_verbose_debugging_output = getenv("NX_VERBOSE_JIT") != NULL;     // NX_VERBOSE_JIT=1: dynarmic emits a debug print per translated instruction (name + register values) through the block
     e->jit = std::make_unique<Jit>(cfg);
     return e;
 }
@@ -367,7 +462,7 @@ int cpu_run(cpu_t *cp) {
             continue;                                      // run the store again (silently): the write itself was done by the callback
         }
         if (c->faulted) {
-            if (c->bad_addr) {
+            if (c->bad_addr_set) {
                 fprintf(stderr, "[RED] guest access to unmapped address %#llx at pc=%#llx sp=%#llx\n", (unsigned long long)c->bad_addr, (unsigned long long)c->s.pc, (unsigned long long)c->s.sp);
                 for (int i = 0; i < 31; i += 4) fprintf(stderr, "[RED]   x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n", i, (unsigned long long)c->s.x[i], i + 1, (unsigned long long)c->s.x[i + 1], i + 2, (unsigned long long)c->s.x[i + 2], i + 3, (unsigned long long)(i + 3 < 31 ? c->s.x[i + 3] : 0));
                 { uint64_t fp = c->s.x[29]; fprintf(stderr, "[RED]   frames (x29 chain):");        // the frame-pointer chain: who called whom
@@ -378,7 +473,14 @@ int cpu_run(cpu_t *cp) {
                       uint64_t a = *(uint64_t *)(fp - 16 + 8 * k); if (a < guest_mem_base() || a + 96 > guest_mem_end()) continue;
                       fprintf(stderr, "[RED]     *%#llx:", (unsigned long long)a); for (int j = 0; j < 12; j++) fprintf(stderr, " %#llx", (unsigned long long)*(uint64_t *)(a + 8 * j)); fprintf(stderr, "\n"); }
                     fp = *(uint64_t *)fp; } }
+                if (const char *fs = getenv("NX_FAULT_STACK")) {      // NX_FAULT_STACK=<words>: the raw stack from sp, so the return addresses of a frame-pointer-less chain are visible too
+                    int n = atoi(fs); uint64_t sp = c->s.sp;
+                    fprintf(stderr, "[RED]   stack from sp=%#llx:", (unsigned long long)sp);
+                    for (int i = 0; i < n && sp + 8 * (i + 1) <= guest_mem_end(); i++) fprintf(stderr, " %#llx", (unsigned long long)*(uint64_t *)(sp + 8 * i));
+                    fprintf(stderr, "\n");
+                }
                 if (c->ops.fault) c->ops.fault(cp, c->s.pc, 3, c->user);
+                dump_pc_log();                                 // NX_TRACE_PC: a fault usually leaves the host waiting on its threads, so the atexit dump never runs; write it here
             }
             return CPU_HALT_FAULT;
         }

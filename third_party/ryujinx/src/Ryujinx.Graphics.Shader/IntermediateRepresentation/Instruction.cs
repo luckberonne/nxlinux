@@ -125,6 +125,12 @@ namespace Ryujinx.Graphics.Shader.IntermediateRepresentation
         VoteAll,
         VoteAllEqual,
         VoteAny,
+        ReduceAdd,
+        ReduceMaxS32,
+        ReduceMaxU32,
+        ReduceMinS32,
+        ReduceMinU32,
+        AtomicAddF32,
 
         Count,
 

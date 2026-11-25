@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "guest_mem.h"
 #include "hle_stub.h"
+#include "module.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -260,6 +261,9 @@ static void thread_attach(thr_t *t) {                  // on the thread's own ho
     t->tlr = tlr_alloc();
     pthread_mutex_unlock(&G);
     memset((void *)t->tlr, 0, TLR_SIZE);
+    // System 20+ SDKs take the thread's handle from the region at +0x110 for every lock (the lock word holds the owner's handle): left at 0 an unlocked mutex reads as
+    // held by the caller and the first allocation aborts. Older SDKs go through the ThreadType at +0x1F8 and never read this word.
+    if (!cpu_is_aarch32()) *(uint32_t *)(t->tlr + 0x110) = t->handle;
     cpu_ops_t ops = {on_svc, cntpct_cb, on_fault};
     t->cpu = cpu_create(&ops, t, 0);
     cpu_set_tls(t->cpu, 0, t->tlr);                     // tpidrro_el0 = ThreadLocalRegion; the SDK sets tpidr_el0 itself
@@ -344,6 +348,7 @@ static void threads_dump_once(int stacks, int all, const char *why) {
         fprintf(stderr, "[threads] id=%#llx h=%#x prio=%d core=%d %s%s wait=%s addr=%#llx lr=%#llx pc=%#llx r0=%#llx tid=%d svcs=%llu entry=%#llx\n", (unsigned long long)t->id, t->handle, t->prio, t->core, t->exited ? "EXITED" : "alive", t->want ? " wants-core" : "",
                 (const char *[]){"none", "lock", "cond", "address", "sync"}[t->wkind >= 0 && t->wkind < 5 ? t->wkind : 0], (unsigned long long)t->waddr, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 30) : 0ull,
                 t->cpu ? (unsigned long long)cpu_get_pc(t->cpu) : 0ull, t->cpu ? (unsigned long long)cpu_get_x(t->cpu, 0) : 0ull, t->tid, (unsigned long long)t->nsvc, (unsigned long long)t->entry);
+        if (t->wkind == 4 && t->whs) { fprintf(stderr, "[threads]   waits on %d handle(s):", t->whn); for (int q = 0; q < t->whn && q < 8; q++) { unsigned hk = t->whs[q] - 0x1000; fprintf(stderr, " %#x(type %d%s)", t->whs[q], hk > 0 && hk < MAX_H ? g_h[hk].type : -1, hk > 0 && hk < MAX_H && g_h[hk].type == O_EVENT_R ? (((event_t *)g_h[hk].obj)->signaled ? " signaled" : " unsignaled") : ""); } fprintf(stderr, "\n"); }
         if (getenv("NX_THREADS_ARG") && t->arg > 0x200000000ull && t->arg < 0x3000000000ull) { fprintf(stderr, "[threads]   id=%#llx function %#llx (ThreadType+0x68) arg %#llx:", (unsigned long long)t->id, (unsigned long long)((uint64_t *)(uintptr_t)t->arg)[13], (unsigned long long)t->arg); for (int k = 0; k < 24; k++) fprintf(stderr, " %#llx", (unsigned long long)((uint64_t *)(uintptr_t)t->arg)[k]); fprintf(stderr, "\n"); } }
     for (thr_t *t = g_all; t; t = t->all) { uint64_t pc, n; if (t->cpu && !t->exited && !cpu_is_aarch32() && cpu_translating(t->cpu, &pc, &n)) fprintf(stderr, "[threads] %#llx is on a Jit, last instruction read %#llx (main+%#llx), %llu read so far\n", (unsigned long long)t->id, (unsigned long long)pc, (unsigned long long)(pc - 0x2000015000ull), (unsigned long long)n); }
     for (thr_t *t = g_all; t; t = t->all) if (t->ipc_name) fprintf(stderr, "[threads] %#llx is inside IPC %s cmd %u for %.1f s\n", (unsigned long long)t->id, t->ipc_name, t->ipc_cmd, (double)(mono_ns() - t->ipc_ns) / 1e9);
@@ -353,7 +358,7 @@ static void threads_dump_once(int stacks, int all, const char *why) {
             uint32_t buf[160]; struct iovec lo = {buf, sizeof buf}, re = {(void *)(uintptr_t)sp, sizeof buf};
             ssize_t got = process_vm_readv(getpid(), &lo, 1, &re, 1, 0);       // a stack may end before 640 bytes: read what is mapped
             if (cpu_is_aarch32()) { for (int i = 0; i < (got > 0 ? got / 4 : 0); i++) if (buf[i] >= 0x206000 && buf[i] < 0x1512000) fprintf(stderr, " %#x", buf[i]); }
-            else for (int i = 0; i + 1 < (got > 0 ? got / 4 : 0); i += 2) { uint64_t v = buf[i] | (uint64_t)buf[i + 1] << 32; if (v >= 0x2000011000ull && v < 0x2001a63000ull) fprintf(stderr, " %#llx", (unsigned long long)v - 0x2000015000ull); }       // 64
+            else for (int i = 0; i + 1 < (got > 0 ? got / 4 : 0); i += 2) { uint64_t v = buf[i] | (uint64_t)buf[i + 1] << 32; module_t *m = v >= 0x2000000000ull ? module_of(v) : NULL; if (m) fprintf(stderr, " %s+%#llx", m->name, (unsigned long long)(v - m->base)); }       // return addresses as module+offset
             fprintf(stderr, "\n");
         }
     if (stacks) { int sent = 0; for (thr_t *t = g_all; t && sent < 8; t = t->all) if (t->tid && !t->exited && t->wkind == 0 && t->nsvc && t->tid != (int)syscall(SYS_gettid)) { syscall(SYS_tgkill, getpid(), t->tid, BT_SIG); sent++; usleep(150000); } }
@@ -467,6 +472,8 @@ static int ipc_svc_yielding(cpu_t *c, uint32_t swi) {
 static void on_svc(cpu_t *c, uint32_t swi, void *user) {
     (void)user;
     { thr_t *me = pthread_getspecific(g_keythr); if (me) me->nsvc++; }
+    if (swi == 0x34 || swi == 0x35) { static uint64_t ta = ~0ull; static _Atomic int tn; if (ta == ~0ull) { const char *e = getenv("NX_TRACE_ADDR"); ta = e ? strtoull(e, NULL, 16) : 0; }       // NX_TRACE_ADDR=<hex>: every WaitForAddress / SignalToAddress on that address (the first 400), with the caller: who waits for a flag and who should set it
+        if (ta && cpu_get_x(c, 0) == ta && tn++ < 400) { thr_t *me = pthread_getspecific(g_keythr); fprintf(stderr, "[addr] %s tid=%d x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx\n", swi == 0x34 ? "wait  " : "signal", me ? (int)me->id : -1, (unsigned long long)cpu_get_x(c, 0), (unsigned long long)cpu_get_x(c, 1), (unsigned long long)cpu_get_x(c, 2), (unsigned long long)cpu_get_x(c, 3), (unsigned long long)cpu_get_x(c, 30)); } }
     if (!cpu_is_aarch32()) { static int tr = -1; static const char *tf; static _Atomic int n; if (tr < 0) { tf = getenv("NX_TRACE_SVC"); tr = tf != NULL; }       // NX_TRACE_SVC for an AArch64 title: the first 3000 SVCs (read once: this runs on every SVC)
         int match = tf && tf[0] && strcmp(tf, "1") && swi >= 0x1000 && hle_stub_name(swi) && strstr(hle_stub_name(swi), tf);       // NX_TRACE_SVC=<name part>: only hooks whose name has it
         if (match || (tr && (!tf || !strcmp(tf, "1")) && n++ < 3000)) fprintf(stderr, "[svc] %#x%s%s x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx\n", swi, swi >= 0x1000 && hle_stub_name(swi) ? " " : "", swi >= 0x1000 && hle_stub_name(swi) ? hle_stub_name(swi) : "", (unsigned long long)cpu_get_x(c, 0), (unsigned long long)cpu_get_x(c, 1), (unsigned long long)cpu_get_x(c, 2), (unsigned long long)cpu_get_x(c, 3), (unsigned long long)cpu_get_x(c, 30)); }
@@ -624,6 +631,8 @@ int kernel_svc(cpu_t *c, uint32_t num) {
     case 0x45: {  // CreateEvent(→w1 write end, w2 read end)
         event_t *e = calloc(1, sizeof *e); e->refs = 2;
         pthread_mutex_lock(&G); uint32_t hw = h_new_o(O_EVENT_W, e, 3), hr = h_new_o(O_EVENT_R, e, 3); pthread_mutex_unlock(&G);
+        { static uint32_t wh = ~0u; if (wh == ~0u) { const char *w = getenv("NX_TRACE_EVENT"); wh = w ? (uint32_t)strtoul(w, NULL, 16) : 0; }       // NX_TRACE_EVENT=<hex handle of an event's read end>: who creates it and every signal and clear of it
+          if (wh && (hr == wh || hw == wh)) fprintf(stderr, "[event] %#x/%#x created, lr=%#llx\n", hw, hr, (unsigned long long)cpu_get_x(c, 30)); }
         regs[0] = 0; regs[1] = hw; regs[2] = hr; break;
     }
     case 0x11: case 0x12: case 0x17: {  // SignalEvent(write end) / ClearEvent(either end) / ResetSignal(read end, error if not signaled)
@@ -631,6 +640,8 @@ int kernel_svc(cpu_t *c, uint32_t num) {
         uint32_t h = (uint32_t)regs[0];
         event_t *e = num == 0x11 ? h_peek(h, O_EVENT_W) : num == 0x17 ? h_peek(h, O_EVENT_R)
                    : (h_peek(h, O_EVENT_W) ? h_peek(h, O_EVENT_W) : h_peek(h, O_EVENT_R));
+        { static uint32_t wh = ~0u; if (wh == ~0u) { const char *w = getenv("NX_TRACE_EVENT"); wh = w ? (uint32_t)strtoul(w, NULL, 16) : 0; }
+          if (wh && e && e == h_peek(wh, O_EVENT_R)) fprintf(stderr, "[event] %#x %s, lr=%#llx\n", wh, num == 0x11 ? "signaled" : num == 0x12 ? "cleared" : "reset", (unsigned long long)cpu_get_x(c, 30)); }
         int64_t r = 0;
         if (!e) r = (num == 0x17 && h_peek(h, O_THREAD)) ? R_BAD_STATE : R_BAD_HANDLE;
         else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(e); }

@@ -75,6 +75,7 @@ int hle_dispatch(cpu_t *c, uint32_t swi) {
     for (int i = 0; i < 8; i++) { r.x[i] = cpu_get_x(c, i); uint64_t v[2]; cpu_get_v(c, i, v); r.d[i] = v[0]; }
     hle_call(e->fn, &r);
     cpu_set_x(c, 0, r.x[0]);
+    cpu_set_x(c, 1, r.x[1]);        // the second half of a 9 to 16 byte struct result; x1 is the callee's to change in any other call
     uint64_t v[2] = {r.d[0], 0};
     cpu_set_v(c, 0, v);
     return 1;

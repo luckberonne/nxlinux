@@ -76,7 +76,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                 gpuAccessor.QueryComputeLocalSizeZ());
         }
 
-        private static ShaderDefinitions CreateGraphicsDefinitions(IGpuAccessor gpuAccessor, ShaderHeader header)
+        internal static ShaderDefinitions CreateGraphicsDefinitions(IGpuAccessor gpuAccessor, ShaderHeader header)
         {
             TransformFeedbackOutput[] transformFeedbackOutputs = GetTransformFeedbackOutputs(gpuAccessor, out ulong transformFeedbackVecMap);
 
@@ -128,7 +128,7 @@ namespace Ryujinx.Graphics.Shader.Translation
             return transformFeedbackOutputs;
         }
 
-        private static int GetLocalMemorySize(ShaderHeader header)
+        internal static int GetLocalMemorySize(ShaderHeader header)
         {
             return header.ShaderLocalMemoryLowSize + header.ShaderLocalMemoryHighSize + (header.ShaderLocalMemoryCrsSize / ThreadsPerWarp);
         }
@@ -177,6 +177,23 @@ namespace Ryujinx.Graphics.Shader.Translation
             }
 
             return functions;
+        }
+
+
+        // The Sm86 frontend (Translation/Sm86, Ampere machine code of Switch 2 titles) builds its own operations: this wraps them in the prologue every translation starts with.
+        internal static FunctionCode EmitCustom(
+            TranslatorContext translatorContext,
+            ResourceManager resourceManager,
+            DecodedProgram program,
+            System.Action<EmitterContext> emit)
+        {
+            EmitterContext context = new(translatorContext, resourceManager, program, false, false);
+
+            EmitOutputsInitialization(context, translatorContext.AttributeUsage, translatorContext.GpuAccessor, translatorContext.Stage);
+
+            emit(context);
+
+            return new FunctionCode(context.GetOperations());
         }
 
         private static void EmitOutputsInitialization(EmitterContext context, AttributeUsage attributeUsage, IGpuAccessor gpuAccessor, ShaderStage stage)

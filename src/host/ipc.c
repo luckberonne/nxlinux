@@ -116,6 +116,7 @@ static int parse(const uint32_t *m, ipc_in_t *in, uint32_t *type, const uint32_t
         ipc_buf_t b = {m[idx + 1] | (cpu_is_aarch32() ? 0 : (uint64_t)(m[idx + 2] >> 28) << 32 | (uint64_t)(m[idx + 2] >> 2 & 7) << 36), m[idx]};    // 64-bit: address bits 32-35 in word 2 bits 28-31, 36-38 in bits 2-4
         if (i < na || i >= na + nb) { if (in->nsend < 4) in->send[in->nsend++] = b; } else if (in->nrecv < 4) in->recv[in->nrecv++] = b;
     }
+    if (*type >= 16) { *raw_out = m + idx; *words_out = w1 & 0x3ff; return 0; }      // TIPC (sm: from system 12.0.0): the arguments follow at once, with no padding and no SFCI header
     const uint32_t *raw = m + (((idx * 4) + 15) & ~15u) / 4;
     unsigned words = w1 & 0x3ff;
     in->control = *type == 5 || *type == 7;
@@ -128,14 +129,16 @@ static int parse(const uint32_t *m, ipc_in_t *in, uint32_t *type, const uint32_t
     return words < 4 ? -1 : 0;
 }
 
-static void reply(uint32_t *m, const ipc_out_t *out, const uint32_t *objs, unsigned nobjs, int domain) {
+// tipc: the request's type word (16 + command) when the request was TIPC, whose reply carries the same type and {Result, data} right after the handles; 0 for CMIF
+static void reply(uint32_t *m, const ipc_out_t *out, const uint32_t *objs, unsigned nobjs, int domain, uint32_t tipc) {
     unsigned idx = 2, special = out->ncopy || (!domain && out->nmove);
-    m[0] = 0;
+    m[0] = tipc;
     if (special) {
         m[idx++] = out->ncopy << 1 | out->nmove << 5;
         for (unsigned i = 0; i < out->ncopy; i++) m[idx++] = out->copy[i];
         if (!domain) for (unsigned i = 0; i < out->nmove; i++) m[idx++] = out->move[i];
     }
+    if (tipc) { m[idx] = out->result; memcpy(m + idx + 1, out->out, out->nout * 4); m[1] = (1 + out->nout) | (special ? 1u << 31 : 0); return; }
     uint32_t *raw = m + (((idx * 4) + 15) & ~15u) / 4, n = 0;
     if (domain) { raw[0] = nobjs; raw[1] = raw[2] = raw[3] = 0; n = 4; }            // DomainOutHeader {u32 objects, 12 bytes}
     raw[n] = 0x4f434653; raw[n + 1] = 0; raw[n + 2] = out->result; raw[n + 3] = 0;   // "SFCO", version 0, Result, token
@@ -154,16 +157,20 @@ static uint32_t send(uint32_t h, uint32_t *m) {
     if (parse(m, &in, &type, &raw, &words)) { fprintf(stderr, "[RED] ipc: malformed message to %s\n", g_s[s].name); return 0xF601u; }
     if (g_trace < 0) g_trace = getenv("NX_IPC_TRACE") != NULL;
     ipc_handler_t fn = g_s[s].fn; const char *oname = g_s[s].name; in.data = g_s[s].data;
-    uint32_t objs[8]; unsigned nobjs = 0; struct domain *D = g_s[s].dom; int dom = D != NULL && !in.control;
-    if (dom) {                                                         // DomainInHeader {u8 type, u8 in objects, u16 data size, u32 object id, u32, u32 token}
+    const uint32_t tipc = type >= 16 ? type : 0;
+    uint32_t objs[8]; unsigned nobjs = 0; struct domain *D = g_s[s].dom; int dom = D != NULL && !in.control && !tipc;
+    if (tipc) {
+        in.cmd = type - 16; in.nargs = words > IPC_MAX_ARGS ? IPC_MAX_ARGS : words;
+        memcpy(in.args, raw, in.nargs * 4);
+    } else if (dom) {                                                         // DomainInHeader {u8 type, u8 in objects, u16 data size, u32 object id, u32, u32 token}
         unsigned dtype = raw[0] & 0xff, dsize = raw[0] >> 16; uint32_t id = raw[1];
         pthread_mutex_lock(&g_dom_mu);
         dom_obj_t *o = NULL; for (int k = 0; k < DOM_MAX; k++) if (D->obj[k].id == id) o = &D->obj[k];
         dom_obj_t found; if (o) found = *o;
         if (o && dtype == 2) o->id = 0;                                   // close the object
         pthread_mutex_unlock(&g_dom_mu);
-        if (!o) { fprintf(stderr, "[RED] ipc: %s: no object %u in the domain\n", g_s[s].name, id); out.result = 0xE401u; reply(m, &out, objs, 0, 1); return 0; }
-        if (dtype == 2) { own_unref(found.data); reply(m, &out, objs, 0, 1); return 0; }
+        if (!o) { fprintf(stderr, "[RED] ipc: %s: no object %u in the domain (message %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x)\n", g_s[s].name, id, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]); out.result = 0xE401u; reply(m, &out, objs, 0, 1, 0); return 0; }
+        if (dtype == 2) { own_unref(found.data); reply(m, &out, objs, 0, 1, 0); return 0; }
         fn = found.fn; oname = found.name; in.data = found.data;
         const uint32_t *c = raw + 4;                                   // SFCI header, then the arguments (dsize counts both)
         in.cmd = c[2]; in.nargs = dsize / 4 < 4 ? 0 : dsize / 4 - 4; if (in.nargs > IPC_MAX_ARGS) in.nargs = IPC_MAX_ARGS;
@@ -197,6 +204,13 @@ static uint32_t send(uint32_t h, uint32_t *m) {
         default: fprintf(stderr, "[RED] ipc: control command %u on %s is not implemented\n", in.cmd, g_s[s].name); out.result = R_NOT_IMPL; break;
         }
     } else { kernel_note_ipc(oname, in.cmd); out.result = fn ? fn(s, &in, &out) : 0xE401u; kernel_note_ipc(NULL, 0); }
+    { static int fail = -1; if (fail < 0) fail = getenv("NX_IPC_FAIL") != NULL;     // NX_IPC_FAIL=1: every distinct (service, command, Result) that is not 0, once, with its first arguments
+      if (fail && out.result) { static struct { const char *name; unsigned cmd; uint32_t r; } seen[512]; static int ns;
+        int dup = 0; for (int i = 0; i < ns; i++) if (seen[i].name == oname && seen[i].cmd == in.cmd && seen[i].r == out.result) { dup = 1; break; }
+        if (!dup) { if (ns < 512) seen[ns++] = (typeof(seen[0])){oname, in.cmd, out.result};
+          fprintf(stderr, "[ipcfail] %s cmd %u -> %#x args:", oname, in.cmd, out.result);
+          for (unsigned i = 0; i < in.nargs && i < 6; i++) fprintf(stderr, " %#x", in.args[i]);
+          fprintf(stderr, "\n"); } } }
     if (dom) {                                                         // the sessions the handler made become objects of this domain
         for (unsigned k = 0; k < out.nmove && nobjs < 8; k++) {
             int ns = slot(out.move[k]); if (ns < 0) continue;
@@ -209,7 +223,7 @@ static uint32_t send(uint32_t h, uint32_t *m) {
             g_s[ns].used = 0;
         }
     }
-    reply(m, &out, objs, nobjs, dom);
+    reply(m, &out, objs, nobjs, dom, tipc);
     if (g_trace) { fprintf(stderr, "[ipc]   reply:"); for (int i = 0; i < 12; i++) fprintf(stderr, " %08x", m[i]); fprintf(stderr, "\n"); }
     return 0;                                                          // the SVC itself succeeded; the service's Result is inside the reply
 }

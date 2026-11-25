@@ -83,6 +83,20 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             Instruction inst = operation.Inst;
             StorageKind storageKind = operation.StorageKind;
 
+            if (storageKind == StorageKind.PhysicalMemory)
+            {
+                context.Info.UsesPhysicalMemory = true;      // an atomic on raw memory needs the addressing model as much as a load
+            }
+
+            if ((inst & Instruction.Mask) is >= Instruction.ReduceAdd and <= Instruction.ReduceMinU32)
+            {
+                context.Info.UsesSubgroupArithmetic = true;
+            }
+            else if ((inst & Instruction.Mask) == Instruction.AtomicAddF32)
+            {
+                context.Info.UsesAtomicFloatAdd = true;
+            }
+
             if (inst is Instruction.Load or Instruction.Store)
             {
                 if (storageKind.IsInputOrOutput())
@@ -109,6 +123,10 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                 else if (storageKind == StorageKind.ConstantBuffer && operation.GetSource(0).Type == OperandType.Constant)
                 {
                     context.ResourceManager.SetUsedConstantBufferBinding(operation.GetSource(0).Value);
+                }
+                else if (storageKind == StorageKind.PhysicalMemory)
+                {
+                    context.Info.UsesPhysicalMemory = true;
                 }
             }
 

@@ -166,7 +166,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             EmitStore(context, StorageKind.SharedMemory, op.LsSize, GetSrcReg(context, op.SrcA), op.Dest, Imm24ToSInt(op.Imm24));
         }
 
-        private static Operand EmitLoadConstant(EmitterContext context, Operand slot, Operand offset)
+        internal static Operand EmitLoadConstant(EmitterContext context, Operand slot, Operand offset)
         {
             Operand vecIndex = context.ShiftRightU32(offset, Const(2));
             Operand elemIndex = context.BitwiseAnd(offset, Const(3));
@@ -305,7 +305,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             return res;
         }
 
-        private static void EmitLoad(
+        internal static void EmitLoad(
             EmitterContext context,
             StorageKind storageKind,
             LsSize2 size,
@@ -386,7 +386,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
         }
 
-        private static void EmitStore(
+        internal static void EmitStore(
             EmitterContext context,
             StorageKind storageKind,
             LsSize2 size,

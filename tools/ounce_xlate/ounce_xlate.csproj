@@ -1,0 +1,15 @@
+<!-- Ounce (Switch 2, SM86 machine code) shader -> SPIR-V. It references the Ryujinx shader translator source kept in the repository (third_party/ryujinx), whose Translation/Sm86 folder
+     is the frontend for Ampere code; -p:RyuSrc=<dir> points it at another copy. -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RyuSrc Condition="'$(RyuSrc)' == ''">$(MSBuildThisFileDirectory)../../third_party/ryujinx</RyuSrc>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(RyuSrc)/src/Ryujinx.Graphics.Shader/Ryujinx.Graphics.Shader.csproj" />
+    <ProjectReference Include="$(RyuSrc)/src/Ryujinx.Common/Ryujinx.Common.csproj" />
+  </ItemGroup>
+</Project>

@@ -8,6 +8,8 @@ VkCommandBuffer nvn_vk_cmd(void);          // the submission being recorded; NUL
 uint64_t nvn_vk_next_fence(void);          // the fence value the submission being recorded will signal
 // The pool buffer that holds [addr, addr+len) and the offset of addr in it; 0 if the range is not inside one memory pool
 int nvn_vk_pool_buffer(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);
+// The Vulkan device address of [addr, addr+len) if it lies inside a memory pool, else 0 (raw pointers in the Switch 2 shaders' driver segment c[0])
+uint64_t nvn_vk_device_address(uint64_t addr, uint64_t len);
 // A buffer the submission reads while it runs (staging data): destroyed once the GPU has completed the submission
 void nvn_vk_keep(const vkbuf_t *b);
 // Short-lived uniform data for the submission being recorded (driver segments, support buffers): a piece of a large host-visible buffer, reused once the
@@ -40,7 +42,8 @@ VkCommandBuffer nvn_vk_oneshot_begin(void);
 int nvn_vk_oneshot_end(VkCommandBuffer cb);
 // Buffer <-> texture copies of the submission being recorded (nvn_tex_vk.c); row and img are the copy strides in bytes, 0 = tightly packed
 void nvn_vk_copy_b2t(const p_copy_b2t *c, uint64_t row, uint64_t img);
-void nvn_vk_copy_t2b(const p_copy_b2t *c, uint64_t row, uint64_t img);   // the record is the same; its `src` is the destination buffer
+void nvn_vk_copy_t2b(const p_copy_b2t *c, uint64_t row, uint64_t img);
+void nvn_vk_copy_t2t(const p_copy_t2t *c);   // nvnCommandBufferCopyTextureToTexture: a copy, or a blit when the sizes or texel sizes differ   // the record is the same; its `src` is the destination buffer
 // Clears of a render target in the submission being recorded (nvn_tex_vk.c). rect = x, y, w, h of the scissor, or NULL for the whole level.
 // A colour clear takes rgba as the game recorded it (floats; converted to the attachment's integer type for integer formats).
 void nvn_vk_clear_color(uint64_t serial, const view_t *v, int has_view, int mask, const float rgba[4], const int *rect);

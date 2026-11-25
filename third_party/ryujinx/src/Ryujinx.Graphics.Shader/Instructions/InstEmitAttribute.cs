@@ -306,7 +306,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             return attr is not AttributeConsts.TessCoordX and not AttributeConsts.TessCoordY;
         }
 
-        private static bool TryFixedFuncToUserAttributeIpa(EmitterContext context, int attr, out Operand selectedAttr)
+        internal static bool TryFixedFuncToUserAttributeIpa(EmitterContext context, int attr, out Operand selectedAttr)
         {
             if (attr is >= AttributeConsts.FrontColorDiffuseR and < AttributeConsts.BackColorDiffuseR)
             {
@@ -341,7 +341,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             return AttributeMap.GenerateAttributeLoad(context, null, offset, isOutput: false, isPerPatch: false);
         }
 
-        private static int FixedFuncToUserAttribute(TranslatorContext translatorContext, int attr, bool isOutput)
+        internal static int FixedFuncToUserAttribute(TranslatorContext translatorContext, int attr, bool isOutput)
         {
             bool supportsLayerFromVertexOrTess = translatorContext.GpuAccessor.QueryHostSupportsLayerVertexTessellation();
             int fixedStartAttr = supportsLayerFromVertexOrTess ? 0 : 1;
@@ -367,7 +367,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             return attr;
         }
 
-        private static int FixedFuncToUserAttribute(TranslatorContext translatorContext, int attr, int baseAttr, int baseIndex, bool isOutput)
+        internal static int FixedFuncToUserAttribute(TranslatorContext translatorContext, int attr, int baseAttr, int baseIndex, bool isOutput)
         {
             int index = (attr - baseAttr) >> 4;
             int userAttrIndex = translatorContext.AttributeUsage.GetFreeUserAttribute(isOutput, baseIndex + index);
@@ -384,7 +384,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             return attr;
         }
 
-        private static bool TryConvertIdToIndexForVulkan(EmitterContext context, int attr, out Operand value)
+        internal static bool TryConvertIdToIndexForVulkan(EmitterContext context, int attr, out Operand value)
         {
             if (context.TranslatorContext.Options.TargetApi == TargetApi.Vulkan)
             {

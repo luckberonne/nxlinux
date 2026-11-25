@@ -3,23 +3,26 @@ int g_vk_nalloc;
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
-static struct { VkDeviceMemory m; int site; } g_am[16384]; static int g_nam; static struct { const char *file; int line; int live; unsigned long long total; } g_site[32]; static int g_nsite;
+static struct { VkDeviceMemory m; int site; unsigned long long size; } g_am[16384]; static int g_nam; static struct { const char *file; int line; int live; unsigned long long total, bytes; } g_site[32]; static unsigned long long g_live_bytes, g_reported_gb; static int g_nsite;
 static pthread_mutex_t g_am_mu = PTHREAD_MUTEX_INITIALIZER;
+void nx_vk_alloc_report(void);
 VkResult nx_vk_alloc_at(VkDevice d, const VkMemoryAllocateInfo *ai, VkDeviceMemory *m, const char *file, int line) {
     VkResult r = vkAllocateMemory(d, ai, NULL, m); if (r) return r;
     pthread_mutex_lock(&g_am_mu);
     int si = 0; while (si < g_nsite && (g_site[si].line != line || g_site[si].file != file)) si++;
     if (si == g_nsite && g_nsite < 32) { g_site[si].file = file; g_site[si].line = line; g_nsite++; }
-    g_site[si].live++; g_site[si].total++; if (g_nam < 16384) { g_am[g_nam].m = *m; g_am[g_nam].site = si; g_nam++; }
-    g_vk_nalloc++; pthread_mutex_unlock(&g_am_mu); return r;
+    g_site[si].live++; g_site[si].total++; g_site[si].bytes += ai->allocationSize; g_live_bytes += ai->allocationSize; if (g_nam < 16384) { g_am[g_nam].m = *m; g_am[g_nam].site = si; g_am[g_nam].size = ai->allocationSize; g_nam++; }
+    g_vk_nalloc++; int rep = g_live_bytes >> 30 > g_reported_gb; if (rep) g_reported_gb = g_live_bytes >> 30; pthread_mutex_unlock(&g_am_mu);
+    if (rep) { fprintf(stderr, "[dm] [nvn] device memory: %llu MB live\n", g_live_bytes >> 20); nx_vk_alloc_report(); }      // each gigabyte reached: where it is held
+    return r;
 }
 void nx_vk_free(VkDevice d, VkDeviceMemory m) {
-    if (m) { pthread_mutex_lock(&g_am_mu); g_vk_nalloc--; for (int i = g_nam - 1; i >= 0; i--) if (g_am[i].m == m) { g_site[g_am[i].site].live--; g_am[i] = g_am[--g_nam]; break; } pthread_mutex_unlock(&g_am_mu); }
+    if (m) { pthread_mutex_lock(&g_am_mu); g_vk_nalloc--; for (int i = g_nam - 1; i >= 0; i--) if (g_am[i].m == m) { g_site[g_am[i].site].live--; g_site[g_am[i].site].bytes -= g_am[i].size; g_live_bytes -= g_am[i].size; g_am[i] = g_am[--g_nam]; break; } pthread_mutex_unlock(&g_am_mu); }
     vkFreeMemory(d, m, NULL);
 }
 void nx_vk_alloc_report(void) {
     pthread_mutex_lock(&g_am_mu);
-    for (int i = 0; i < g_nsite; i++) if (g_site[i].live > 0) { const char *f = strrchr(g_site[i].file, '/'); fprintf(stderr, "[dm] [nvn] device memory: %s:%d holds %d live allocations (%llu made)\n", f ? f + 1 : g_site[i].file, g_site[i].line, g_site[i].live, g_site[i].total); }
+    for (int i = 0; i < g_nsite; i++) if (g_site[i].live > 0) { const char *f = strrchr(g_site[i].file, '/'); fprintf(stderr, "[dm] [nvn] device memory: %s:%d holds %d live allocations, %llu MB (%llu made)\n", f ? f + 1 : g_site[i].file, g_site[i].line, g_site[i].live, g_site[i].bytes >> 20, g_site[i].total); }
     pthread_mutex_unlock(&g_am_mu);
 }
 #include <stdio.h>
@@ -38,7 +41,8 @@ int vkctx_create(vkctx_t *c) {
     const char *layers[1]; uint32_t nl = 0;
     uint32_t lc = 0; vkEnumerateInstanceLayerProperties(&lc, NULL);
     VkLayerProperties *lp = calloc(lc ? lc : 1, sizeof *lp); vkEnumerateInstanceLayerProperties(&lc, lp);
-    for (uint32_t i = 0; i < lc; i++) if (!strcmp(lp[i].layerName, "VK_LAYER_KHRONOS_validation")) { layers[nl++] = "VK_LAYER_KHRONOS_validation"; c->validation = 1; }
+    const int want_validation = getenv("NX_VK_VALIDATION") != NULL;       // NX_VK_VALIDATION=1: the Khronos validation layer (off by default: it crashed inside itself on Ocarina of Time's draws and costs a lot of time)
+    for (uint32_t i = 0; want_validation && i < lc; i++) if (!strcmp(lp[i].layerName, "VK_LAYER_KHRONOS_validation")) { layers[nl++] = "VK_LAYER_KHRONOS_validation"; c->validation = 1; }
     free(lp);
     VkApplicationInfo ai = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "nxlinux", .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai, .enabledLayerCount = nl, .ppEnabledLayerNames = layers};
@@ -55,7 +59,7 @@ int vkctx_create(vkctx_t *c) {
 
     uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(c->pd, NULL, &ne, NULL);
     VkExtensionProperties *ext = calloc(ne, sizeof *ext); vkEnumerateDeviceExtensionProperties(c->pd, NULL, &ne, ext);
-    const char *want[12]; uint32_t nw = 0;
+    const char *want[16]; uint32_t nw = 0;
     c->has_ext_mem_host = has_ext(ext, ne, "VK_EXT_external_memory_host");
     c->has_xfb = has_ext(ext, ne, "VK_EXT_transform_feedback");
     c->has_depth_clip_control = has_ext(ext, ne, "VK_EXT_depth_clip_control");
@@ -63,10 +67,19 @@ int vkctx_create(vkctx_t *c) {
     if (c->has_xfb) want[nw++] = "VK_EXT_transform_feedback";
     if (c->has_depth_clip_control) want[nw++] = "VK_EXT_depth_clip_control";
     int has_interlock = has_ext(ext, ne, "VK_EXT_fragment_shader_interlock");
+    int has_rob2 = has_ext(ext, ne, "VK_EXT_robustness2");          // nullDescriptor: a texture array element or a buffer with no resource reads as zeros instead of a wild address
+    if (has_rob2) want[nw++] = "VK_EXT_robustness2";
+    int has_af = has_ext(ext, ne, "VK_EXT_shader_atomic_float");     // RED.E.ADD.F32 of a Switch 2 compute program: a float add to a raw address
+    if (has_af) want[nw++] = "VK_EXT_shader_atomic_float";
     if (has_interlock) want[nw++] = "VK_EXT_fragment_shader_interlock";
     c->has_push_descriptor = has_ext(ext, ne, "VK_KHR_push_descriptor");
     if (c->has_push_descriptor) want[nw++] = "VK_KHR_push_descriptor";
+    int has_placed = has_ext(ext, ne, "VK_EXT_map_memory_placed") && has_ext(ext, ne, "VK_KHR_map_memory2");
     free(ext);
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT mpq = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+    if (has_placed) { VkPhysicalDeviceFeatures2 q4 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &mpq}; vkGetPhysicalDeviceFeatures2(c->pd, &q4); }
+    c->has_map_placed = has_placed && mpq.memoryMapPlaced && mpq.memoryUnmapReserve;
+    if (c->has_map_placed) { want[nw++] = "VK_KHR_map_memory2"; want[nw++] = "VK_EXT_map_memory_placed"; }
 
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT il = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, has_interlock ? &il : NULL};
@@ -77,6 +90,13 @@ int vkctx_create(vkctx_t *c) {
     VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
     vkGetPhysicalDeviceFeatures2(c->pd, &f2);
     VkPhysicalDeviceFeatures *f = &f2.features;
+    {   VkPhysicalDeviceSubgroupSizeControlProperties sgp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceProperties2 pp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sgp}; vkGetPhysicalDeviceProperties2(c->pd, &pp);
+        c->has_sg32 = f13.subgroupSizeControl && sgp.minSubgroupSize <= 32 && sgp.maxSubgroupSize >= 32 && (sgp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) && !getenv("NX_NO_SG32"); }
+    VkPhysicalDeviceRobustness2FeaturesEXT r2q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    if (has_rob2) { VkPhysicalDeviceFeatures2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &r2q}; vkGetPhysicalDeviceFeatures2(c->pd, &q2); }
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT afq = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+    if (has_af) { VkPhysicalDeviceFeatures2 q3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &afq}; vkGetPhysicalDeviceFeatures2(c->pd, &q3); }
     // What the NVN backend cannot do without
     if (!f12.bufferDeviceAddress) FAIL("%s lacks bufferDeviceAddress", c->props.deviceName);
     if (!f12.runtimeDescriptorArray || !f12.descriptorBindingPartiallyBound || !f12.descriptorBindingSampledImageUpdateAfterBind)
@@ -94,7 +114,7 @@ int vkctx_create(vkctx_t *c) {
     VkPhysicalDeviceTransformFeedbackFeaturesEXT exfb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, has_interlock ? &eil : NULL, c->has_xfb, c->has_xfb};
     VkPhysicalDeviceDepthClipControlFeaturesEXT edcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &exfb, c->has_depth_clip_control};
     VkPhysicalDeviceVulkan13Features e13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &edcc, .dynamicRendering = 1, .synchronization2 = 1,
-                                            .shaderDemoteToHelperInvocation = f13.shaderDemoteToHelperInvocation};
+                                            .shaderDemoteToHelperInvocation = f13.shaderDemoteToHelperInvocation, .subgroupSizeControl = f13.subgroupSizeControl};
     VkPhysicalDeviceVulkan11Features e11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, NULL, .shaderDrawParameters = f11.shaderDrawParameters};
     VkPhysicalDeviceVulkan12Features e12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &e13, .bufferDeviceAddress = 1, .timelineSemaphore = 1,
         .runtimeDescriptorArray = 1, .shaderSampledImageArrayNonUniformIndexing = f12.shaderSampledImageArrayNonUniformIndexing,
@@ -108,7 +128,11 @@ int vkctx_create(vkctx_t *c) {
         .multiDrawIndirect = f->multiDrawIndirect, .imageCubeArray = f->imageCubeArray, .shaderStorageImageWriteWithoutFormat = f->shaderStorageImageWriteWithoutFormat,
         .drawIndirectFirstInstance = f->drawIndirectFirstInstance, .logicOp = f->logicOp};
     e11.pNext = &e12; e12.pNext = &e13; e13.pNext = &edcc;
-    VkPhysicalDeviceFeatures2 ef2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e11, .features = ef};
+    VkPhysicalDeviceRobustness2FeaturesEXT er2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, &e11, .nullDescriptor = has_rob2 && r2q.nullDescriptor && !getenv("NX_NO_NULLDESC")};
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT eaf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT, has_rob2 ? (void *)&er2 : (void *)&e11, .shaderBufferFloat32AtomicAdd = has_af && afq.shaderBufferFloat32AtomicAdd};
+    VkPhysicalDeviceFeatures2 ef2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, has_af ? (void *)&eaf : has_rob2 ? (void *)&er2 : (void *)&e11, .features = ef};
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT emp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT, ef2.pNext, .memoryMapPlaced = 1, .memoryUnmapReserve = 1};
+    if (c->has_map_placed) ef2.pNext = &emp;
 
     uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(c->pd, &nq, NULL);
     VkQueueFamilyProperties qp[16]; if (nq > 16) nq = 16; vkGetPhysicalDeviceQueueFamilyProperties(c->pd, &nq, qp);
@@ -132,6 +156,11 @@ int vkctx_create(vkctx_t *c) {
         c->GetMemoryHostPointerProperties = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(c->dev, "vkGetMemoryHostPointerPropertiesEXT");
     }
     c->enabled = ef;
+    if (c->has_map_placed) {
+        c->MapMemory2 = (PFN_vkMapMemory2KHR)vkGetDeviceProcAddr(c->dev, "vkMapMemory2KHR");
+        c->UnmapMemory2 = (PFN_vkUnmapMemory2KHR)vkGetDeviceProcAddr(c->dev, "vkUnmapMemory2KHR");
+        if (!c->MapMemory2 || !c->UnmapMemory2) c->has_map_placed = 0;
+    }
     if (c->has_push_descriptor) c->CmdPushDescriptorSet = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(c->dev, "vkCmdPushDescriptorSetKHR");
     if (c->has_xfb) {
         c->CmdBeginTransformFeedback = (PFN_vkCmdBeginTransformFeedbackEXT)vkGetDeviceProcAddr(c->dev, "vkCmdBeginTransformFeedbackEXT");

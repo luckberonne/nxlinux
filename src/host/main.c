@@ -55,6 +55,9 @@ int main(int argc, char **argv) {
         mp.heap = 0xD0000000; mp.app_pool = 0xCD500000; mp.stack = 0x10000000;      // a 64-bit retail title (Mario Kart 8 Deluxe 4.x: SetHeapSize(0xc1c00000)) asks for 3 GB of heap
         // NX_APP_POOL_MB=<n>: the memory the application may use (what its heap and its modules' images are counted against): Mario Party Superstars asks for a heap of 0xcd000000 and its
         // modules take 44 MB more, which the 3,285 MB above does not hold (SetHeapSize failed with 0x10801); the heap region itself is 3,328 MB
+        // NX_HEAP_MB=<n>: a larger heap region and, with it, application pool (a Switch 2 title sizes its root heap as pool minus the big fixed heaps it carves first: the Zelda
+        // Ocarina of Time build wants about 6 GB in all and fails to create an 877 MB heap in the 276 MB it has left of 3,285 MB)
+        { const char *hm = getenv("NX_HEAP_MB"); if (hm && atoll(hm) > 0) { mp.heap = (uint64_t)atoll(hm) << 20; mp.app_pool = mp.heap - 0x2B00000; } }
         { const char *pm = getenv("NX_APP_POOL_MB"); if (pm && atoll(pm) > 0 && ((uint64_t)atoll(pm) << 20) <= mp.heap) mp.app_pool = (uint64_t)atoll(pm) << 20; }
         // The alias region of a 39-bit process is 64 GB on the console, and the SDK's address region manager (nn::os::AllocateAddressRegion) hands out pieces of it:
         // Super Smash Bros. Ultimate's engine reserves 62 GB there in a static constructor and aborts if it does not get them. Only reserved here (PROT_NONE, MAP_NORESERVE):

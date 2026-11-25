@@ -23,7 +23,7 @@ static const char *const op_name[OP_COUNT_] = {
     N(OP_STENCIL), N(OP_POLY_OFFSET), N(OP_DRAW), N(OP_DRAW_IDX), N(OP_DISPATCH), N(OP_BARRIER),
     N(OP_SET_TEX_POOL), N(OP_SET_SAMP_POOL), N(OP_COPY_B2T), N(OP_COPY_STRIDE), N(OP_BLEND_COLOR), N(OP_COPY_T2B), N(OP_BIND_IMG), N(OP_COPY_T2T),
     N(OP_RESET_COUNTER), N(OP_CLEAR_TEX), N(OP_CLEAR_BUF), N(OP_DEPTH_CLAMP), N(OP_RENDER_COND), N(OP_FENCE_SYNC), N(OP_TF_BIND), N(OP_TF_STATE),
-    N(OP_RAST_DISCARD), N(OP_VP_SWIZZLE), N(OP_BIND_TEX1), N(OP_PRIM_RESTART), N(OP_BIND_UBO_SMALL), N(OP_BIND_VBUF1),
+    N(OP_RAST_DISCARD), N(OP_VP_SWIZZLE), N(OP_BIND_TEX1), N(OP_PRIM_RESTART), N(OP_BIND_UBO_SMALL), N(OP_BIND_VBUF1), N(OP_PUSH_CC),
 };
 #undef N
 
@@ -124,11 +124,18 @@ void mtl_exec(const uint8_t *p) {
               nvn_vk_copy_b2t(&cp, g_copy_row, g_copy_img); break; } }
         case OP_COPY_T2B: { extern int nvn_trace_frame_now(void); if (nvn_trace_frame_now()) { const p_copy_b2t *q = (const p_copy_b2t *)a; fprintf(stderr, "[dm] [nvn] trace copy texture->buffer: serial %llu %dx%d, destination %#llx\n", q->tex ? (unsigned long long)q->tex->serial : 0ull, q->r.width, q->r.height, (unsigned long long)q->src); }
             nvn_vk_copy_t2b((const p_copy_b2t *)a, g_copy_row, g_copy_img); break; }   // the record is a p_copy_b2t whose src is the destination buffer
+        case OP_COPY_T2T: { extern int nvn_trace_frame_now(void); const p_copy_t2t *q = (const p_copy_t2t *)a;
+            if (nvn_trace_frame_now()) fprintf(stderr, "[dm] [nvn] trace copy texture->texture: serial %llu %dx%d -> serial %llu %dx%d at (%d,%d), flags %#x\n", q->src ? (unsigned long long)q->src->serial : 0ull, q->sr.width, q->sr.height,
+                                               q->dst ? (unsigned long long)q->dst->serial : 0ull, q->dr.width, q->dr.height, q->dr.xoffset, q->dr.yoffset, (unsigned)q->flags);
+            if (getenv("NX_NO_T2T")) { pending(h.op); break; }       // NX_NO_T2T=1: not executed, as before
+            nvn_vk_copy_t2t(q); break; }
         case OP_SET_RT: {
             const p_set_rt *r = (const p_set_rt *)a;
             memset(&g_rt, 0, sizeof g_rt); g_rt.n = r->n > 8 ? 8 : r->n;
             for (int i = 0; i < g_rt.n; i++) { g_rt.cser[i] = r->color[i] ? r->color[i]->serial : 0; g_rt.cview[i] = r->cview[i]; g_rt.has_cview[i] = r->has_cview[i]; }
             g_rt.dser = r->depth ? r->depth->serial : 0; g_rt.dview = r->dview; g_rt.has_dview = r->has_dview;
+            { extern int g_nvn_rt_ncolour; g_nvn_rt_ncolour = 0; for (int i = 0; i < g_rt.n; i++) if (g_rt.cser[i]) g_nvn_rt_ncolour++; }
+            { static int lg = -1; if (lg < 0) lg = getenv("NX_CLEAR_ALL") != NULL; if (lg) { fprintf(stderr, "[dm] [nvn] set render targets: %d colour", g_rt.n); for (int i = 0; i < g_rt.n; i++) fprintf(stderr, " %llu", (unsigned long long)g_rt.cser[i]); fprintf(stderr, ", depth %llu view %d (layers %d min %d n %d)\n", (unsigned long long)g_rt.dser, g_rt.has_dview, g_rt.dview.set_layers, g_rt.dview.min_layer, g_rt.dview.nlayers); } }
             break; }
         case OP_SCISSOR: { const p_scissor *sc = (const p_scissor *)a;
             { static int lg = -1; static unsigned n; if (lg < 0) lg = getenv("NX_SCISSOR_LOG") != NULL; if (lg && n < 40 && sc->w == 0 && sc->x != 0) { n++; const uint32_t *q = (const uint32_t *)(const void *)p; fprintf(stderr, "[dm] [nvn] replay: a scissor record at %p size %u reads %d %d %d %d; words around it: %#x %#x | %#x %#x %#x %#x | %#x %#x\n", (const void *)p, h.size, sc->x, sc->y, sc->w, sc->h, q[-2], q[-1], q[0], q[1], q[2], q[3], q[4], q[5]); } }
@@ -136,7 +143,7 @@ void mtl_exec(const uint8_t *p) {
         case OP_DRAW: { p_draw t; nvn_draw(draw_rec(a, h.size, &t)); break; }
         case OP_DRAW_IDX: { p_draw_idx t; nvn_draw_idx(draw_idx_rec(a, h.size, &t)); break; }
         case OP_DISPATCH: { p_dispatch t; memset(&t, 0, sizeof t); memcpy(&t, a, h.size < sizeof t ? h.size : sizeof t); nvn_dispatch(&t); break; }
-        case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SSBO: case OP_BIND_IMG:
+        case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SSBO: case OP_BIND_IMG: case OP_PUSH_CC:
         case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_STENCIL: case OP_PRIM_RESTART: case OP_RAST_DISCARD:
             nvn_draw_state_op(h.op, a); break;
         case OP_CLEAR_COLOR: {

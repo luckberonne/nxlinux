@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 typedef struct {
-    uint64_t x[8];   // x0..x7: integer and pointer arguments; x0 also receives the result
+    uint64_t x[8];   // x0..x7: integer and pointer arguments; x0 also receives the result, and x1 its second half (a struct of 9 to 16 bytes comes back in x0 and x1, as rax and rdx do here)
     uint64_t d[8];   // low 64 bits of v0..v7: float (low 32 bits) and double arguments; d[0] also receives the result
 } hle_regs_t;
 

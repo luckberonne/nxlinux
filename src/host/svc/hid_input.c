@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/uio.h>
 #include <time.h>
+#include <unistd.h>
 
 #define NPAD_BASE   0x9A00u     // 10 entries of 0x5000: players 1..8, handheld, other
 #define LIFO_FULLKEY 0x28u      // within an entry: style, assignment, colours, then the lifos of 0x350 bytes
@@ -110,7 +112,8 @@ static void publish_player(uint8_t *mem, int pl) {
     uint8_t *s = lifo + 0x20 + tail * 0x30;
     uint32_t attr = 3;                                             // connected, wired
     uint8_t rec[0x30] = {0};
-    memcpy(rec + 0x00, &n, 8); memcpy(rec + 0x08, &n, 8); memcpy(rec + 0x10, &buttons, 8);
+    uint64_t seq = n * 2; memcpy(rec + 0x00, &seq, 8); memcpy(rec + 0x08, &n, 8);     // rec+0 is the entry's seqlock counter (odd = being written: the system 20 SDK retries until it is even and unchanged), rec+8 the state's sampling number (consecutive)
+    memcpy(rec + 0x10, &buttons, 8);
     memcpy(rec + 0x18, st, 16); memcpy(rec + 0x28, &attr, 4);
     memcpy(s, rec, sizeof rec);
     uint64_t cap = LIFO_COUNT;
@@ -119,10 +122,17 @@ static void publish_player(uint8_t *mem, int pl) {
     memcpy(lifo + 0x10, &tail, 8); memcpy(lifo + 0x18, &count, 8);
 }
 
+// Is every page of the block still mapped in the guest? A title may free the memory without unmapping the shared memory first (a host write there is a SIGSEGV: seen at frame ~545 of the world load)
+static int block_mapped(uint64_t a) {
+    char b[64]; struct iovec l[64], r[64];
+    for (int i = 0; i < 64; i++) { l[i] = (struct iovec){b + i, 1}; r[i] = (struct iovec){(void *)(uintptr_t)(a + (uint64_t)i * 0x1000), 1}; }
+    return process_vm_readv(getpid(), l, 64, r, 64, 0) == 64;
+}
 static void *pump(void *arg) {
     (void)arg;
     for (;;) {
         uint64_t a = __atomic_load_n(&g_hid_blob.mapped, __ATOMIC_ACQUIRE);
+        if (a && !block_mapped(a)) { uint64_t exp = a; __atomic_compare_exchange_n(&g_hid_blob.mapped, &exp, 0, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED); a = 0; }
         if (a) for (int pl = 0; pl < MAX_PLAYERS; pl++) publish_player((uint8_t *)(uintptr_t)a, pl);
         struct timespec d = {0, 8 * 1000 * 1000}; nanosleep(&d, NULL);
     }

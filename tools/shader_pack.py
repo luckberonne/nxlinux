@@ -46,6 +46,38 @@ def image_slot(t):
     return (b - C2_IMG) // 8
 
 
+CS_HANDLE_BASE = {'a22eb9ecf134873b': 0xa0, 'f3508715d8d4cfc7': 0xc0, '68b1b94cdb9548ce': 0x130, 'bc48ef317c743ca4': 0x90}      # Switch 2 compute programs (the title's video enhancement): where the table of texture and image handles starts in c[0]; 0x50 unless listed
+CS_HANDLE_DEFAULT = 0x50
+
+
+def cs_ctl_layout(ctl):
+    """(units, rows) of a Switch 2 compute program from its control section: the dword at +0xb0 has, in its second byte, the size of the program's pushed-constant block in 16 byte units (it starts at c[0][0x10]), and in its third
+    byte the number of storage buffer rows (address, size; 0x10 each) that follow it, and after those come the handle table. Checked against the c[0] offsets six programs read (24ff13bd 3+5: rows from 0x40, textures at 0x90;
+    c409e952 3+3: textures at 0x70; 4dc886e0 4+4: rows from 0x50, textures at 0x90; 7d3f806b 1+5: rows from 0x20; afb4ddcc 3+10). None when the section is missing."""
+    if not ctl or len(ctl) < 0xb4: return None
+    w, = struct.unpack_from('<I', ctl, 0xb0)
+    return (w >> 8) & 0xFF, (w >> 16) & 0xFF
+
+
+def cs_handle_slots(res, key_hex, ctl=b''):
+    """{('t'|'i', binding): slot} for the textures and images a Switch 2 compute program reads through handles in c[0] (cbuf_slot 0, bound the usual way). The table starts at a base that
+    depends on the program (the pushed constants and its storage buffer rows come first) and has 8 bytes per entry: texture slot s at base + 8 s, then the images from the first entry
+    after the highest texture slot the program uses: image j at base + 8 (ntex + j). Worked out from the 11 programs of Movie/Ndve against what the game binds for each dispatch."""
+    base = CS_HANDLE_BASE.get(key_hex, CS_HANDLE_DEFAULT)
+    lay = cs_ctl_layout(ctl)
+    if lay and 1 <= lay[0] <= 7 and key_hex not in CS_HANDLE_BASE: base = 0x10 + 0x10 * (lay[0] + lay[1])      # a program with a small push block: the table follows the rows
+    out = {}
+    def ok(t): return not t.get('separate') and t.get('array', 1) == 1 and t['cbuf_slot'] == 0 and (t['handle'] >> 28) == 0 and (t['type'] & 0xFF) in SAMPLER_TYPES and not t['type'] & 512 and (t['handle'] & 0x3FFF) * 4 >= base
+    ntex = 0
+    for t in res.get('textures', []):
+        if ok(t) and ((t['handle'] & 0x3FFF) * 4 - base) % 8 == 0:
+            out[('t', t['binding'])] = ((t['handle'] & 0x3FFF) * 4 - base) // 8; ntex = max(ntex, out[('t', t['binding'])] + 1)
+    for t in res.get('images', []):
+        if ok(t) and ((t['handle'] & 0x3FFF) * 4 - base) % 8 == 0 and ((t['handle'] & 0x3FFF) * 4 - base) // 8 >= ntex:
+            out[('i', t['binding'])] = ((t['handle'] & 0x3FFF) * 4 - base) // 8 - ntex
+    return out
+
+
 def texture_array_kind(t):
     """The 32-entry arrays a shader indexes by a texture or sampler ID the game keeps in a storage buffer (Ryujinx's fallback: `fp_t2d_cb0_40000000`, element = min(ID, 31)).
     The draw path fills element k with the texture (KIND_TEXA, aux = its sampler type) or the sampler (KIND_SAMPA) that has ID k in the pool. None for anything else."""
@@ -109,7 +141,7 @@ def support_binding(spirv):
     return None
 
 
-def entry(key_hex, spirv, res, c1=b''):
+def entry(key_hex, spirv, res, c1=b'', ctl=b''):
     """One library entry from a translated shader; c1: the constant segment c[1] as the game's shader package has it (empty: not captured)"""
     key = bytes.fromhex(key_hex)
     if len(key) != 8: raise ValueError(f'a shader key is 8 bytes, got {key_hex!r}')
@@ -139,13 +171,16 @@ def entry(key_hex, spirv, res, c1=b''):
         elif res['stage'] == 'cs' and sb['cb_slot'] == 0 and 0 <= off - C0_CS_UBO < 0x10 * C0_CS_UBO_SLOTS and (off - C0_CS_UBO) % 0x10 == 0:
             binds.append((sb['binding'], KIND_SBUF_UBO, (off - C0_CS_UBO) // 0x10, sb.get('flags', 0)))     # the game's own uniform slot, read as a storage buffer
         else: needs |= NEEDS_SBUF                                         # an address kept elsewhere
+    cs = cs_handle_slots(res, key_hex, ctl) if res.get('stage') == 'cs' else {}
     for t in res.get('textures', []):
+        if ('t', t['binding']) in cs: binds.append((t['binding'], KIND_TEX, cs[('t', t['binding'])], t['type'])); continue
         slot = combined_slot(t)
         if slot is not None: binds.append((t['binding'], KIND_TEX, slot, t['type']))
         elif (u := ubo_texture(t)) is not None: binds.append((t['binding'], KIND_TEX_UBO, u, t['type']))
         elif (k := texture_array_kind(t)) is not None: binds.append((t['binding'], k, 0, t['type']))
         else: needs |= NEEDS_TEX
     for t in res.get('images', []):
+        if ('i', t['binding']) in cs: binds.append((t['binding'], KIND_IMG, cs[('i', t['binding'])], t['type'])); continue
         if (b := image_slot(t)) is not None: binds.append((t['binding'], KIND_IMG, b, t['type']))
         else: needs |= NEEDS_IMG
     if res.get('geometry_stride'): needs |= NEEDS_GEOM
@@ -183,8 +218,8 @@ def main(argv):
         if spv.name.endswith('.reader.spv'): continue
         res = spv.with_suffix('.res.json')
         if not res.exists(): sys.exit(f'{spv}: no {res.name} beside it')
-        c1 = spv.with_suffix('.c1')
-        entries.append(entry(spv.stem, spv.read_bytes(), json.loads(res.read_text()), c1.read_bytes() if c1.is_file() else b''))
+        c1 = spv.with_suffix('.c1'); ctl = spv.with_suffix('.ctl')
+        entries.append(entry(spv.stem, spv.read_bytes(), json.loads(res.read_text()), c1.read_bytes() if c1.is_file() else b'', ctl.read_bytes() if ctl.is_file() else b''))
     out.write_bytes(pack(entries))
     print(f'{out}: {len(entries)} shader(s)')
 

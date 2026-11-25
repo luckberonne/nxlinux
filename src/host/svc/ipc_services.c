@@ -98,6 +98,74 @@ static uint32_t aoc(int session, const ipc_in_t *in, ipc_out_t *out) {
     }
 }
 
+// ---- nifm:u: network interface management, offline. A request is Free, and what it reports is that the network cannot be used; submitting signals its events once.
+#define NIFM_NOT_AVAILABLE 0x2586Eu      // module 110, description 300: network communication is not available
+typedef struct { uint32_t ev[2]; } nifm_request_t;
+static uint32_t nifm_request(int session, const ipc_in_t *in, ipc_out_t *out) {
+    (void)session; nifm_request_t *r = in->data;
+    switch (in->cmd) {
+    case 0: OUT32(1); return 0;                                    // GetRequestState: Free
+    case 1: return NIFM_NOT_AVAILABLE;                             // GetResult
+    case 2:                                                        // GetSystemEventReadableHandles: the state-updated and the error-info events
+        if (!r->ev[0]) { r->ev[0] = kernel_event_new(0); r->ev[1] = kernel_event_new(0); }
+        out->copy[out->ncopy++] = r->ev[0]; out->copy[out->ncopy++] = r->ev[1]; return 0;
+    case 4: if (r->ev[0]) kernel_event_signal(r->ev[0]); return 0; // Submit
+    case 20: case 21: return 0;                                    // GetAppletInfo / GetAdditionalInfo: nothing
+    default: return 0;                                             // Cancel and the Set* requirements
+    }
+}
+static uint32_t nifm_general(int session, const ipc_in_t *in, ipc_out_t *out) {
+    (void)session;
+    switch (in->cmd) {
+    case 1: OUT32(1); return 0;                                    // GetClientId
+    case 4: {                                                      // CreateRequest(requirement preset) -> IRequest
+        nifm_request_t *r = calloc(1, sizeof *r);
+        out->move[out->nmove++] = ipc_new_session_owned("nifm.req", nifm_request, r, free); return 0;
+    }
+    case 12: OUT32(0); return NIFM_NOT_AVAILABLE;                  // GetCurrentIpAddress
+    case 17: case 20: OUT32(0); return 0;                          // Is{Wireless,Ethernet}CommunicationEnabled
+    case 18: OUT32(0); return 0;                                   // GetInternetConnectionStatus: not connected (three bytes, zero)
+    case 21: case 22: OUT32(0); return 0;                          // IsAnyInternetRequestAccepted / IsAnyForegroundRequestAccepted
+    default: return 0;
+    }
+}
+static uint32_t nifm(int session, const ipc_in_t *in, ipc_out_t *out) {
+    (void)session;
+    switch (in->cmd) {
+    case 4: case 5: out->move[out->nmove++] = ipc_new_session("nifm.gen", nifm_general); return 0;   // CreateGeneralServiceOld / CreateGeneralService(pid)
+    default: return unimpl("nifm:u", in);
+    }
+}
+
+// ---- nsd:a / nsd:u: the name service, offline. The environment is "lp1" (retail); a name resolves to itself; settings and saves are empty.
+static void nsd_text(const ipc_in_t *in, const char *text) {
+    if (!in->nrecv) return;
+    memset((void *)(uintptr_t)in->recv[0].addr, 0, in->recv[0].size);
+    strlcpy((char *)(uintptr_t)in->recv[0].addr, text, in->recv[0].size);
+}
+static uint32_t nsd(int session, const ipc_in_t *in, ipc_out_t *out) {
+    (void)session;
+    switch (in->cmd) {
+    case 10: case 11: nsd_text(in, "lp1"); return 0;                 // GetSettingName / GetEnvironmentIdentifier
+    case 12: if (in->nrecv) memset((void *)(uintptr_t)in->recv[0].addr, 0, in->recv[0].size); return 0;   // GetDeviceId
+    case 13: case 14: return 0;                                        // DeleteSettings / ImportSettings
+    case 20: case 21:                                                  // Resolve / ResolveEx: the name itself
+        if (in->nsend && in->nrecv) { uint32_t n = in->send[0].size < in->recv[0].size ? in->send[0].size : in->recv[0].size; memcpy((void *)(uintptr_t)in->recv[0].addr, (const void *)(uintptr_t)in->send[0].addr, n); }
+        if (in->cmd == 21) OUT32(0);
+        return 0;
+    case 30: case 31: case 40: case 41: case 42: case 43: case 50:   // NAS service setting, request and API names, the current setting: empty
+        if (in->nrecv) memset((void *)(uintptr_t)in->recv[0].addr, 0, in->recv[0].size);
+        if (in->cmd == 31 || in->cmd == 41 || in->cmd == 43) OUT32(0);
+        return 0;
+    case 100: return 0;                                                // SetChangeEnvironmentIdentifierDisabled
+    case 101: OUT32(0); return 0;                                      // IsChangeEnvironmentIdentifierDisabled
+    case 200: return 0;                                                // SetWithoutDomainExchangeFqdns
+    case 300: OUT32(0); return 0;                                      // GetApplicationServerEnvironmentType
+    case 301: case 302: return 0;
+    default: return unimpl("nsd", in);
+    }
+}
+
 // ---- pctl: parental controls. Everything is unrestricted; only the commands a title uses are answered.
 static uint32_t pctl_service(int session, const ipc_in_t *in, ipc_out_t *out) {
     (void)session;
@@ -431,8 +499,13 @@ static uint32_t mii_static(int session, const ipc_in_t *in, ipc_out_t *out) {
 }
 
 // ---- prepo: play reports (telemetry the console sends to Nintendo). Accepted and dropped.
+static uint32_t prepo_obj(int session, const ipc_in_t *in, ipc_out_t *out) {      // what prepo:u 10500 hands back (system 20+): an object the title calls (its command 0 first) and discards; the reports are dropped, so every command succeeds
+    (void)session; (void)out; static unsigned n; if (n++ < 6) fprintf(stderr, "[dm] prepo object: command %u (%u argument words), accepted\n", in->cmd, in->nargs);
+    return 0;
+}
 static uint32_t prepo(int session, const ipc_in_t *in, ipc_out_t *out) {
-    (void)session; (void)out;
+    (void)session;
+    if (in->cmd == 10500) { out->move[out->nmove++] = ipc_new_session("prepo.obj", prepo_obj); return 0; }
     if (in->cmd == 10100 || in->cmd == 10101 || in->cmd == 10102 || in->cmd == 10103 || in->cmd == 10104 || in->cmd == 10105 || in->cmd == 10200 || in->cmd == 20100 || in->cmd == 30100 || in->cmd == 40100 || in->cmd == 50100 || in->cmd == 90100) return 0;
     return hid_permissive("prepo", in);
 }
@@ -547,6 +620,8 @@ __attribute__((constructor)) static void register_services(void) {
     ipc_register_service("apm", apm);
     ipc_register_service("aoc:u", aoc);
     ipc_register_service("pctl:a", pctl); ipc_register_service("pctl:s", pctl); ipc_register_service("pctl:r", pctl); ipc_register_service("pctl", pctl);
+    ipc_register_service("nifm:u", nifm); ipc_register_service("nifm:a", nifm); ipc_register_service("nifm:s", nifm);
+    ipc_register_service("nsd:a", nsd); ipc_register_service("nsd:u", nsd);
     ipc_register_service("appletOE", applet_oe);
     ipc_register_service("fsp-srv", fsp);
     ipc_register_service("hid", hid);

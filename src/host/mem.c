@@ -84,6 +84,12 @@ int mem_init(const mem_profile_t *p) {
 }
 
 // ---- alias region page bitmap
+// NX_MEM_UNMAP_LOG=1: each guest unmap of 64 KB or more, and whether it overlaps a GPU memory pool (the pool's buffer is the guest's pages imported by host pointer: unmapping them invalidates it)
+extern int nvn_vk_pool_overlap(uint64_t, uint64_t) __attribute__((weak));
+static void unmap_note(const char *what, uint64_t a, uint64_t n) {
+    static int lg = -1; if (lg < 0) lg = getenv("NX_MEM_UNMAP_LOG") != NULL;
+    if (lg && n >= 0x10000) fprintf(stderr, "[dm] mem unmap (%s) %#llx size %#llx%s\n", what, (unsigned long long)a, (unsigned long long)n, (&nvn_vk_pool_overlap && nvn_vk_pool_overlap(a, n)) ? "  IN A GPU POOL" : "");
+}
 static int64_t alias_pages(uint64_t off, uint64_t n, int map) {   // returns the pages whose state really changed (negative for unmap)
     int64_t ch = 0;
     for (uint64_t p = off >> 12, e = (off + n + 0xFFF) >> 12; p < e; ) {
@@ -254,6 +260,7 @@ int mem_svc(cpu_t *c, uint32_t num) {
         int rc = 0;
         if (size > previous) rc = mprotect(g_heap + previous, size - previous, PROT_READ | PROT_WRITE);
         else if (size < previous) {      // new heap memory is zero on Horizon: drop the pages as well as the access
+            unmap_note("heap shrink", (uint64_t)g_heap + size, previous - size);
             rc = mprotect(g_heap + size, previous - size, PROT_NONE);
             if (!rc) madvise(g_heap + size, previous - size, MADV_DONTNEED);
         }
@@ -297,6 +304,7 @@ int mem_svc(cpu_t *c, uint32_t num) {
             if (!k || g_map[k - 1].base != dst || g_map[k - 1].size != size || g_map[k - 1].src != src) res = R_INVALID_STATE;
             else {
                 memcpy((void *)src, (void *)dst, size);   // the contents move back to the source
+                unmap_note("unmap alias", dst, size);
                 mprotect((void *)dst, size, PROT_NONE);
                 madvise((void *)dst, size, MADV_DONTNEED);
                 g_map[k - 1] = g_map[--g_nmap];
@@ -331,7 +339,7 @@ int mem_svc(cpu_t *c, uint32_t num) {
         }
         int commit = num == 0x2C;
         if (commit) { if (mprotect((void *)a, size, PROT_READ | PROT_WRITE)) die("MapPhysicalMemory mprotect failed"); }
-        else { mprotect((void *)a, size, PROT_NONE); madvise((void *)a, size, MADV_DONTNEED); }   // remapped pages must read as zero
+        else { unmap_note("unmap physical", a, size); mprotect((void *)a, size, PROT_NONE); madvise((void *)a, size, MADV_DONTNEED); }   // remapped pages must read as zero
         atomic_fetch_add(&g_alias_mapped, alias_pages(off, size, commit) * 4096);
         pthread_mutex_unlock(&g_map_lock);
         regs[0] = 0; break;
@@ -375,6 +383,9 @@ int mem_svc(cpu_t *c, uint32_t num) {
         // nn::os::GetFreeThreadCount: the thread resource limit less the threads alive. pm gives an application 96 threads.
         case I_FreeThreadCount: { int u = kernel_live_threads(); v = u < 96 ? 96 - u : 0; break; }
         case I_UserExcAddr: { static uint64_t ctx; if (!ctx) ctx = guest_alloc(0x1000, 0x1000); v = ctx; break; }   // newer SDKs' SetDyingMessageRegion writes to +0x1c0
+        // Info 33 (system 20+ SDKs): the page size. nn::ro::ProtectRelro requires its addresses to be multiples of it, and the virtual address memory manager maps that
+        // many bytes at the start of the alias region for its tables (both abort on 0). Read from the SDK's use of it, not from a kernel reference.
+        case 33: v = 0x1000; break;
         default: v = 0; break;
         }
         regs[0] = 0; regs[1] = v; break;
